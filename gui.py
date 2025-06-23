@@ -1,11 +1,13 @@
 import tkinter as tk
-from tkinter import scrolledtext, messagebox, simpledialog
+from tkinter import ttk, scrolledtext, messagebox
 import os
 import sys
 import threading
 import queue
 import subprocess
 import glob
+import requests
+import zipfile
 from executor import (
     find_bat_files, run_bat_file, kill_existing_processes, 
     analyze_site_domains, update_zapret_tool
@@ -24,63 +26,87 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-class AddSiteDialog(tk.Toplevel):
-    # ... (содержимое этого класса без изменений)
-    def __init__(self, parent, on_complete_callback):
+class UpdateDialog(tk.Toplevel):
+    """Диалоговое окно для отображения процесса обновления."""
+    def __init__(self, parent, repo_url):
         super().__init__(parent)
-        self.parent = parent
-        self.on_complete_callback = on_complete_callback
-        self.title("Анализ доменов сайта")
-        self.geometry("500x350")
+        self.repo_url = repo_url
+        self.title("Обновление Лаунчера")
+        self.geometry("500x150")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
-        tk.Label(self, text="Введите URL сайта для анализа:").pack(pady=(10, 5))
-        self.url_entry = tk.Entry(self, width=60)
-        self.url_entry.pack(pady=5, padx=10)
-        self.url_entry.insert(0, "https://")
-        self.analyze_button = tk.Button(self, text="Начать анализ", command=self.start_analysis)
-        self.analyze_button.pack(pady=10)
-        self.progress = ttk.Progressbar(self, mode='indeterminate', length=480)
-        self.progress.pack(pady=5)
-        self.log_widget = scrolledtext.ScrolledText(self, height=10, state='disabled', bg='black', fg='lightgray')
-        self.log_widget.pack(pady=10, padx=10, fill="both", expand=True)
 
-    def log(self, message):
-        self.log_widget.config(state='normal')
-        self.log_widget.insert(tk.END, message + "\n")
-        self.log_widget.config(state='disabled')
-        self.log_widget.see(tk.END)
+        self.protocol("WM_DELETE_WINDOW", lambda: None) # Запрещаем закрытие окна
 
-    def start_analysis(self):
-        url = self.url_entry.get()
-        if not url or url == "https://":
-            messagebox.showerror("Ошибка", "Пожалуйста, введите URL.", parent=self)
-            return
-        self.analyze_button.config(state="disabled")
-        self.url_entry.config(state="disabled")
-        self.progress.start(10)
-        self.analysis_thread = threading.Thread(target=self._analysis_worker, args=(url,), daemon=True)
-        self.analysis_thread.start()
+        self.status_label = tk.Label(self, text="Подготовка к обновлению...")
+        self.status_label.pack(pady=(10, 5))
+        self.progress = ttk.Progressbar(self, mode='determinate', length=480)
+        self.progress.pack(pady=10)
+        
+        self.worker_thread = threading.Thread(target=self._update_worker, daemon=True)
+        self.worker_thread.start()
 
-    def _analysis_worker(self, url):
-        found_domains = analyze_site_domains(url, self.log)
-        self.parent.after(0, self.analysis_complete, found_domains)
+    def log(self, message, value=None):
+        self.status_label.config(text=message)
+        if value is not None:
+            self.progress['value'] = value
+        self.update_idletasks()
 
-    def analysis_complete(self, domains):
-        self.progress.stop()
-        if domains:
-            self.on_complete_callback(domains)
-            messagebox.showinfo("Успех", "Анализ завершен.", parent=self)
-        else:
-            messagebox.showerror("Ошибка", "Не удалось получить домены.", parent=self)
-        self.destroy()
+    def _update_worker(self):
+        try:
+            # 1. Найти последний релиз
+            self.log("Поиск последнего релиза на GitHub...", 10)
+            api_url = f"https://api.github.com/repos/{self.repo_url}/releases/latest"
+            response = requests.get(api_url)
+            response.raise_for_status()
+            release_data = response.json()
+            assets = release_data.get('assets', [])
+            zip_url = None
+            for asset in assets:
+                if asset.get('name', '').endswith('.zip'):
+                    zip_url = asset['browser_download_url']
+                    break
+            if not zip_url:
+                messagebox.showerror("Ошибка обновления", "В последнем релизе не найден ZIP-архив.")
+                self.destroy()
+                return
+
+            # 2. Скачать архив
+            self.log(f"Скачивание версии {release_data['tag_name']}...", 30)
+            temp_dir = "_update_temp"
+            if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
+            os.makedirs(temp_dir)
+            zip_path = os.path.join(temp_dir, 'update.zip')
+            
+            with requests.get(zip_url, stream=True) as r:
+                r.raise_for_status()
+                with open(zip_path, 'wb') as f:
+                    shutil.copyfileobj(r.raw, f)
+            
+            # 3. Распаковать
+            self.log("Распаковка архива...", 80)
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(temp_dir)
+            os.remove(zip_path)
+
+            # 4. Запустить батник и закрыться
+            self.log("Запуск установщика...", 100)
+            time.sleep(1) # Небольшая пауза для наглядности
+            updater_bat_path = resource_path('_run_updater.bat')
+            subprocess.Popen([updater_bat_path], creationflags=subprocess.CREATE_NEW_CONSOLE)
+            self.master.destroy() # Закрываем основное приложение
+
+        except Exception as e:
+            messagebox.showerror("Ошибка обновления", f"Произошла ошибка:\n{e}")
+            self.destroy()
 
 class App:
     def __init__(self, root):
+        # ... (код инициализации без изменений)
         self.root = root
-        self.root.title(f"AntiZapret Launcher v{__version__}")
-        self.root.geometry("850x850")
+        self.root.title(f"Zapret Launcher v{__version__}")
+        self.root.geometry("850x500")
         self.process = None
         self.log_queue = queue.Queue()
         self.create_widgets()
@@ -88,24 +114,19 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def create_widgets(self):
-        # --- Верхняя панель с кнопками ---
+        # ... (код виджетов без изменений)
         top_frame = tk.Frame(self.root)
         top_frame.pack(pady=10, padx=10, fill=tk.X)
-        
         self.run_button = tk.Button(top_frame, text="Запустить профиль", command=self.select_and_run_bat)
         self.run_button.pack(side=tk.LEFT)
         self.stop_button = tk.Button(top_frame, text="Остановить/Проверить", command=self.stop_process)
         self.stop_button.pack(side=tk.LEFT, padx=5)
         self.add_site_button = tk.Button(top_frame, text="Анализ сайта", command=self.open_add_site_dialog)
         self.add_site_button.pack(side=tk.LEFT, padx=5)
-        
-        # --- Кнопки обновления справа ---
         self.update_launcher_button = tk.Button(top_frame, text="Обновить Лаунчер", command=self.run_self_update)
         self.update_launcher_button.pack(side=tk.RIGHT, padx=(10, 0))
         self.update_zapret_button = tk.Button(top_frame, text="Обновить Zapret", command=self.open_zapret_update_dialog)
         self.update_zapret_button.pack(side=tk.RIGHT)
-
-        # ... остальной код виджетов без изменений
         list_frame = tk.Frame(self.root)
         list_frame.pack(pady=5, padx=10, fill=tk.BOTH, expand=True)
         tk.Label(list_frame, text="Выберите профиль для запуска:").pack(anchor=tk.W)
@@ -121,24 +142,13 @@ class App:
         self.log_window.pack(fill=tk.BOTH, expand=True)
         setup_text_widget_bindings(self.log_window)
         setup_text_widget_bindings(self.bat_listbox)
-
+    
     def run_self_update(self):
         """Запускает процесс самообновления лаунчера."""
         if messagebox.askyesno("Подтверждение", "Программа скачает последнюю версию с GitHub и закроется для обновления.\n\nПродолжить?"):
-            try:
-                updater_path = resource_path('_run_updater.bat')
-                if not os.path.exists(updater_path):
-                    messagebox.showerror("Ошибка", "Файл '_run_updater.bat' не найден!")
-                    return
-
-                # Запускаем батник в новом, отдельном процессе и консольном окне
-                subprocess.Popen([updater_path], creationflags=subprocess.CREATE_NEW_CONSOLE)
-                
-                # Сразу же закрываем текущее приложение
-                self.root.destroy()
-            except Exception as e:
-                messagebox.showerror("Ошибка запуска", f"Не удалось запустить процесс обновления:\n{e}")
-
+            UpdateDialog(self.root, 'Sankyuubigan/dpi_gui')
+    
+    # ... (остальной код класса App без изменений)
     def open_add_site_dialog(self):
         AddSiteDialog(self.root, self.add_domains_to_list)
 
@@ -153,7 +163,6 @@ class App:
 
     def refresh_bat_list(self):
         self.log_message("-> Обновляю список профилей...")
-        self.bat_listbox.delete(0, tk.END)
         self.populate_bat_files()
 
     def add_domains_to_list(self, new_domains):
@@ -183,6 +192,7 @@ class App:
             messagebox.showerror("Ошибка файла", f"Не удалось записать в {custom_list_path}:\n{e}")
 
     def populate_bat_files(self):
+        self.bat_listbox.delete(0, tk.END)
         base_path = resource_path('.')
         zapret_folders = glob.glob(os.path.join(base_path, 'zapret-discord-youtube-*'))
         if not zapret_folders:
@@ -191,7 +201,6 @@ class App:
             return
         zapret_dir = zapret_folders[0]
         self.bat_files = find_bat_files(zapret_dir)
-        self.bat_listbox.delete(0, tk.END)
         for abs_path in self.bat_files:
             try:
                 display_path = os.path.relpath(abs_path, base_path).replace('\\', '/')
@@ -217,7 +226,7 @@ class App:
         self.log_window.config(state='disabled')
         kill_existing_processes(self.log_message)
         self.log_message(f"Запуск профиля: {os.path.basename(file_path)}")
-        self.process = run_bat_file(file_path, self.log_message)
+        self.process = run_bat_file(file_path, resource_path('.'), self.log_message)
         if not self.process:
             self.log_message("Не удалось запустить процесс.")
             return

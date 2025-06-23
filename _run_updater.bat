@@ -1,26 +1,13 @@
 @echo off
 REM This batch file is now 100% ASCII to avoid any encoding issues.
-REM All user-facing messages are handled by the python script.
 
-REM Set UTF-8 codepage just in case for python's output
-chcp 65001 > nul
+REM Give the main app a moment to close completely
+timeout /t 2 /nobreak > nul
 
-REM --- Run the main python update script ---
-python update.py
-
-REM --- Check the result ---
-if %errorlevel% neq 0 (
-    echo.
-    echo !!! The python script reported an error. Update canceled.
-    goto end
-)
-
-echo.
 echo --- Installing Update ---
-echo.
 
 REM --- Find the path to the new build ---
-set "SOURCE_PATH=_update_temp\dist\dpi_gui"
+set "SOURCE_PATH=%~dp0_update_temp"
 
 REM --- Check if the folder exists ---
 if not exist "%SOURCE_PATH%" (
@@ -30,7 +17,7 @@ if not exist "%SOURCE_PATH%" (
 
 REM --- Copy files, replacing old ones ---
 echo -> Copying new files...
-xcopy "%SOURCE_PATH%" "." /E /H /C /I /Y > nul
+xcopy "%SOURCE_PATH%" "%~dp0" /E /H /C /I /Y > nul
 
 if %errorlevel% neq 0 (
     echo !!! ERROR COPYING FILES.
@@ -40,13 +27,16 @@ if %errorlevel% neq 0 (
 echo -> Copying complete.
 echo.
 echo -> Cleaning up temporary files...
-rmdir /s /q _update_temp
+rmdir /s /q "%SOURCE_PATH%"
 
 echo.
 echo ==================================================
 echo      UPDATE COMPLETED SUCCESSFULLY!
 echo ==================================================
 echo.
+echo You can now run the application again.
+echo This window will close in 5 seconds...
+timeout /t 5 > nul
 
 :end
-pause
+exit
