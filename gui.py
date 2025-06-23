@@ -5,34 +5,27 @@ import sys
 import threading
 import queue
 import subprocess
-from executor import find_bat_files, run_bat_file, kill_existing_processes, analyze_site_domains
+import glob
+from executor import (
+    find_bat_files, run_bat_file, kill_existing_processes, 
+    analyze_site_domains, update_zapret_tool
+)
 from text_utils import setup_text_widget_bindings
 
-# --- Внедрение версии ---
 try:
     from _version import __version__
 except ImportError:
     __version__ = "dev"
-# -------------------------
 
 def resource_path(relative_path):
-    """
-    Получает абсолютный путь к ресурсу. Работает и для исходников,
-    и для скомпилированного приложения.
-    """
     try:
-        # PyInstaller создает временную папку и сохраняет путь в _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
-        # Если мы не в скомпилированном приложении, base_path - это папка, где лежит main.py
         base_path = os.path.abspath(".")
-
     return os.path.join(base_path, relative_path)
-
 
 class AddSiteDialog(tk.Toplevel):
     # ... (содержимое этого класса без изменений)
-    """Диалоговое окно для анализа и добавления доменов сайта."""
     def __init__(self, parent, on_complete_callback):
         super().__init__(parent)
         self.parent = parent
@@ -78,16 +71,16 @@ class AddSiteDialog(tk.Toplevel):
         self.progress.stop()
         if domains:
             self.on_complete_callback(domains)
-            messagebox.showinfo("Успех", "Анализ завершен. Новые домены добавлены в custom_list.txt.", parent=self)
+            messagebox.showinfo("Успех", "Анализ завершен.", parent=self)
         else:
-            messagebox.showerror("Ошибка", "Не удалось получить домены. Проверьте лог на наличие ошибок.", parent=self)
+            messagebox.showerror("Ошибка", "Не удалось получить домены.", parent=self)
         self.destroy()
 
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"AntiZapret Launcher v{__version__}")
-        self.root.geometry("700x700")
+        self.root.title(f"Zapret Launcher v{__version__}")
+        self.root.geometry("850x500")
         self.process = None
         self.log_queue = queue.Queue()
         self.create_widgets()
@@ -95,15 +88,24 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def create_widgets(self):
-        # ... (содержимое без изменений)
+        # --- Верхняя панель с кнопками ---
         top_frame = tk.Frame(self.root)
         top_frame.pack(pady=10, padx=10, fill=tk.X)
+        
         self.run_button = tk.Button(top_frame, text="Запустить профиль", command=self.select_and_run_bat)
         self.run_button.pack(side=tk.LEFT)
         self.stop_button = tk.Button(top_frame, text="Остановить/Проверить", command=self.stop_process)
         self.stop_button.pack(side=tk.LEFT, padx=5)
         self.add_site_button = tk.Button(top_frame, text="Анализ сайта", command=self.open_add_site_dialog)
         self.add_site_button.pack(side=tk.LEFT, padx=5)
+        
+        # --- Кнопки обновления справа ---
+        self.update_launcher_button = tk.Button(top_frame, text="Обновить Лаунчер", command=self.run_self_update)
+        self.update_launcher_button.pack(side=tk.RIGHT, padx=(10, 0))
+        self.update_zapret_button = tk.Button(top_frame, text="Обновить Zapret", command=self.open_zapret_update_dialog)
+        self.update_zapret_button.pack(side=tk.RIGHT)
+
+        # ... остальной код виджетов без изменений
         list_frame = tk.Frame(self.root)
         list_frame.pack(pady=5, padx=10, fill=tk.BOTH, expand=True)
         tk.Label(list_frame, text="Выберите профиль для запуска:").pack(anchor=tk.W)
@@ -120,11 +122,41 @@ class App:
         setup_text_widget_bindings(self.log_window)
         setup_text_widget_bindings(self.bat_listbox)
 
+    def run_self_update(self):
+        """Запускает процесс самообновления лаунчера."""
+        if messagebox.askyesno("Подтверждение", "Программа скачает последнюю версию с GitHub и закроется для обновления.\n\nПродолжить?"):
+            try:
+                updater_path = resource_path('_run_updater.bat')
+                if not os.path.exists(updater_path):
+                    messagebox.showerror("Ошибка", "Файл '_run_updater.bat' не найден!")
+                    return
+
+                # Запускаем батник в новом, отдельном процессе и консольном окне
+                subprocess.Popen([updater_path], creationflags=subprocess.CREATE_NEW_CONSOLE)
+                
+                # Сразу же закрываем текущее приложение
+                self.root.destroy()
+            except Exception as e:
+                messagebox.showerror("Ошибка запуска", f"Не удалось запустить процесс обновления:\n{e}")
+
     def open_add_site_dialog(self):
         AddSiteDialog(self.root, self.add_domains_to_list)
 
+    def open_zapret_update_dialog(self):
+        if messagebox.askyesno("Подтверждение", "Это скачает последнюю версию утилиты Zapret от разработчика Flowseal.\n\nВсе активные процессы будут остановлены. Продолжить?"):
+            update_thread = threading.Thread(target=self._zapret_update_worker, daemon=True)
+            update_thread.start()
+
+    def _zapret_update_worker(self):
+        update_zapret_tool(resource_path('.'), self.log_message)
+        self.root.after(0, self.refresh_bat_list)
+
+    def refresh_bat_list(self):
+        self.log_message("-> Обновляю список профилей...")
+        self.bat_listbox.delete(0, tk.END)
+        self.populate_bat_files()
+
     def add_domains_to_list(self, new_domains):
-        # *** ИЗМЕНЕНО: Используем resource_path для доступа к файлу ***
         custom_list_path = resource_path('custom_list.txt')
         try:
             existing_domains = set()
@@ -151,30 +183,25 @@ class App:
             messagebox.showerror("Ошибка файла", f"Не удалось записать в {custom_list_path}:\n{e}")
 
     def populate_bat_files(self):
-        # *** ИЗМЕНЕНО: Используем resource_path для поиска папки ***
-        zapret_dir = resource_path('zapret-discord-youtube-1.8.1')
-        if not os.path.isdir(zapret_dir):
-            messagebox.showerror("Ошибка", f"Папка 'zapret-discord-youtube-1.8.1' не найдена.")
+        base_path = resource_path('.')
+        zapret_folders = glob.glob(os.path.join(base_path, 'zapret-discord-youtube-*'))
+        if not zapret_folders:
+            messagebox.showerror("Ошибка", f"Папка 'zapret-discord-youtube-*' не найдена.")
             self.bat_files = []
             return
+        zapret_dir = zapret_folders[0]
         self.bat_files = find_bat_files(zapret_dir)
-        
-        # Отображаемый путь строим относительно основной папки, а не временной
-        project_root = os.path.abspath(".")
+        self.bat_listbox.delete(0, tk.END)
         for abs_path in self.bat_files:
-            # Нам нужно показать простой путь, а не временный
             try:
-                # Пытаемся построить путь относительно папки, где лежит exe
-                display_path = os.path.relpath(abs_path, resource_path('')).replace('\\', '/')
+                display_path = os.path.relpath(abs_path, base_path).replace('\\', '/')
             except ValueError:
-                # Если не получается (например, разные диски), показываем только имя файла
-                display_path = os.path.join('zapret-discord-youtube-1.8.1', os.path.basename(abs_path))
+                display_path = os.path.join(os.path.basename(zapret_dir), os.path.basename(abs_path))
             self.bat_listbox.insert(tk.END, display_path)
 
     def select_and_run_bat(self):
-        # ... (код без изменений)
         if self.process and self.process.poll() is None:
-            messagebox.showinfo("Информация", "Процесс уже запущен. Для перезапуска сначала остановите его.")
+            messagebox.showinfo("Информация", "Процесс уже запущен.")
             return
         selected_indices = self.bat_listbox.curselection()
         if not selected_indices:
@@ -185,7 +212,6 @@ class App:
         self.run_process(file_path)
 
     def run_process(self, file_path):
-        # ... (код без изменений)
         self.log_window.config(state='normal')
         self.log_window.delete('1.0', tk.END)
         self.log_window.config(state='disabled')
@@ -193,7 +219,7 @@ class App:
         self.log_message(f"Запуск профиля: {os.path.basename(file_path)}")
         self.process = run_bat_file(file_path, self.log_message)
         if not self.process:
-            self.log_message("Не удалось запустить процесс. Проверьте логи выше на наличие ошибок.")
+            self.log_message("Не удалось запустить процесс.")
             return
         self.run_button.config(state=tk.DISABLED)
         self.bat_listbox.config(state=tk.DISABLED)
@@ -203,13 +229,11 @@ class App:
         self.monitor_process()
 
     def read_process_output(self, process, q):
-        # ... (код без изменений)
         for line in iter(process.stdout.readline, ''):
             q.put(line)
         q.put(None)
 
     def monitor_process(self):
-        # ... (код без изменений)
         try:
             line = self.log_queue.get_nowait()
             if line is None:
@@ -222,7 +246,6 @@ class App:
             self.root.after(100, self.monitor_process)
 
     def process_finished(self):
-        # ... (код без изменений)
         return_code = self.process.poll() if self.process else 'N/A'
         self.log_message(f"\nПроцесс завершен с кодом {return_code}.")
         self.run_button.config(state=tk.NORMAL)
@@ -230,7 +253,6 @@ class App:
         self.process = None
 
     def stop_process(self):
-        # ... (код без изменений)
         self.log_message("\n" + "="*40)
         self.log_message("--- ОСТАНОВКА / ПРОВЕРКА ПРОЦЕССА ---")
         kill_existing_processes(self.log_message)
@@ -240,29 +262,23 @@ class App:
         self.process = None
         
     def check_process_status(self):
-        # ... (код без изменений)
         self.log_message("Проверка статуса через системный tasklist...")
         try:
             command = 'tasklist /FI "IMAGENAME eq winws.exe"'
             result = subprocess.run(command, capture_output=True, text=True, check=False, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             if 'winws.exe' in result.stdout.lower():
                 self.log_message("!!! ВНИМАНИЕ: Процесс winws.exe все еще активен!")
-                self.log_message("    Возможно, для его остановки требуются права администратора.")
             else:
                 self.log_message("ПОДТВЕРЖДЕНО: Процесс winws.exe в системе не найден.")
-        except FileNotFoundError:
-             self.log_message("WARNING: Команда 'tasklist' не найдена. Не могу проверить статус.")
         except Exception as e:
             self.log_message(f"ERROR: Ошибка при проверке статуса: {e}")
         self.log_message("="*40 + "\n")
 
     def on_closing(self):
-        # ... (код без изменений)
         self.stop_process()
         self.root.destroy()
 
     def log_message(self, message):
-        # ... (код без изменений)
         self.log_window.config(state='normal')
         self.log_window.insert(tk.END, message + "\n")
         self.log_window.config(state='disabled')

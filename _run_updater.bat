@@ -1,65 +1,52 @@
 @echo off
+REM Устанавливаем кодировку UTF-8 для корректного вывода из Python
 chcp 65001 > nul
+
 echo.
-echo ==================================================
-echo               DPI GUI UPDATER
-echo ==================================================
-echo.
-echo Этот скрипт скачает последнюю версию с GitHub,
-echo скомпилирует ее и заменит текущие файлы.
-echo.
-echo ВНИМАНИЕ: Текущее окно программы будет закрыто!
+echo --- The main application is now closed. Starting the update process... ---
 echo.
 
-REM Принудительно закрываем основное приложение, если оно запущено
-taskkill /F /IM dpi_gui.exe > nul 2>&1
-
-REM Запускаем Python-скрипт для скачивания и сборки
+REM --- Запускаем основной скрипт обновления ---
 python update.py
 
-REM Проверяем, успешно ли отработал скрипт
+REM --- Проверяем результат ---
 if %errorlevel% neq 0 (
     echo.
-    echo !!! ПРОИЗОШЛА ОШИБКА НА ЭТАПЕ СКАЧИВАНИЯ/СБОРКИ. !!!
-    echo Обновление отменено.
+    echo !!! An error occurred during download/build. Update canceled.
     goto end
 )
 
 echo.
-echo --- УСТАНОВКА ОБНОВЛЕНИЯ ---
+echo --- Installing Update ---
 echo.
 
-REM *** ИЗМЕНЕНО: Путь к новой сборке стал статичным ***
+REM --- Находим путь к новой сборке ---
 set "SOURCE_PATH=_update_temp\dist\dpi_gui"
 
-REM Проверяем, существует ли папка
+REM --- Проверяем, существует ли папка ---
 if not exist "%SOURCE_PATH%" (
-    echo !!! Не удалось найти папку с новой сборкой: %SOURCE_PATH%
+    echo !!! Could not find the new build folder: %SOURCE_PATH%
     goto end
 )
 
-echo -> Найдена новая версия в: %SOURCE_PATH%
-echo -> Текущая директория: %cd%
-echo.
-echo -> Копирую файлы с заменой...
-
-REM Копируем все содержимое новой папки в текущую с заменой
+REM --- Копируем файлы с заменой ---
+echo -> Copying new files...
 xcopy "%SOURCE_PATH%" "." /E /H /C /I /Y > nul
 
 if %errorlevel% neq 0 (
-    echo !!! ОШИБКА КОПИРОВАНИЯ ФАЙЛОВ.
+    echo !!! ERROR COPYING FILES.
     goto end
 )
 
-echo -> Копирование завершено.
+echo -> Copying complete.
 echo.
-echo -> Очищаю временные файлы...
+echo -> Cleaning up temporary files...
 rmdir /s /q _update_temp
 
 echo.
 echo ==================================================
-echo      ОБНОВЛЕНИЕ УСПЕШНО ЗАВЕРШЕНО!
-echo      Можно запускать dpi_gui.exe
+echo      UPDATE COMPLETED SUCCESSFULLY!
+echo      You can now run dpi_gui.exe
 echo ==================================================
 echo.
 
