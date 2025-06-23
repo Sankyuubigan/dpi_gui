@@ -1,2 +1,23 @@
-/__pycache__
-/zapret-discord-youtube-1.8.1
+# Файлы и папки PyInstaller
+/dist/
+/build/
+*.spec
+
+# Временный файл версии
+_version.py
+
+# Временная папка для обновлений
+_update_temp/
+
+# Кэш Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Файлы IDE
+.vscode/
+.idea/
+
+#Файлы антизапрета
+zapret-discord-youtube*
