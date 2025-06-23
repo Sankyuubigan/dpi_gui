@@ -86,8 +86,8 @@ class AddSiteDialog(tk.Toplevel):
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"Zapret Launcher v{__version__}")
-        self.root.geometry("700x500")
+        self.root.title(f"AntiZapret Launcher v{__version__}")
+        self.root.geometry("700x700")
         self.process = None
         self.log_queue = queue.Queue()
         self.create_widgets()
