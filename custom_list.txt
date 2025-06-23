@@ -37,3 +37,4 @@ quay.io
 docker.io
 huggingface.co
 glama.ai
+static.glama.ai
