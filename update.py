@@ -6,14 +6,13 @@ import shutil
 import subprocess
 
 # --- КОНФИГУРАЦИЯ ---
-# *** ИЗМЕНЕНО: Добавлен ваш репозиторий ***
 GITHUB_REPO = 'Sankyuubigan/dpi_gui' 
 BRANCH = 'main'
 # ----------------------
 
 TEMP_DIR = "_update_temp"
 USER_FILES = [
-    "zapret-discord-youtube-1.8.1", # Это имя будет искаться для копирования
+    "zapret-discord-youtube-1.8.1",
     "custom_list.txt"
 ]
 DOWNLOAD_URL = f"https://github.com/{GITHUB_REPO}/archive/refs/heads/{BRANCH}.zip"
@@ -25,21 +24,23 @@ def cleanup():
 
 def copy_user_data(destination_dir):
     print("-> Preserving user data (zapret folder and custom list)...")
-    
-    # Ищем папку zapret по шаблону, так как версия может меняться
     zapret_folder_found = False
+    current_zapret_folder = ""
     for item in os.listdir('.'):
         if os.path.isdir(item) and item.startswith('zapret-discord-youtube-'):
-            USER_FILES[0] = item # Обновляем имя папки на актуальное
+            current_zapret_folder = item
             zapret_folder_found = True
             break
+    
+    files_to_copy = [f for f in USER_FILES if f != "zapret-discord-youtube-1.8.1"]
+    if zapret_folder_found:
+        files_to_copy.insert(0, current_zapret_folder)
 
-    for item in USER_FILES:
+    for item in files_to_copy:
         if not os.path.exists(item):
             print(f"   - WARNING: '{item}' not found, skipping.")
             continue
-        
-        destination_path = os.path.join(destination_dir, item)
+        destination_path = os.path.join(destination_dir, os.path.basename(item))
         try:
             if os.path.isdir(item):
                 shutil.copytree(item, destination_path)
@@ -52,6 +53,7 @@ def copy_user_data(destination_dir):
     return True
 
 def update():
+    """Выполняет полный цикл обновления."""
     cleanup()
     
     print(f"-> Downloading latest GUI version from {GITHUB_REPO}...")
@@ -88,21 +90,31 @@ def update():
         python_executable = sys.executable
         build_script_path = os.path.join(source_path, 'build.py')
         command = [python_executable, build_script_path, '--source-dir', source_path]
-        subprocess.run(command, check=True)
+        subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8')
         print("-> New GUI version built successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"!!! NEW VERSION BUILD ERROR: !!!")
+        print("--- STDOUT ---")
+        print(e.stdout)
+        print("--- STDERR ---")
+        print(e.stderr)
+        cleanup()
+        return False
     except Exception as e:
-        print(f"!!! NEW VERSION BUILD ERROR: {e}")
+        print(f"!!! An unexpected build error occurred: {e}")
         cleanup()
         return False
 
     print("\n--- Update is ready to be installed. ---")
-    print("Close this window, and the .bat file will complete the installation.")
+    print("The batch file will now complete the installation.")
     return True
 
 if __name__ == "__main__":
+    print("==================================================")
+    print("               DPI GUI UPDATER SCRIPT             ")
+    print("==================================================")
     if GITHUB_REPO == 'YOUR_GITHUB_USERNAME/YOUR_REPO_NAME':
-        print("="*60)
-        print("!!! ATTENTION: GITHUB REPOSITORY IS NOT CONFIGURED !!!")
+        print("\n!!! ATTENTION: GITHUB REPOSITORY IS NOT CONFIGURED !!!")
         sys.exit(1)
     if not update():
         sys.exit(1)

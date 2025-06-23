@@ -1,18 +1,17 @@
 @echo off
-REM Устанавливаем кодировку UTF-8 для корректного вывода из Python
+REM This batch file is now 100% ASCII to avoid any encoding issues.
+REM All user-facing messages are handled by the python script.
+
+REM Set UTF-8 codepage just in case for python's output
 chcp 65001 > nul
 
-echo.
-echo --- The main application is now closed. Starting the update process... ---
-echo.
-
-REM --- Запускаем основной скрипт обновления ---
+REM --- Run the main python update script ---
 python update.py
 
-REM --- Проверяем результат ---
+REM --- Check the result ---
 if %errorlevel% neq 0 (
     echo.
-    echo !!! An error occurred during download/build. Update canceled.
+    echo !!! The python script reported an error. Update canceled.
     goto end
 )
 
@@ -20,16 +19,16 @@ echo.
 echo --- Installing Update ---
 echo.
 
-REM --- Находим путь к новой сборке ---
+REM --- Find the path to the new build ---
 set "SOURCE_PATH=_update_temp\dist\dpi_gui"
 
-REM --- Проверяем, существует ли папка ---
+REM --- Check if the folder exists ---
 if not exist "%SOURCE_PATH%" (
     echo !!! Could not find the new build folder: %SOURCE_PATH%
     goto end
 )
 
-REM --- Копируем файлы с заменой ---
+REM --- Copy files, replacing old ones ---
 echo -> Copying new files...
 xcopy "%SOURCE_PATH%" "." /E /H /C /I /Y > nul
 
@@ -46,7 +45,6 @@ rmdir /s /q _update_temp
 echo.
 echo ==================================================
 echo      UPDATE COMPLETED SUCCESSFULLY!
-echo      You can now run dpi_gui.exe
 echo ==================================================
 echo.
 
