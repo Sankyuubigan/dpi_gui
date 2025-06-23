@@ -6,7 +6,7 @@ import shutil
 import subprocess
 
 # --- КОНФИГУРАЦИЯ ---
-GITHUB_REPO = 'YOUR_GITHUB_USERNAME/YOUR_REPO_NAME' 
+GITHUB_REPO = 'Sankyuubigan/dpi_gui' 
 BRANCH = 'main'
 # ----------------------
 
