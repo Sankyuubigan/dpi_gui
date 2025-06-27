@@ -30,18 +30,30 @@ def print_status(message):
 def download_file(url, dest_path):
     """Скачивает файл с отображением прогресса."""
     try:
-        response = requests.get(url, stream=True)
+        response = requests.get(url, stream=True, timeout=15)
         response.raise_for_status()
         total_size = int(response.headers.get('content-length', 0))
         
+        print_status(f"Скачиваю {url.split('/')[-1]}...")
         with open(dest_path, 'wb') as f:
             downloaded = 0
             for chunk in response.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                
                 f.write(chunk)
                 downloaded += len(chunk)
-                done = int(50 * downloaded / total_size)
-                sys.stdout.write(f"\r    -> [{'=' * done}{' ' * (50 - done)}] {downloaded / (1024 * 1024):.2f} MB")
+                
+                # Если размер известен, показываем прогресс-бар
+                if total_size > 0:
+                    done = int(50 * downloaded / total_size)
+                    sys.stdout.write(f"\r    -> [{'=' * done}{' ' * (50 - done)}] {downloaded / (1024 * 1024):.2f} / {total_size / (1024 * 1024):.2f} MB")
+                # Если размер неизвестен, показываем только скачанный объем
+                else:
+                    sys.stdout.write(f"\r    -> Скачано: {downloaded / (1024 * 1024):.2f} MB")
+                
                 sys.stdout.flush()
+
         sys.stdout.write('\n')
         return True
     except requests.exceptions.RequestException as e:
@@ -99,31 +111,36 @@ def update_app_scripts(commit_hash):
     if not download_file(zip_url, temp_zip_path):
         return
 
-    # Удаляем старое содержимое папки, если оно есть
-    if os.path.exists(APP_DIR):
-        shutil.rmtree(APP_DIR)
-    os.makedirs(APP_DIR)
+    # Временная папка для безопасной распаковки
+    temp_extract_dir = "temp_extract"
+    if os.path.exists(temp_extract_dir):
+        shutil.rmtree(temp_extract_dir)
+    os.makedirs(temp_extract_dir)
 
-    print_status("Распаковываю скрипты...")
+    print_status("Распаковываю скрипты во временную папку...")
     with zipfile.ZipFile(temp_zip_path, 'r') as zf:
-        # GitHub упаковывает все в папку типа 'repo-name-hash'
-        # Нам нужно извлечь содержимое этой папки в APP_DIR
-        top_level_folder = zf.namelist()
-        for member in zf.infolist():
-            # Изменяем путь, чтобы извлечь без родительской папки
-            new_path = os.path.join(APP_DIR, os.path.relpath(member.filename, top_level_folder))
-            if member.is_dir():
-                if not os.path.exists(new_path):
-                    os.makedirs(new_path)
-            else:
-                # Убедимся, что директория для файла существует
-                if not os.path.exists(os.path.dirname(new_path)):
-                    os.makedirs(os.path.dirname(new_path))
-                with open(new_path, 'wb') as f:
-                    f.write(zf.read(member.filename))
+        zf.extractall(temp_extract_dir)
 
     os.remove(temp_zip_path)
     
+    # GitHub упаковывает все в папку типа 'repo-name-hash'
+    # Нам нужно найти эту папку
+    source_dir = os.path.join(temp_extract_dir, f"{GITHUB_REPO_NAME}-{commit_hash}", "app_src")
+    
+    if not os.path.exists(source_dir):
+        print_status(f"ОШИБКА: Не найдена папка 'app_src' в скачанном архиве.")
+        shutil.rmtree(temp_extract_dir)
+        return
+
+    # Удаляем старую папку и перемещаем новую на ее место
+    if os.path.exists(APP_DIR):
+        shutil.rmtree(APP_DIR)
+    
+    shutil.move(source_dir, APP_DIR)
+    
+    # Очищаем временную папку
+    shutil.rmtree(temp_extract_dir)
+
     # Сохраняем хэш новой версии
     with open(VERSION_FILE, 'w') as f:
         f.write(commit_hash)
@@ -159,7 +176,7 @@ def main():
     main_script_path = os.path.join(APP_DIR, 'gui.py')
     if not os.path.exists(main_script_path):
         print_status(f"ОШИБКА: Основной скрипт не найден по пути {main_script_path}")
-        print_status("Попробуйте удалить папку app_src и перезапустить лаунчер.")
+        print_status("Попробуйте удалить папки 'app_src' и 'python_runtime' и перезапустить лаунчер.")
         input("Нажмите Enter для выхода...")
         return
         
