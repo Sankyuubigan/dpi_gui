@@ -13,10 +13,10 @@ __pycache__/
 .vscode/
 .idea/
 
-# Папки, управляемые лаунчером
+# Папки и файлы, управляемые лаунчером
 /python_runtime/
-/app_src/
 app_update.zip
+app_src/.version_hash # Игнорируем только файл версии, а не всю папку
 
 # Файлы антизапрета (пользовательские данные)
 zapret-discord-youtube*
