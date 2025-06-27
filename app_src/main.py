@@ -42,8 +42,8 @@ class UpdateDialog(tk.Toplevel):
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"Zapret Launcher (Dynamic Version)")
-        self.root.geometry("850x500")
+        self.root.title(f"AntiZapret Launcher")
+        self.root.geometry("850x850")
         self.process = None
         self.log_queue = queue.Queue()
 

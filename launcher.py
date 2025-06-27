@@ -100,10 +100,8 @@ def setup_python():
             zf.extractall(temp_unpack_dir)
         os.remove(temp_zip_path)
 
-        # --- ИСПРАВЛЕНО: Надежный поиск и перемещение папки 'python' ---
         unpacked_root_name = next(os.scandir(temp_unpack_dir)).name
         unpacked_root_path = os.path.join(temp_unpack_dir, unpacked_root_name)
-        
         source_python_dir = os.path.join(unpacked_root_path, 'python')
 
         if not os.path.exists(source_python_dir):
@@ -184,13 +182,6 @@ def main():
 
     if not setup_python(): return
 
-    python_exe = os.path.join(PYTHON_DIR, 'python.exe')
-    requirements_path = os.path.join(APP_DIR, 'requirements.txt')
-    if os.path.exists(requirements_path):
-        pip_command = [python_exe, '-m', 'pip', 'install', '-r', requirements_path]
-        print_status("Проверка и установка зависимостей (requests)...")
-        subprocess.run(pip_command, check=True, capture_output=True, text=True)
-
     print_status("Проверка обновлений скриптов...")
     latest_hash = get_latest_commit_hash()
     local_hash = get_local_commit_hash()
@@ -208,6 +199,16 @@ def main():
             print_status("ОБНОВЛЕНИЕ НЕ УДАЛОСЬ. Запускаю старую версию.")
     else:
         print_status("У вас последняя версия скриптов.")
+
+    # --- ИСПРАВЛЕНО: Установка зависимостей ПОСЛЕ обновления скриптов ---
+    python_exe = os.path.join(PYTHON_DIR, 'python.exe')
+    requirements_path = os.path.join(APP_DIR, 'requirements.txt')
+    if os.path.exists(requirements_path):
+        pip_command = [python_exe, '-m', 'pip', 'install', '-r', requirements_path]
+        print_status("Проверка и установка зависимостей...")
+        # Используем capture_output, чтобы не замусоривать консоль выводом pip
+        subprocess.run(pip_command, check=True, capture_output=True, text=True)
+        print_status("Зависимости успешно установлены.")
 
     main_script_path = os.path.join(APP_DIR, 'main.py')
     if not os.path.exists(main_script_path):
