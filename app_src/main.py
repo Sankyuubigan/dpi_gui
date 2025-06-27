@@ -24,17 +24,24 @@ from executor import (
 from text_utils import setup_text_widget_bindings
 from version_checker import check_zapret_version
 
-__version__ = "dynamic"
-
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"AntiZapret Launcher")
-        self.root.geometry("850x850")
+        
+        # --- ИСПРАВЛЕНО: Читаем версию из файла .version_hash ---
+        version_hash = "unknown"
+        version_file_path = os.path.join(APP_SOURCE_DIR, ".version_hash")
+        if os.path.exists(version_file_path):
+            with open(version_file_path, 'r') as f:
+                full_hash = f.read().strip()
+                if full_hash:
+                    version_hash = full_hash[:7] # Показываем короткий хэш
+
+        self.root.title(f"Zapret Launcher (Commit: {version_hash})")
+        self.root.geometry("850x500")
         self.process = None
         self.log_queue = queue.Queue()
 
-        # --- ИСПРАВЛЕНО: Теперь 'дом' приложения - это папка app_src ---
         self.app_dir = APP_SOURCE_DIR 
         self.resources_path = APP_SOURCE_DIR
 
@@ -93,7 +100,6 @@ class App:
             update_thread.start()
 
     def _zapret_update_worker(self):
-        # Теперь передаем правильный путь (app_src)
         update_zapret_tool(self.app_dir, self.log_message)
         self.root.after(0, self.refresh_bat_list)
 
@@ -102,7 +108,6 @@ class App:
         self.populate_bat_files()
 
     def add_domains_to_list(self, new_domains):
-        # Теперь custom_list.txt тоже ищется в app_src
         custom_list_path = os.path.join(self.app_dir, 'custom_list.txt')
         try:
             existing_domains = set()
@@ -130,7 +135,6 @@ class App:
 
     def populate_bat_files(self):
         self.bat_listbox.delete(0, tk.END)
-        # Теперь ищем папки zapret в правильном месте (app_src)
         zapret_folders = glob.glob(os.path.join(self.app_dir, 'zapret-discord-youtube-*'))
         
         if not zapret_folders:
@@ -174,7 +178,6 @@ class App:
         self.log_window.config(state='disabled')
         kill_existing_processes(self.log_message)
         self.log_message(f"Запуск профиля: {os.path.basename(file_path)}")
-        # Передаем правильный путь (app_src) для поиска custom_list.txt
         self.process = run_bat_file(file_path, self.app_dir, self.log_message)
         if not self.process:
             self.log_message("Не удалось запустить процесс.")

@@ -20,10 +20,11 @@ except ImportError:
     SELENIUM_AVAILABLE = False
 
 def update_zapret_tool(base_dir, log_callback):
-    # ... (код этой функции без изменений)
+    """Скачивает и корректно распаковывает утилиту Zapret в папку с версией."""
     ZAPRET_REPO = "Flowseal/zapret-discord-youtube"
     API_URL = f"https://api.github.com/repos/{ZAPRET_REPO}/releases/latest"
     log_callback("\n--- Обновление утилиты Zapret ---")
+    
     try:
         log_callback("-> Запрос к GitHub API для поиска последнего релиза...")
         response = requests.get(API_URL)
@@ -43,6 +44,8 @@ def update_zapret_tool(base_dir, log_callback):
     except Exception as e:
         log_callback(f"!!! ОШИБКА: Не удалось получить информацию о релизе: {e}")
         return
+
+    # --- ИСПРАВЛЕНО: Логика распаковки ---
     temp_zip_path = os.path.join(base_dir, '_zapret_update.zip')
     try:
         log_callback(f"-> Скачиваю архив: {zip_url}")
@@ -55,18 +58,29 @@ def update_zapret_tool(base_dir, log_callback):
         log_callback(f"!!! ОШИБКА СКАЧИВАНИЯ: {e}")
         if os.path.exists(temp_zip_path): os.remove(temp_zip_path)
         return
+
     try:
         log_callback("-> Остановка активных процессов winws.exe...")
         kill_existing_processes(log_callback)
-        log_callback("-> Удаление старой версии папки 'zapret'...")
+        
+        log_callback("-> Удаление старых версий папок 'zapret'...")
         old_zapret_folders = glob.glob(os.path.join(base_dir, 'zapret-discord-youtube-*'))
         for folder in old_zapret_folders:
             shutil.rmtree(folder)
             log_callback(f"   - Удалена папка: {os.path.basename(folder)}")
+
+        # 1. Создаем целевую папку с правильным именем
+        target_dir = os.path.join(base_dir, f"zapret-discord-youtube-{tag_name}")
+        os.makedirs(target_dir, exist_ok=True)
+        log_callback(f"-> Создана папка: {os.path.basename(target_dir)}")
+
+        # 2. Распаковываем архив ВНУТРЬ этой папки
         log_callback("-> Распаковка новой версии...")
         with zipfile.ZipFile(temp_zip_path, 'r') as zf:
-            zf.extractall(base_dir)
+            zf.extractall(target_dir)
+        
         log_callback(f"-> Утилита Zapret успешно обновлена до версии {tag_name}!")
+
     except Exception as e:
         log_callback(f"!!! ОШИБКА ПРИ УСТАНОВКЕ: {e}")
     finally:
@@ -75,8 +89,8 @@ def update_zapret_tool(base_dir, log_callback):
             log_callback("-> Временный архив удален.")
         log_callback("--- Обновление утилиты Zapret завершено ---\n")
 
+
 def analyze_site_domains(url: str, log_callback):
-    # ... (код этой функции без изменений)
     if not SELENIUM_AVAILABLE:
         log_callback("ОШИБКА: Библиотека Selenium не установлена.")
         return None
@@ -119,7 +133,6 @@ def analyze_site_domains(url: str, log_callback):
         log_callback("Анализ завершен, браузер закрыт.")
 
 def find_bat_files(directory="."):
-    # ... (код этой функции без изменений)
     bat_files = []
     if not os.path.isdir(directory): return []
     for root, _, files in os.walk(directory):
@@ -129,7 +142,6 @@ def find_bat_files(directory="."):
     return sorted(bat_files)
 
 def kill_existing_processes(log_callback):
-    # ... (код этой функции без изменений)
     try:
         result = subprocess.run(
             ["taskkill", "/F", "/IM", "winws.exe"], check=False, capture_output=True, text=True,
@@ -143,12 +155,10 @@ def kill_existing_processes(log_callback):
         log_callback(f"ERROR: Ошибка при попытке остановить процессы: {e}")
 
 def get_game_filter_value(base_dir):
-    # ... (код этой функции без изменений)
     game_flag_file = os.path.join(base_dir, 'bin', 'game_filter.enabled')
     return "1024-65535" if os.path.exists(game_flag_file) else "0"
 
 def is_custom_list_valid(filepath, log_callback):
-    # ... (код этой функции без изменений)
     if not os.path.exists(filepath):
         return False
     if os.path.getsize(filepath) == 0:
@@ -163,24 +173,18 @@ def is_custom_list_valid(filepath, log_callback):
     return False
 
 def parse_command_from_bat(file_path, log_callback):
-    """
-    Извлекает строку аргументов для winws.exe из .bat файла.
-    Эта версия более надежная.
-    """
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
         
-        # Ищем маркер и берем все, что после него
         marker = 'winws.exe"'
         parts = content.split(marker, 1)
         
         if len(parts) < 2:
             log_callback(f"DEBUG: Не удалось найти маркер '{marker}' в файле {os.path.basename(file_path)}")
-            return "" # Возвращаем пустую строку, как и раньше
+            return ""
             
-        command_str = parts[1]
-        # Заменяем символы переноса и новые строки на пробелы
+        command_str = parts
         command_str = command_str.replace('^', ' ').replace('\n', ' ').strip()
         log_callback(f"DEBUG: Успешно извлечена команда из {os.path.basename(file_path)}")
         return command_str
@@ -189,13 +193,11 @@ def parse_command_from_bat(file_path, log_callback):
         return ""
 
 def run_bat_file(file_path, app_base_path, log_callback):
-    # ... (остальной код без изменений)
     bat_base_dir = os.path.dirname(file_path)
     custom_list_path = os.path.join(app_base_path, 'custom_list.txt')
     custom_list_is_valid = is_custom_list_valid(custom_list_path, log_callback)
     game_filter = get_game_filter_value(bat_base_dir)
     
-    # *** ИЗМЕНЕНО: Передаем log_callback в парсер для отладки ***
     raw_command_str = parse_command_from_bat(file_path, log_callback)
     
     if not raw_command_str:
