@@ -11,7 +11,6 @@ import zipfile
 import shutil
 import glob
 
-# --- Selenium imports ---
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
@@ -20,15 +19,11 @@ try:
 except ImportError:
     SELENIUM_AVAILABLE = False
 
-# --- Новая функция обновления утилиты Zapret ---
 def update_zapret_tool(base_dir, log_callback):
-    """Скачивает и устанавливает последний релиз утилиты Zapret."""
+    # ... (код этой функции без изменений)
     ZAPRET_REPO = "Flowseal/zapret-discord-youtube"
     API_URL = f"https://api.github.com/repos/{ZAPRET_REPO}/releases/latest"
-    
     log_callback("\n--- Обновление утилиты Zapret ---")
-    
-    # 1. Получаем информацию о последнем релизе
     try:
         log_callback("-> Запрос к GitHub API для поиска последнего релиза...")
         response = requests.get(API_URL)
@@ -48,8 +43,6 @@ def update_zapret_tool(base_dir, log_callback):
     except Exception as e:
         log_callback(f"!!! ОШИБКА: Не удалось получить информацию о релизе: {e}")
         return
-
-    # 2. Скачивание архива
     temp_zip_path = os.path.join(base_dir, '_zapret_update.zip')
     try:
         log_callback(f"-> Скачиваю архив: {zip_url}")
@@ -62,36 +55,28 @@ def update_zapret_tool(base_dir, log_callback):
         log_callback(f"!!! ОШИБКА СКАЧИВАНИЯ: {e}")
         if os.path.exists(temp_zip_path): os.remove(temp_zip_path)
         return
-
-    # 3. Подготовка к замене
     try:
         log_callback("-> Остановка активных процессов winws.exe...")
         kill_existing_processes(log_callback)
-
         log_callback("-> Удаление старой версии папки 'zapret'...")
-        # Ищем старую папку по шаблону, чтобы удалить любую версию
         old_zapret_folders = glob.glob(os.path.join(base_dir, 'zapret-discord-youtube-*'))
         for folder in old_zapret_folders:
             shutil.rmtree(folder)
             log_callback(f"   - Удалена папка: {os.path.basename(folder)}")
-
         log_callback("-> Распаковка новой версии...")
         with zipfile.ZipFile(temp_zip_path, 'r') as zf:
             zf.extractall(base_dir)
-        
         log_callback(f"-> Утилита Zapret успешно обновлена до версии {tag_name}!")
     except Exception as e:
         log_callback(f"!!! ОШИБКА ПРИ УСТАНОВКЕ: {e}")
     finally:
-        # Удаляем временный архив
         if os.path.exists(temp_zip_path):
             os.remove(temp_zip_path)
             log_callback("-> Временный архив удален.")
         log_callback("--- Обновление утилиты Zapret завершено ---\n")
 
-
-# ... (остальной код executor.py без изменений)
 def analyze_site_domains(url: str, log_callback):
+    # ... (код этой функции без изменений)
     if not SELENIUM_AVAILABLE:
         log_callback("ОШИБКА: Библиотека Selenium не установлена.")
         return None
@@ -134,6 +119,7 @@ def analyze_site_domains(url: str, log_callback):
         log_callback("Анализ завершен, браузер закрыт.")
 
 def find_bat_files(directory="."):
+    # ... (код этой функции без изменений)
     bat_files = []
     if not os.path.isdir(directory): return []
     for root, _, files in os.walk(directory):
@@ -143,6 +129,7 @@ def find_bat_files(directory="."):
     return sorted(bat_files)
 
 def kill_existing_processes(log_callback):
+    # ... (код этой функции без изменений)
     try:
         result = subprocess.run(
             ["taskkill", "/F", "/IM", "winws.exe"], check=False, capture_output=True, text=True,
@@ -156,40 +143,67 @@ def kill_existing_processes(log_callback):
         log_callback(f"ERROR: Ошибка при попытке остановить процессы: {e}")
 
 def get_game_filter_value(base_dir):
+    # ... (код этой функции без изменений)
     game_flag_file = os.path.join(base_dir, 'bin', 'game_filter.enabled')
     return "1024-65535" if os.path.exists(game_flag_file) else "0"
 
 def is_custom_list_valid(filepath, log_callback):
-    if not os.path.exists(filepath): return False
-    if os.path.getsize(filepath) == 0: return False
+    # ... (код этой функции без изменений)
+    if not os.path.exists(filepath):
+        return False
+    if os.path.getsize(filepath) == 0:
+        return False
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
-                if line.strip() and not line.strip().startswith('#'): return True
-    except Exception: return False
+                if line.strip() and not line.strip().startswith('#'):
+                    return True
+    except Exception:
+        return False
     return False
 
-def parse_command_from_bat(file_path):
+def parse_command_from_bat(file_path, log_callback):
+    """
+    Извлекает строку аргументов для winws.exe из .bat файла.
+    Эта версия более надежная.
+    """
     try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f: content = f.read()
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        
+        # Ищем маркер и берем все, что после него
         marker = 'winws.exe"'
-        idx = content.find(marker)
-        if idx == -1: return ""
-        command_str = content[idx + len(marker):]
-        return command_str.replace('^', ' ').replace('\n', ' ').strip()
-    except Exception: return ""
+        parts = content.split(marker, 1)
+        
+        if len(parts) < 2:
+            log_callback(f"DEBUG: Не удалось найти маркер '{marker}' в файле {os.path.basename(file_path)}")
+            return "" # Возвращаем пустую строку, как и раньше
+            
+        command_str = parts[1]
+        # Заменяем символы переноса и новые строки на пробелы
+        command_str = command_str.replace('^', ' ').replace('\n', ' ').strip()
+        log_callback(f"DEBUG: Успешно извлечена команда из {os.path.basename(file_path)}")
+        return command_str
+    except Exception as e:
+        log_callback(f"DEBUG: Критическая ошибка при чтении файла {os.path.basename(file_path)}: {e}")
+        return ""
 
-def run_bat_file(file_path, log_callback):
-    base_dir = os.path.dirname(file_path)
-    custom_list_path = os.path.abspath('custom_list.txt')
+def run_bat_file(file_path, app_base_path, log_callback):
+    # ... (остальной код без изменений)
+    bat_base_dir = os.path.dirname(file_path)
+    custom_list_path = os.path.join(app_base_path, 'custom_list.txt')
     custom_list_is_valid = is_custom_list_valid(custom_list_path, log_callback)
-    game_filter = get_game_filter_value(base_dir)
-    raw_command_str = parse_command_from_bat(file_path)
+    game_filter = get_game_filter_value(bat_base_dir)
+    
+    # *** ИЗМЕНЕНО: Передаем log_callback в парсер для отладки ***
+    raw_command_str = parse_command_from_bat(file_path, log_callback)
+    
     if not raw_command_str:
-        log_callback(f"ERROR: Не удалось извлечь команду из файла {os.path.basename(file_path)}")
+        log_callback(f"ERROR: Не удалось извлечь команду из файла {os.path.basename(file_path)}. Проверьте содержимое .bat файла.")
         return None
-    bin_path_with_sep = os.path.join(base_dir, 'bin') + os.sep
-    lists_path_with_sep = os.path.join(base_dir, 'lists') + os.sep
+        
+    bin_path_with_sep = os.path.join(bat_base_dir, 'bin') + os.sep
+    lists_path_with_sep = os.path.join(bat_base_dir, 'lists') + os.sep
     substituted_str = raw_command_str.replace('%GameFilter%', game_filter)
     substituted_str = substituted_str.replace('%BIN%', bin_path_with_sep)
     substituted_str = substituted_str.replace('%LISTS%', lists_path_with_sep)
@@ -222,7 +236,7 @@ def run_bat_file(file_path, log_callback):
             final_args.extend(['--hostlist', custom_list_path])
         if i < len(blocks) - 1:
             final_args.append('--new')
-    executable_path = os.path.join(base_dir, 'bin', 'winws.exe')
+    executable_path = os.path.join(bat_base_dir, 'bin', 'winws.exe')
     final_command = [executable_path] + final_args
     log_callback("="*40)
     log_callback("ДЕТАЛИ ЗАПУСКА ПРОЦЕССА")
@@ -233,7 +247,7 @@ def run_bat_file(file_path, log_callback):
     log_callback("="*40)
     try:
         process = subprocess.Popen(
-            final_command, cwd=base_dir, stdout=subprocess.PIPE,
+            final_command, cwd=bat_base_dir, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True,
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
             encoding='utf-8', errors='ignore'

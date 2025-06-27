@@ -22,7 +22,7 @@ def run_command(command, cwd=None, check=True):
         )
         return result.stdout.strip()
     except FileNotFoundError:
-        print(f"!!! ОШИБКА: Команда '{command[0]}' не найдена. Убедитесь, что она установлена и доступна в PATH.")
+        print(f"!!! ОШИБКА: Команда '{command}' не найдена. Убедитесь, что она установлена и доступна в PATH.")
         return None
     except subprocess.CalledProcessError as e:
         print(f"!!! ОШИБКА ВЫПОЛНЕНИЯ КОМАНДЫ: {command}")
@@ -63,7 +63,7 @@ def cleanup_old_releases():
         for line in lines[RELEASES_TO_KEEP + 1:]:
             try:
                 # Тег обычно находится во втором столбце
-                tag = line.split('\t')[1]
+                tag = line.split('\t')
                 tags_to_delete.append(tag)
             except IndexError:
                 continue # Пропускаем строки с неверным форматом
@@ -96,7 +96,18 @@ def build_project(source_dir, no_release=False):
     try:
         python_executable = sys.executable
         spec_file_path = os.path.join(source_dir, SPEC_FILE)
-        command = [python_executable, "-m", "PyInstaller", "--noconfirm", "--clean", spec_file_path]
+        icon_file = os.path.join(source_dir, 'icon.ico')
+
+        command = [
+            python_executable, "-m", "PyInstaller", "--noconfirm", "--clean"
+        ]
+        
+        # Добавляем иконку в .exe, если она существует
+        if os.path.exists(icon_file):
+            command.append(f"--icon={icon_file}")
+        
+        command.append(spec_file_path)
+
         subprocess.run(command, check=True, cwd=source_dir, capture_output=True)
         print("-> Сборка PyInstaller успешно завершена.")
     except Exception as e:

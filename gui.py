@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, simpledialog
 import os
 import sys
 import threading
@@ -8,26 +8,33 @@ import subprocess
 import glob
 import requests
 import zipfile
+import shutil
+import time
 from executor import (
     find_bat_files, run_bat_file, kill_existing_processes, 
     analyze_site_domains, update_zapret_tool
 )
 from text_utils import setup_text_widget_bindings
+from version_checker import check_zapret_version
 
 try:
     from _version import __version__
 except ImportError:
     __version__ = "dev"
 
-def resource_path(relative_path):
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+def get_base_path():
+    """
+    Возвращает правильный базовый путь для внутренних ресурсов.
+    Для скомпилированного .exe это будет папка _internal (_MEIPASS).
+    Для исходников - текущая директория.
+    """
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        return sys._MEIPASS
+    else:
+        return os.path.abspath(".")
 
 class UpdateDialog(tk.Toplevel):
-    """Диалоговое окно для отображения процесса обновления."""
+    # ... (содержимое этого класса без изменений)
     def __init__(self, parent, repo_url):
         super().__init__(parent)
         self.repo_url = repo_url
@@ -36,14 +43,11 @@ class UpdateDialog(tk.Toplevel):
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
-
-        self.protocol("WM_DELETE_WINDOW", lambda: None) # Запрещаем закрытие окна
-
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
         self.status_label = tk.Label(self, text="Подготовка к обновлению...")
         self.status_label.pack(pady=(10, 5))
         self.progress = ttk.Progressbar(self, mode='determinate', length=480)
         self.progress.pack(pady=10)
-        
         self.worker_thread = threading.Thread(target=self._update_worker, daemon=True)
         self.worker_thread.start()
 
@@ -55,7 +59,6 @@ class UpdateDialog(tk.Toplevel):
 
     def _update_worker(self):
         try:
-            # 1. Найти последний релиз
             self.log("Поиск последнего релиза на GitHub...", 10)
             api_url = f"https://api.github.com/repos/{self.repo_url}/releases/latest"
             response = requests.get(api_url)
@@ -71,47 +74,62 @@ class UpdateDialog(tk.Toplevel):
                 messagebox.showerror("Ошибка обновления", "В последнем релизе не найден ZIP-архив.")
                 self.destroy()
                 return
-
-            # 2. Скачать архив
             self.log(f"Скачивание версии {release_data['tag_name']}...", 30)
-            temp_dir = "_update_temp"
-            if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-            os.makedirs(temp_dir)
-            zip_path = os.path.join(temp_dir, 'update.zip')
-            
+            # Для обновления, временная папка создается рядом с EXE
+            update_temp_dir = os.path.join(os.path.dirname(sys.executable), "_update_temp")
+            if os.path.exists(update_temp_dir): shutil.rmtree(update_temp_dir)
+            os.makedirs(update_temp_dir)
+            zip_path = os.path.join(update_temp_dir, 'update.zip')
             with requests.get(zip_url, stream=True) as r:
                 r.raise_for_status()
                 with open(zip_path, 'wb') as f:
                     shutil.copyfileobj(r.raw, f)
-            
-            # 3. Распаковать
             self.log("Распаковка архива...", 80)
             with zipfile.ZipFile(zip_path, 'r') as zf:
-                zf.extractall(temp_dir)
+                zf.extractall(update_temp_dir)
             os.remove(zip_path)
-
-            # 4. Запустить батник и закрыться
             self.log("Запуск установщика...", 100)
-            time.sleep(1) # Небольшая пауза для наглядности
-            updater_bat_path = resource_path('_run_updater.bat')
-            subprocess.Popen([updater_bat_path], creationflags=subprocess.CREATE_NEW_CONSOLE)
-            self.master.destroy() # Закрываем основное приложение
-
+            time.sleep(1)
+            # Батник должен лежать рядом с EXE
+            updater_bat_path = os.path.join(os.path.dirname(sys.executable), '_run_updater.bat')
+            subprocess.Popen([updater_bat_path], creationflags=subprocess.CREATE_NEW_CONSOLE, cwd=os.path.dirname(sys.executable))
+            self.master.destroy()
         except Exception as e:
             messagebox.showerror("Ошибка обновления", f"Произошла ошибка:\n{e}")
             self.destroy()
 
 class App:
     def __init__(self, root):
-        # ... (код инициализации без изменений)
         self.root = root
         self.root.title(f"Zapret Launcher v{__version__}")
         self.root.geometry("850x500")
         self.process = None
         self.log_queue = queue.Queue()
+
+        # Путь для внешних файлов (конфиги, папки zapret), находящихся рядом с .exe
+        self.app_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.abspath(".")
+        # Путь для внутренних ресурсов, упакованных с программой (например, иконка)
+        self.resources_path = get_base_path()
+
+        self.set_app_icon()
         self.create_widgets()
         self.populate_bat_files()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        # В фоновом режиме проверяем последнюю версию Zapret
+        threading.Thread(target=check_zapret_version, args=(self.log_message,), daemon=True).start()
+
+    def set_app_icon(self):
+        """Устанавливает иконку для главного окна, если файл icon.ico существует."""
+        try:
+            # Иконка должна быть добавлена как data-файл в .spec или лежать рядом
+            # и будет доступна в _MEIPASS или в корневой папке
+            icon_path = os.path.join(self.resources_path, 'icon.ico')
+            if os.path.exists(icon_path):
+                self.root.iconbitmap(icon_path)
+        except Exception:
+            # Игнорируем ошибки, если иконку не удалось установить (например, в Linux)
+            pass
 
     def create_widgets(self):
         # ... (код виджетов без изменений)
@@ -144,11 +162,9 @@ class App:
         setup_text_widget_bindings(self.bat_listbox)
     
     def run_self_update(self):
-        """Запускает процесс самообновления лаунчера."""
         if messagebox.askyesno("Подтверждение", "Программа скачает последнюю версию с GitHub и закроется для обновления.\n\nПродолжить?"):
             UpdateDialog(self.root, 'Sankyuubigan/dpi_gui')
-    
-    # ... (остальной код класса App без изменений)
+
     def open_add_site_dialog(self):
         AddSiteDialog(self.root, self.add_domains_to_list)
 
@@ -158,7 +174,7 @@ class App:
             update_thread.start()
 
     def _zapret_update_worker(self):
-        update_zapret_tool(resource_path('.'), self.log_message)
+        update_zapret_tool(self.app_dir, self.log_message)
         self.root.after(0, self.refresh_bat_list)
 
     def refresh_bat_list(self):
@@ -166,7 +182,7 @@ class App:
         self.populate_bat_files()
 
     def add_domains_to_list(self, new_domains):
-        custom_list_path = resource_path('custom_list.txt')
+        custom_list_path = os.path.join(self.app_dir, 'custom_list.txt')
         try:
             existing_domains = set()
             if os.path.exists(custom_list_path):
@@ -193,19 +209,33 @@ class App:
 
     def populate_bat_files(self):
         self.bat_listbox.delete(0, tk.END)
-        base_path = resource_path('.')
-        zapret_folders = glob.glob(os.path.join(base_path, 'zapret-discord-youtube-*'))
+        # Ищем все папки с утилитой в каталоге программы
+        zapret_folders = glob.glob(os.path.join(self.app_dir, 'zapret-discord-youtube-*'))
+        
         if not zapret_folders:
-            messagebox.showerror("Ошибка", f"Папка 'zapret-discord-youtube-*' не найдена.")
+            messagebox.showerror("Ошибка", f"Папки 'zapret-discord-youtube-*' не найдены в каталоге программы:\n{self.app_dir}")
             self.bat_files = []
             return
-        zapret_dir = zapret_folders[0]
-        self.bat_files = find_bat_files(zapret_dir)
+
+        all_bat_files = []
+        # Проходим по каждой найденной папке и собираем bat-файлы
+        for folder in zapret_folders:
+            all_bat_files.extend(find_bat_files(folder))
+        
+        # Сортируем, чтобы порядок был предсказуемым и одинаковым при каждом запуске
+        self.bat_files = sorted(all_bat_files)
+
+        if not self.bat_files:
+            self.log_message("ПРЕДУПРЕЖДЕНИЕ: Не найдено ни одного .bat файла в папках 'zapret-discord-youtube-*'.")
+            return
+
         for abs_path in self.bat_files:
             try:
-                display_path = os.path.relpath(abs_path, base_path).replace('\\', '/')
-            except ValueError:
-                display_path = os.path.join(os.path.basename(zapret_dir), os.path.basename(abs_path))
+                # Показываем путь относительно папки программы для наглядности
+                display_path = os.path.relpath(abs_path, self.app_dir).replace('\\', '/')
+            except (ValueError, AttributeError):
+                # Фоллбэк, если что-то пошло не так
+                display_path = os.path.join(os.path.basename(os.path.dirname(abs_path)), os.path.basename(abs_path))
             self.bat_listbox.insert(tk.END, display_path)
 
     def select_and_run_bat(self):
@@ -216,7 +246,7 @@ class App:
         if not selected_indices:
             messagebox.showwarning("Предупреждение", "Пожалуйста, выберите профиль из списка.")
             return
-        selected_index = selected_indices[0]
+        selected_index = selected_indices
         file_path = self.bat_files[selected_index]
         self.run_process(file_path)
 
@@ -226,7 +256,7 @@ class App:
         self.log_window.config(state='disabled')
         kill_existing_processes(self.log_message)
         self.log_message(f"Запуск профиля: {os.path.basename(file_path)}")
-        self.process = run_bat_file(file_path, resource_path('.'), self.log_message)
+        self.process = run_bat_file(file_path, self.app_dir, self.log_message)
         if not self.process:
             self.log_message("Не удалось запустить процесс.")
             return
