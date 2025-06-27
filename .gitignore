@@ -3,12 +3,6 @@
 /build/
 *.spec
 
-# Временный файл версии
-_version.py
-
-# Временная папка для обновлений
-_update_temp/
-
 # Кэш Python
 __pycache__/
 *.pyc
@@ -18,6 +12,11 @@ __pycache__/
 # Файлы IDE
 .vscode/
 .idea/
+
+# Папки, управляемые лаунчером
+/python_runtime/
+/app_src/
+app_update.zip
 
 # Файлы антизапрета (пользовательские данные)
 zapret-discord-youtube*
