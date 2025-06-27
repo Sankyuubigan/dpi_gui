@@ -13,8 +13,6 @@ import time
 
 # Определяем базовую директорию приложения (папка app_src)
 APP_SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Выходим на уровень выше, чтобы найти папки zapret и т.д.
-APP_BASE_DIR = os.path.dirname(APP_SOURCE_DIR)
 
 # Добавляем текущую папку в пути, чтобы импорты работали
 sys.path.insert(0, APP_SOURCE_DIR)
@@ -26,18 +24,7 @@ from executor import (
 from text_utils import setup_text_widget_bindings
 from version_checker import check_zapret_version
 
-# Версия теперь не так важна, но оставим для отображения в заголовке
 __version__ = "dynamic"
-
-class UpdateDialog(tk.Toplevel):
-    # Этот класс больше не используется для самообновления,
-    # но может понадобиться для чего-то еще. Оставим его.
-    def __init__(self, parent, repo_url):
-        super().__init__(parent)
-        self.repo_url = repo_url
-        self.title("Обновление")
-        self.geometry("500x150")
-        # ... остальной код без изменений ...
 
 class App:
     def __init__(self, root):
@@ -47,7 +34,8 @@ class App:
         self.process = None
         self.log_queue = queue.Queue()
 
-        self.app_dir = APP_BASE_DIR 
+        # --- ИСПРАВЛЕНО: Теперь 'дом' приложения - это папка app_src ---
+        self.app_dir = APP_SOURCE_DIR 
         self.resources_path = APP_SOURCE_DIR
 
         self.set_app_icon()
@@ -75,10 +63,6 @@ class App:
         self.add_site_button = tk.Button(top_frame, text="Анализ сайта", command=self.open_add_site_dialog)
         self.add_site_button.pack(side=tk.LEFT, padx=5)
         
-        # Кнопка обновления лаунчера больше не нужна, т.к. он обновляется сам
-        # self.update_launcher_button = tk.Button(top_frame, text="Обновить Лаунчер", command=self.run_self_update)
-        # self.update_launcher_button.pack(side=tk.RIGHT, padx=(10, 0))
-        
         self.update_zapret_button = tk.Button(top_frame, text="Обновить Zapret", command=self.open_zapret_update_dialog)
         self.update_zapret_button.pack(side=tk.RIGHT)
         
@@ -101,7 +85,6 @@ class App:
         setup_text_widget_bindings(self.bat_listbox)
 
     def open_add_site_dialog(self):
-        # AddSiteDialog(self.root, self.add_domains_to_list)
         messagebox.showinfo("В разработке", "Функция анализа сайта находится в разработке.")
 
     def open_zapret_update_dialog(self):
@@ -110,6 +93,7 @@ class App:
             update_thread.start()
 
     def _zapret_update_worker(self):
+        # Теперь передаем правильный путь (app_src)
         update_zapret_tool(self.app_dir, self.log_message)
         self.root.after(0, self.refresh_bat_list)
 
@@ -118,6 +102,7 @@ class App:
         self.populate_bat_files()
 
     def add_domains_to_list(self, new_domains):
+        # Теперь custom_list.txt тоже ищется в app_src
         custom_list_path = os.path.join(self.app_dir, 'custom_list.txt')
         try:
             existing_domains = set()
@@ -145,6 +130,7 @@ class App:
 
     def populate_bat_files(self):
         self.bat_listbox.delete(0, tk.END)
+        # Теперь ищем папки zapret в правильном месте (app_src)
         zapret_folders = glob.glob(os.path.join(self.app_dir, 'zapret-discord-youtube-*'))
         
         if not zapret_folders:
@@ -188,6 +174,7 @@ class App:
         self.log_window.config(state='disabled')
         kill_existing_processes(self.log_message)
         self.log_message(f"Запуск профиля: {os.path.basename(file_path)}")
+        # Передаем правильный путь (app_src) для поиска custom_list.txt
         self.process = run_bat_file(file_path, self.app_dir, self.log_message)
         if not self.process:
             self.log_message("Не удалось запустить процесс.")

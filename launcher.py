@@ -200,14 +200,15 @@ def main():
     else:
         print_status("У вас последняя версия скриптов.")
 
-    # --- ИСПРАВЛЕНО: Установка зависимостей ПОСЛЕ обновления скриптов ---
-    python_exe = os.path.join(PYTHON_DIR, 'python.exe')
+    pip_python_exe = os.path.join(PYTHON_DIR, 'python.exe')
     requirements_path = os.path.join(APP_DIR, 'requirements.txt')
     if os.path.exists(requirements_path):
-        pip_command = [python_exe, '-m', 'pip', 'install', '-r', requirements_path]
+        pip_command = [pip_python_exe, '-m', 'pip', 'install', '-r', requirements_path]
         print_status("Проверка и установка зависимостей...")
-        # Используем capture_output, чтобы не замусоривать консоль выводом pip
-        subprocess.run(pip_command, check=True, capture_output=True, text=True)
+        
+        # --- ИСПРАВЛЕНО: Добавляем флаг CREATE_NO_WINDOW, чтобы скрыть консоль pip ---
+        creation_flags = subprocess.CREATE_NO_WINDOW if is_windowed else 0
+        subprocess.run(pip_command, check=True, capture_output=True, text=True, creationflags=creation_flags)
         print_status("Зависимости успешно установлены.")
 
     main_script_path = os.path.join(APP_DIR, 'main.py')
@@ -215,7 +216,8 @@ def main():
         show_critical_error(f"Основной скрипт 'main.py' не найден по пути:\n{main_script_path}")
         return
         
-    command = [python_exe, main_script_path]
+    python_gui_exe = os.path.join(PYTHON_DIR, 'pythonw.exe')
+    command = [python_gui_exe, main_script_path]
     
     print_status("Запускаю основное приложение...")
     print_status(f"Команда: {command}")
@@ -224,7 +226,7 @@ def main():
     try:
         subprocess.Popen(command, cwd=APP_DIR)
     except FileNotFoundError:
-        show_critical_error(f"Не удалось запустить Python. Исполняемый файл не найден по пути:\n{python_exe}")
+        show_critical_error(f"Не удалось запустить Python. Исполняемый файл не найден по пути:\n{python_gui_exe}")
     except Exception as e:
         show_critical_error(f"Неизвестная ошибка при запуске приложения.\n\n{e}")
     
