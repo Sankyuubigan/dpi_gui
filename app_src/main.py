@@ -19,8 +19,9 @@ sys.path.insert(0, APP_SOURCE_DIR)
 
 from executor import (
     find_bat_files, run_bat_file, kill_existing_processes, 
-    analyze_site_domains, update_zapret_tool
+    update_zapret_tool
 )
+from domain_finder import AnalysisDialog
 from text_utils import setup_text_widget_bindings
 from version_checker import check_zapret_version
 
@@ -28,14 +29,13 @@ class App:
     def __init__(self, root):
         self.root = root
         
-        # --- ИСПРАВЛЕНО: Читаем версию из файла .version_hash ---
         version_hash = "unknown"
         version_file_path = os.path.join(APP_SOURCE_DIR, ".version_hash")
         if os.path.exists(version_file_path):
             with open(version_file_path, 'r') as f:
                 full_hash = f.read().strip()
                 if full_hash:
-                    version_hash = full_hash[:7] # Показываем короткий хэш
+                    version_hash = full_hash[:7]
 
         self.root.title(f"Zapret Launcher (Commit: {version_hash})")
         self.root.geometry("850x500")
@@ -67,7 +67,7 @@ class App:
         self.run_button.pack(side=tk.LEFT)
         self.stop_button = tk.Button(top_frame, text="Остановить/Проверить", command=self.stop_process)
         self.stop_button.pack(side=tk.LEFT, padx=5)
-        self.add_site_button = tk.Button(top_frame, text="Анализ сайта", command=self.open_add_site_dialog)
+        self.add_site_button = tk.Button(top_frame, text="добавить сайт", command=self.open_add_site_dialog)
         self.add_site_button.pack(side=tk.LEFT, padx=5)
         
         self.update_zapret_button = tk.Button(top_frame, text="Обновить Zapret", command=self.open_zapret_update_dialog)
@@ -92,7 +92,9 @@ class App:
         setup_text_widget_bindings(self.bat_listbox)
 
     def open_add_site_dialog(self):
-        messagebox.showinfo("В разработке", "Функция анализа сайта находится в разработке.")
+        dialog = AnalysisDialog(self.root, title="Анализ сайта для добавления доменов")
+        if dialog.result_domains:
+            self.add_domains_to_list(dialog.result_domains)
 
     def open_zapret_update_dialog(self):
         if messagebox.askyesno("Подтверждение", "Это скачает последнюю версию утилиты Zapret от разработчика Flowseal.\n\nВсе активные процессы будут остановлены. Продолжить?"):
@@ -123,7 +125,8 @@ class App:
                 return
             all_domains = sorted(list(existing_domains.union(set(new_domains))))
             with open(custom_list_path, 'w', encoding='utf-8') as f:
-                f.write("# Список доменов, сгенерированный программой.\n")
+                f.write("# Это ваш личный список доменов. Добавляйте по одному домену на строку.\n")
+                f.write("# Строки, начинающиеся с #, игнорируются.\n")
                 for domain in all_domains:
                     f.write(domain + '\n')
             self.log_message("\n--- Добавлены новые домены в custom_list.txt: ---")

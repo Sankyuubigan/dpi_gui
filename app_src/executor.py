@@ -11,14 +11,6 @@ import zipfile
 import shutil
 import glob
 
-try:
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.common.exceptions import WebDriverException
-    SELENIUM_AVAILABLE = True
-except ImportError:
-    SELENIUM_AVAILABLE = False
-
 def update_zapret_tool(base_dir, log_callback):
     """Скачивает и корректно распаковывает утилиту Zapret в папку с версией."""
     ZAPRET_REPO = "Flowseal/zapret-discord-youtube"
@@ -45,7 +37,6 @@ def update_zapret_tool(base_dir, log_callback):
         log_callback(f"!!! ОШИБКА: Не удалось получить информацию о релизе: {e}")
         return
 
-    # --- ИСПРАВЛЕНО: Логика распаковки ---
     temp_zip_path = os.path.join(base_dir, '_zapret_update.zip')
     try:
         log_callback(f"-> Скачиваю архив: {zip_url}")
@@ -69,12 +60,10 @@ def update_zapret_tool(base_dir, log_callback):
             shutil.rmtree(folder)
             log_callback(f"   - Удалена папка: {os.path.basename(folder)}")
 
-        # 1. Создаем целевую папку с правильным именем
         target_dir = os.path.join(base_dir, f"zapret-discord-youtube-{tag_name}")
         os.makedirs(target_dir, exist_ok=True)
         log_callback(f"-> Создана папка: {os.path.basename(target_dir)}")
 
-        # 2. Распаковываем архив ВНУТРЬ этой папки
         log_callback("-> Распаковка новой версии...")
         with zipfile.ZipFile(temp_zip_path, 'r') as zf:
             zf.extractall(target_dir)
@@ -89,48 +78,6 @@ def update_zapret_tool(base_dir, log_callback):
             log_callback("-> Временный архив удален.")
         log_callback("--- Обновление утилиты Zapret завершено ---\n")
 
-
-def analyze_site_domains(url: str, log_callback):
-    if not SELENIUM_AVAILABLE:
-        log_callback("ОШИБКА: Библиотека Selenium не установлена.")
-        return None
-    log_callback("Запускаю браузер для анализа...")
-    chrome_options = Options()
-    chrome_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--log-level=3")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    driver = None
-    try:
-        driver = webdriver.Chrome(options=chrome_options)
-        log_callback(f"Перехожу на {url}...")
-        driver.get(url)
-        log_callback("Жду 7 секунд для прогрузки всех ресурсов...")
-        time.sleep(7)
-        log_callback("Собираю сетевые логи...")
-        logs = driver.get_log('performance')
-        domains = set()
-        for entry in logs:
-            log = json.loads(entry['message'])['message']
-            if log['method'] == 'Network.requestWillBeSent':
-                request_url = log['params']['request']['url']
-                domain = urlparse(request_url).netloc
-                if domain:
-                    domains.add(domain)
-        log_callback(f"Найдено {len(domains)} уникальных доменов.")
-        return sorted(list(domains))
-    except WebDriverException as e:
-        log_callback(f"\n!!! ОШИБКА SELENIUM !!!")
-        return None
-    except Exception as e:
-        log_callback(f"Произошла непредвиденная ошибка: {e}")
-        return None
-    finally:
-        if driver:
-            driver.quit()
-        log_callback("Анализ завершен, браузер закрыт.")
 
 def find_bat_files(directory="."):
     bat_files = []

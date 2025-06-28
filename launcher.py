@@ -206,7 +206,6 @@ def main():
         pip_command = [pip_python_exe, '-m', 'pip', 'install', '-r', requirements_path]
         print_status("Проверка и установка зависимостей...")
         
-        # --- ИСПРАВЛЕНО: Добавляем флаг CREATE_NO_WINDOW, чтобы скрыть консоль pip ---
         creation_flags = subprocess.CREATE_NO_WINDOW if is_windowed else 0
         subprocess.run(pip_command, check=True, capture_output=True, text=True, creationflags=creation_flags)
         print_status("Зависимости успешно установлены.")
