@@ -5,92 +5,315 @@ import sys
 import threading
 import queue
 import subprocess
-import glob
-import requests
-import zipfile
-import shutil
-import time
 import traceback
+import ctypes
+
+# --- Начальная настройка и проверка прав ---
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+def run_as_admin():
+    try:
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
+    except Exception as e:
+        messagebox.showerror("Ошибка запуска", f"Не удалось перезапустить с правами администратора:\n{e}")
 
 # Определяем базовую директорию приложения (папка app_src)
 APP_SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Добавляем текущую папку в пути, чтобы импорты работали
 sys.path.insert(0, APP_SOURCE_DIR)
 
-from executor import (
-    find_bat_files, run_bat_file, kill_existing_processes, 
-    update_zapret_tool
-)
+# --- Импорты модулей проекта ---
+from executor import update_zapret_tool, is_custom_list_valid
 from domain_finder import AnalysisDialog
 from text_utils import setup_text_widget_bindings
 from version_checker import check_zapret_version
+from profiles import PROFILES
+import process_manager
+import settings_manager
+import testing_utils
 
 class App:
     def __init__(self, root):
         self.root = root
+        self.process = None
+        self.log_queue = queue.Queue()
+        self.app_dir = APP_SOURCE_DIR
+        self.profiles = PROFILES
+        self.test_thread = None
+
+        self.setup_window()
+        self.create_widgets()
+        self.populate_profiles_list()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
+        # Первоначальная проверка и запуск фоновых задач
+        self.update_game_filter_checkbox()
+        threading.Thread(target=check_zapret_version, args=(self.log_message,), daemon=True).start()
+
+    def setup_window(self):
         version_hash = "unknown"
-        version_file_path = os.path.join(APP_SOURCE_DIR, ".version_hash")
+        version_file_path = os.path.join(self.app_dir, ".version_hash")
         if os.path.exists(version_file_path):
             with open(version_file_path, 'r') as f:
                 full_hash = f.read().strip()
                 if full_hash:
                     version_hash = full_hash[:7]
-
         self.root.title(f"Zapret Launcher (Commit: {version_hash})")
-        self.root.geometry("850x500")
-        self.process = None
-        self.log_queue = queue.Queue()
-
-        self.app_dir = APP_SOURCE_DIR 
-        self.resources_path = APP_SOURCE_DIR
-
-        self.set_app_icon()
-        self.create_widgets()
-        self.populate_bat_files()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        
-        threading.Thread(target=check_zapret_version, args=(self.log_message,), daemon=True).start()
-
-    def set_app_icon(self):
+        self.root.geometry("850x600")
         try:
-            icon_path = os.path.join(self.resources_path, 'icon.ico')
+            icon_path = os.path.join(self.app_dir, 'icon.ico')
             if os.path.exists(icon_path):
                 self.root.iconbitmap(icon_path)
         except Exception:
             pass
 
     def create_widgets(self):
-        top_frame = tk.Frame(self.root)
-        top_frame.pack(pady=10, padx=10, fill=tk.X)
-        self.run_button = tk.Button(top_frame, text="Запустить профиль", command=self.select_and_run_bat)
-        self.run_button.pack(side=tk.LEFT)
-        self.stop_button = tk.Button(top_frame, text="Остановить/Проверить", command=self.stop_process)
-        self.stop_button.pack(side=tk.LEFT, padx=5)
-        self.add_site_button = tk.Button(top_frame, text="добавить сайт", command=self.open_add_site_dialog)
-        self.add_site_button.pack(side=tk.LEFT, padx=5)
-        
-        self.update_zapret_button = tk.Button(top_frame, text="Обновить Zapret", command=self.open_zapret_update_dialog)
-        self.update_zapret_button.pack(side=tk.RIGHT)
-        
-        list_frame = tk.Frame(self.root)
-        list_frame.pack(pady=5, padx=10, fill=tk.BOTH, expand=True)
-        tk.Label(list_frame, text="Выберите профиль для запуска:").pack(anchor=tk.W)
-        self.bat_listbox = tk.Listbox(list_frame)
-        self.bat_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.bat_listbox.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.bat_listbox.config(yscrollcommand=scrollbar.set)
-        
+        # --- ОСНОВНАЯ СТРУКТУРА С ВКЛАДКАМИ ---
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(expand=True, fill="both", padx=10, pady=5)
+
+        tab_control = ttk.Frame(notebook, padding=10)
+        tab_tools = ttk.Frame(notebook, padding=10)
+        tab_testing = ttk.Frame(notebook, padding=10)
+
+        notebook.add(tab_control, text="Управление")
+        notebook.add(tab_tools, text="Инструменты и Настройки")
+        notebook.add(tab_testing, text="Тестирование")
+
+        # --- ВКЛАДКА "УПРАВЛЕНИЕ" ---
+        self.create_control_tab(tab_control)
+
+        # --- ВКЛАДКА "ИНСТРУМЕНТЫ И НАСТРОЙКИ" ---
+        self.create_tools_tab(tab_tools)
+
+        # --- ВКЛАДКА "ТЕСТИРОВАНИЕ" ---
+        self.create_testing_tab(tab_testing)
+
+        # --- ОКНО ЛОГОВ ---
         log_frame = tk.Frame(self.root)
         log_frame.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
         tk.Label(log_frame, text="Логи:").pack(anchor=tk.W)
         self.log_window = scrolledtext.ScrolledText(log_frame, height=10, state='disabled', bg='black', fg='white', relief=tk.SUNKEN, borderwidth=1)
         self.log_window.pack(fill=tk.BOTH, expand=True)
-        
         setup_text_widget_bindings(self.log_window)
-        setup_text_widget_bindings(self.bat_listbox)
+
+    def create_control_tab(self, parent):
+        list_frame = ttk.LabelFrame(parent, text="Профили")
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        self.profiles_listbox = tk.Listbox(list_frame)
+        self.profiles_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.profiles_listbox.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.profiles_listbox.config(yscrollcommand=scrollbar.set)
+        setup_text_widget_bindings(self.profiles_listbox)
+
+        actions_frame = ttk.Frame(parent)
+        actions_frame.pack(fill=tk.X, pady=5)
+        
+        self.run_button = ttk.Button(actions_frame, text="Запустить профиль", command=self.run_selected_profile)
+        self.run_button.pack(side=tk.LEFT, padx=5)
+        self.stop_button = ttk.Button(actions_frame, text="Остановить", command=self.stop_process)
+        self.stop_button.pack(side=tk.LEFT, padx=5)
+
+        service_frame = ttk.LabelFrame(parent, text="Автозапуск (Системная служба)")
+        service_frame.pack(fill=tk.X, pady=10)
+
+        self.install_service_button = ttk.Button(service_frame, text="Установить в автозапуск", command=self.install_service)
+        self.install_service_button.pack(side=tk.LEFT, padx=5, pady=5)
+        self.uninstall_service_button = ttk.Button(service_frame, text="Удалить из автозапуска", command=self.uninstall_service)
+        self.uninstall_service_button.pack(side=tk.LEFT, padx=5, pady=5)
+
+    def create_tools_tab(self, parent):
+        general_frame = ttk.LabelFrame(parent, text="Общие инструменты")
+        general_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(general_frame, text="Проверить статус", command=self.check_status).pack(side=tk.LEFT, padx=5, pady=5)
+        ttk.Button(general_frame, text="Обновить Zapret", command=self.run_zapret_update).pack(side=tk.LEFT, padx=5, pady=5)
+        ttk.Button(general_frame, text="Обновить списки IP", command=lambda: self.run_in_thread(settings_manager.update_ipset_list, self.app_dir, self.log_message)).pack(side=tk.LEFT, padx=5, pady=5)
+
+        settings_frame = ttk.LabelFrame(parent, text="Настройки")
+        settings_frame.pack(fill=tk.X, pady=10)
+        
+        self.game_filter_var = tk.BooleanVar()
+        self.game_filter_check = ttk.Checkbutton(settings_frame, text="Игровой фильтр (для всех профилей)", variable=self.game_filter_var, command=self.toggle_game_filter)
+        self.game_filter_check.pack(anchor=tk.W, padx=5, pady=5)
+
+        domain_frame = ttk.LabelFrame(parent, text="Пользовательские списки")
+        domain_frame.pack(fill=tk.X, pady=10)
+        ttk.Button(domain_frame, text="Добавить домены с сайта...", command=self.open_add_site_dialog).pack(side=tk.LEFT, padx=5, pady=5)
+        ttk.Button(domain_frame, text="Открыть custom_list.txt", command=self.open_custom_list).pack(side=tk.LEFT, padx=5, pady=5)
+
+    def create_testing_tab(self, parent):
+        site_test_frame = ttk.LabelFrame(parent, text="Автоматический тест по сайту")
+        site_test_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(site_test_frame, text="Адрес сайта (например, rutracker.org):").pack(anchor=tk.W, padx=5, pady=(5,0))
+        self.site_test_url = tk.StringVar(value="rutracker.org")
+        ttk.Entry(site_test_frame, textvariable=self.site_test_url).pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(site_test_frame, text="Начать тест по сайту", command=self.run_site_test).pack(pady=5)
+
+        discord_test_frame = ttk.LabelFrame(parent, text="Интерактивный тест для Discord")
+        discord_test_frame.pack(fill=tk.X, pady=10)
+        
+        ttk.Button(discord_test_frame, text="Очистить кэш Discord", command=lambda: self.run_in_thread(settings_manager.clear_discord_cache, self.app_dir, self.log_message)).pack(side=tk.LEFT, padx=5, pady=5)
+        ttk.Button(discord_test_frame, text="Начать тест для Discord", command=self.run_discord_test).pack(side=tk.LEFT, padx=5, pady=5)
+
+    def _handle_ui_error(self, e):
+        """Централизованный обработчик ошибок для предотвращения падения GUI."""
+        error_details = traceback.format_exc()
+        self.log_message("\n" + "="*20 + " КРИТИЧЕСКАЯ ОШИБКА GUI " + "="*20)
+        self.log_message("Произошла непредвиденная ошибка в интерфейсе:")
+        self.log_message(error_details)
+        self.log_message("="*62 + "\n")
+        messagebox.showerror("Критическая ошибка", f"Произошла ошибка:\n{e}\n\nПодробности записаны в окне логов.")
+
+    def populate_profiles_list(self):
+        self.profiles_listbox.delete(0, tk.END)
+        for profile in self.profiles:
+            self.profiles_listbox.insert(tk.END, profile['name'])
+        if self.profiles:
+            self.profiles_listbox.select_set(0)
+
+    def get_selected_profile(self):
+        selected_indices = self.profiles_listbox.curselection()
+        if not selected_indices:
+            messagebox.showwarning("Предупреждение", "Пожалуйста, выберите профиль из списка.")
+            return None
+        # ИСПРАВЛЕНО: .curselection() возвращает кортеж (tuple) со строковыми индексами.
+        # Нам нужен первый элемент, преобразованный в целое число (integer).
+        selected_index = int(selected_indices)
+        return self.profiles[selected_index]
+
+    def run_selected_profile(self):
+        try:
+            if self.process and self.process.poll() is None:
+                messagebox.showinfo("Информация", "Процесс уже запущен.")
+                return
+            
+            profile = self.get_selected_profile()
+            if not profile: return
+
+            self.log_window.config(state='normal')
+            self.log_window.delete('1.0', tk.END)
+            self.log_window.config(state='disabled')
+            
+            process_manager.stop_all_processes(self.log_message)
+            self.log_message(f"Запуск профиля: {profile['name']}")
+
+            game_filter_enabled = self.game_filter_var.get()
+            custom_list_path = os.path.join(self.app_dir, 'lists', 'custom_list.txt')
+            use_custom_list = is_custom_list_valid(custom_list_path)
+
+            self.process = process_manager.start_process(profile, self.app_dir, game_filter_enabled, use_custom_list, self.log_message)
+            
+            if not self.process:
+                self.log_message("Не удалось запустить процесс. Проверьте логи выше на наличие ошибок.")
+                return
+                
+            self.set_controls_state(tk.DISABLED)
+            self.worker_thread = threading.Thread(target=self.read_process_output, daemon=True)
+            self.worker_thread.start()
+            self.monitor_process()
+        except Exception as e:
+            self._handle_ui_error(e)
+
+    def read_process_output(self):
+        for line in iter(self.process.stdout.readline, ''):
+            self.log_queue.put(line)
+        self.log_queue.put(None)
+
+    def monitor_process(self):
+        try:
+            line = self.log_queue.get_nowait()
+            if line is None:
+                self.process_finished()
+                return
+            self.log_message(line.strip())
+        except queue.Empty:
+            pass
+        if self.process:
+            self.root.after(100, self.monitor_process)
+
+    def process_finished(self):
+        return_code = self.process.poll() if self.process else 'N/A'
+        self.log_message(f"\nПроцесс завершен с кодом {return_code}.")
+        self.set_controls_state(tk.NORMAL)
+        self.process = None
+
+    def stop_process(self):
+        try:
+            self.log_message("\n" + "="*40)
+            self.log_message("--- ОСТАНОВКА ПРОЦЕССА ---")
+            process_manager.stop_all_processes(self.log_message)
+            self.check_status(log_header=False)
+            self.set_controls_state(tk.NORMAL)
+            self.process = None
+        except Exception as e:
+            self._handle_ui_error(e)
+
+    def check_status(self, log_header=True):
+        try:
+            settings_manager.check_status(self.app_dir, self.log_message, log_header)
+        except Exception as e:
+            self._handle_ui_error(e)
+
+    def set_controls_state(self, state):
+        self.run_button.config(state=state)
+        self.profiles_listbox.config(state=state)
+        self.install_service_button.config(state=state)
+
+    def on_closing(self):
+        try:
+            if self.process and self.process.poll() is None:
+                if messagebox.askyesno("Подтверждение", "Процесс еще активен. Остановить его перед выходом?"):
+                    self.stop_process()
+            self.root.destroy()
+        except Exception as e:
+            self._handle_ui_error(e)
+
+    def log_message(self, message):
+        if self.log_window.winfo_exists():
+            self.log_window.config(state='normal')
+            self.log_window.insert(tk.END, str(message) + "\n")
+            self.log_window.config(state='disabled')
+            self.log_window.see(tk.END)
+
+    def run_in_thread(self, target_func, *args):
+        thread = threading.Thread(target=target_func, args=args, daemon=True)
+        thread.start()
+
+    def run_zapret_update(self):
+        try:
+            if messagebox.askyesno("Подтверждение", "Это скачает последнюю версию утилиты Zapret от Flowseal.\n\nВсе активные процессы будут остановлены. Продолжить?"):
+                update_thread = threading.Thread(target=update_zapret_tool, args=(self.app_dir, self.log_message), daemon=True)
+                update_thread.start()
+        except Exception as e:
+            self._handle_ui_error(e)
+
+    def update_game_filter_checkbox(self):
+        is_enabled = settings_manager.get_game_filter_status(self.app_dir)
+        self.game_filter_var.set(is_enabled)
+
+    def toggle_game_filter(self):
+        try:
+            settings_manager.toggle_game_filter(self.app_dir, self.log_message)
+            self.update_game_filter_checkbox()
+        except Exception as e:
+            self._handle_ui_error(e)
+
+    def open_custom_list(self):
+        try:
+            list_path = os.path.join(self.app_dir, 'lists', 'custom_list.txt')
+            if not os.path.exists(list_path):
+                with open(list_path, 'w', encoding='utf-8') as f:
+                    f.write("# Это ваш личный список доменов. Добавляйте по одному домену на строку.\n")
+            os.startfile(list_path)
+        except Exception as e:
+            self._handle_ui_error(e)
 
     def open_add_site_dialog(self):
         try:
@@ -98,29 +321,11 @@ class App:
             if dialog.result_domains:
                 self.add_domains_to_list(dialog.result_domains)
         except Exception as e:
-            error_details = traceback.format_exc()
-            self.log_message("\n" + "="*20 + " КРИТИЧЕСКАЯ ОШИБКА " + "="*20)
-            self.log_message("Произошла ошибка при открытии диалога анализа сайта:")
-            self.log_message(error_details)
-            self.log_message("="*58 + "\n")
-            messagebox.showerror("Критическая ошибка", f"Произошла ошибка:\n{e}\n\nПодробности записаны в окне логов.")
-
-    def open_zapret_update_dialog(self):
-        if messagebox.askyesno("Подтверждение", "Это скачает последнюю версию утилиты Zapret от разработчика Flowseal.\n\nВсе активные процессы будут остановлены. Продолжить?"):
-            update_thread = threading.Thread(target=self._zapret_update_worker, daemon=True)
-            update_thread.start()
-
-    def _zapret_update_worker(self):
-        update_zapret_tool(self.app_dir, self.log_message)
-        self.root.after(0, self.refresh_bat_list)
-
-    def refresh_bat_list(self):
-        self.log_message("-> Обновляю список профилей...")
-        self.populate_bat_files()
+            self._handle_ui_error(e)
 
     def add_domains_to_list(self, new_domains):
-        custom_list_path = os.path.join(self.app_dir, 'custom_list.txt')
         try:
+            custom_list_path = os.path.join(self.app_dir, 'lists', 'custom_list.txt')
             existing_domains = set()
             if os.path.exists(custom_list_path):
                 with open(custom_list_path, 'r', encoding='utf-8') as f:
@@ -143,133 +348,72 @@ class App:
                 self.log_message(f"  + {domain}")
             self.log_message("--------------------------------------------------")
         except Exception as e:
-            messagebox.showerror("Ошибка файла", f"Не удалось записать в {custom_list_path}:\n{e}")
+            self._handle_ui_error(e)
 
-    def populate_bat_files(self):
-        self.bat_listbox.delete(0, tk.END)
-        zapret_folders = glob.glob(os.path.join(self.app_dir, 'zapret-discord-youtube-*'))
-        
-        if not zapret_folders:
-            self.log_message(f"ПРЕДУПРЕЖДЕНИЕ: Папки 'zapret-discord-youtube-*' не найдены в каталоге {self.app_dir}")
-            self.log_message("-> Используйте кнопку 'Обновить Zapret' для их скачивания.")
-            self.bat_files = []
-            return
-
-        all_bat_files = []
-        for folder in zapret_folders:
-            all_bat_files.extend(find_bat_files(folder))
-        
-        self.bat_files = sorted(all_bat_files)
-
-        if not self.bat_files:
-            self.log_message("ПРЕДУПРЕЖДЕНИЕ: Не найдено ни одного .bat файла в папках 'zapret-discord-youtube-*'.")
-            return
-
-        for abs_path in self.bat_files:
-            try:
-                display_path = os.path.relpath(abs_path, self.app_dir).replace('\\', '/')
-            except (ValueError, AttributeError):
-                display_path = os.path.join(os.path.basename(os.path.dirname(abs_path)), os.path.basename(abs_path))
-            self.bat_listbox.insert(tk.END, display_path)
-
-    def select_and_run_bat(self):
+    def install_service(self):
         try:
-            if self.process and self.process.poll() is None:
-                messagebox.showinfo("Информация", "Процесс уже запущен.")
-                return
-            
-            selected_indices = self.bat_listbox.curselection()
-            if not selected_indices:
-                messagebox.showwarning("Предупреждение", "Пожалуйста, выберите профиль из списка.")
-                return
-            
-            # --- ИСПРАВЛЕНО ---
-            selected_index = selected_indices[0]
-            
-            file_path = self.bat_files[selected_index]
-            self.run_process(file_path)
+            profile = self.get_selected_profile()
+            if not profile: return
+            if messagebox.askyesno("Подтверждение", f"Установить профиль '{profile['name']}' как службу Windows?\n\nЭто позволит обходу запускаться автоматически при старте системы."):
+                self.run_in_thread(settings_manager.install_service, self.app_dir, self.log_message, profile)
         except Exception as e:
-            error_details = traceback.format_exc()
-            self.log_message("\n" + "="*20 + " КРИТИЧЕСКАЯ ОШИБКА " + "="*20)
-            self.log_message("Произошла непредвиденная ошибка при попытке запуска:")
-            self.log_message(error_details)
-            self.log_message("="*58 + "\n")
-            messagebox.showerror("Критическая ошибка", f"Произошла ошибка:\n{e}\n\nПодробности записаны в окне логов.")
+            self._handle_ui_error(e)
 
-    def run_process(self, file_path):
-        self.log_window.config(state='normal')
-        self.log_window.delete('1.0', tk.END)
-        self.log_window.config(state='disabled')
-        kill_existing_processes(self.log_message)
-        self.log_message(f"Запуск профиля: {os.path.basename(file_path)}")
-        self.process = run_bat_file(file_path, self.app_dir, self.log_message)
-        if not self.process:
-            self.log_message("Не удалось запустить процесс. Проверьте логи выше на наличие ошибок.")
-            return
-        self.run_button.config(state=tk.DISABLED)
-        self.bat_listbox.config(state=tk.DISABLED)
-        self.worker_thread = threading.Thread(target=self.read_process_output, args=(self.process, self.log_queue))
-        self.worker_thread.daemon = True
-        self.worker_thread.start()
-        self.monitor_process()
-
-    def read_process_output(self, process, q):
-        for line in iter(process.stdout.readline, ''):
-            q.put(line)
-        q.put(None)
-
-    def monitor_process(self):
+    def uninstall_service(self):
         try:
-            line = self.log_queue.get_nowait()
-            if line is None:
-                self.process_finished()
-                return
-            self.log_message(line.strip())
-        except queue.Empty:
-            pass
-        if self.process:
-            self.root.after(100, self.monitor_process)
-
-    def process_finished(self):
-        return_code = self.process.poll() if self.process else 'N/A'
-        self.log_message(f"\nПроцесс завершен с кодом {return_code}.")
-        self.run_button.config(state=tk.NORMAL)
-        self.bat_listbox.config(state=tk.NORMAL)
-        self.process = None
-
-    def stop_process(self):
-        self.log_message("\n" + "="*40)
-        self.log_message("--- ОСТАНОВКА / ПРОВЕРКА ПРОЦЕССА ---")
-        kill_existing_processes(self.log_message)
-        self.check_process_status()
-        self.run_button.config(state=tk.NORMAL)
-        self.bat_listbox.config(state=tk.NORMAL)
-        self.process = None
-        
-    def check_process_status(self):
-        self.log_message("Проверка статуса через системный tasklist...")
-        try:
-            command = 'tasklist /FI "IMAGENAME eq winws.exe"'
-            result = subprocess.run(command, capture_output=True, text=True, check=False, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-            if 'winws.exe' in result.stdout.lower():
-                self.log_message("!!! ВНИМАНИЕ: Процесс winws.exe все еще активен!")
-            else:
-                self.log_message("ПОДТВЕРЖДЕНО: Процесс winws.exe в системе не найден.")
+            if messagebox.askyesno("Подтверждение", "Удалить службу автозапуска Zapret?"):
+                self.run_in_thread(settings_manager.uninstall_service, self.app_dir, self.log_message)
         except Exception as e:
-            self.log_message(f"ERROR: Ошибка при проверке статуса: {e}")
-        self.log_message("="*40 + "\n")
+            self._handle_ui_error(e)
 
-    def on_closing(self):
-        self.stop_process()
-        self.root.destroy()
+    def _check_test_running(self):
+        if self.test_thread and self.test_thread.is_alive():
+            messagebox.showwarning("Внимание", "Тест уже запущен. Дождитесь его окончания.")
+            return True
+        return False
 
-    def log_message(self, message):
-        self.log_window.config(state='normal')
-        self.log_window.insert(tk.END, message + "\n")
-        self.log_window.config(state='disabled')
-        self.log_window.see(tk.END)
+    def run_site_test(self):
+        try:
+            if self._check_test_running(): return
+            domain = self.site_test_url.get().strip()
+            if not domain:
+                messagebox.showerror("Ошибка", "Введите адрес сайта для теста.")
+                return
+            
+            self.test_thread = threading.Thread(
+                target=testing_utils.run_site_test,
+                args=(domain, self.profiles, self.app_dir, self.game_filter_var.get(), self.log_message),
+                daemon=True
+            )
+            self.test_thread.start()
+        except Exception as e:
+            self._handle_ui_error(e)
+
+    def run_discord_test(self):
+        try:
+            if self._check_test_running(): return
+
+            def ask_user_callback(profile_name):
+                return messagebox.askyesno(
+                    "Интерактивный тест",
+                    f"Профиль '{profile_name}' запущен.\n\nDiscord заработал корректно?",
+                    icon='question'
+                )
+
+            self.test_thread = threading.Thread(
+                target=testing_utils.run_discord_test,
+                args=(self.profiles, self.app_dir, self.game_filter_var.get(), self.log_message, ask_user_callback),
+                daemon=True
+            )
+            self.test_thread.start()
+        except Exception as e:
+            self._handle_ui_error(e)
 
 if __name__ == "__main__":
+    if not is_admin():
+        run_as_admin()
+        sys.exit()
+    
     root = tk.Tk()
     app = App(root)
     root.mainloop()

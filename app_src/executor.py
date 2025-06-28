@@ -1,11 +1,5 @@
 import os
-import sys
 import subprocess
-import shlex
-import re
-import time
-import json
-from urllib.parse import urlparse
 import requests
 import zipfile
 import shutil
@@ -52,7 +46,11 @@ def update_zapret_tool(base_dir, log_callback):
 
     try:
         log_callback("-> Остановка активных процессов winws.exe...")
-        kill_existing_processes(log_callback)
+        # Используем taskkill напрямую, так как process_manager может быть недоступен
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "winws.exe"], check=False, capture_output=True,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        )
         
         log_callback("-> Удаление старых версий папок 'zapret'...")
         old_zapret_folders = glob.glob(os.path.join(base_dir, 'zapret-discord-youtube-*'))
@@ -78,34 +76,8 @@ def update_zapret_tool(base_dir, log_callback):
             log_callback("-> Временный архив удален.")
         log_callback("--- Обновление утилиты Zapret завершено ---\n")
 
-
-def find_bat_files(directory="."):
-    bat_files = []
-    if not os.path.isdir(directory): return []
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if file.lower().endswith(".bat") and file.lower() != "service.bat":
-                bat_files.append(os.path.abspath(os.path.join(root, file)))
-    return sorted(bat_files)
-
-def kill_existing_processes(log_callback):
-    try:
-        result = subprocess.run(
-            ["taskkill", "/F", "/IM", "winws.exe"], check=False, capture_output=True, text=True,
-            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-        )
-        if result.returncode == 0:
-            log_callback("INFO: Один или несколько процессов winws.exe были успешно остановлены.")
-        else:
-            log_callback("INFO: Активных процессов winws.exe не найдено.")
-    except Exception as e:
-        log_callback(f"ERROR: Ошибка при попытке остановить процессы: {e}")
-
-def get_game_filter_value(base_dir):
-    game_flag_file = os.path.join(base_dir, 'bin', 'game_filter.enabled')
-    return "1024-65535" if os.path.exists(game_flag_file) else "0"
-
-def is_custom_list_valid(filepath, log_callback):
+def is_custom_list_valid(filepath):
+    """Проверяет, существует ли custom_list и не пуст ли он."""
     if not os.path.exists(filepath):
         return False
     if os.path.getsize(filepath) == 0:
@@ -118,105 +90,3 @@ def is_custom_list_valid(filepath, log_callback):
     except Exception:
         return False
     return False
-
-def parse_command_from_bat(file_path, log_callback):
-    try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-        
-        marker = 'winws.exe"'
-        parts = content.split(marker, 1)
-        
-        if len(parts) < 2:
-            log_callback(f"ОШИБКА: Не удалось найти маркер '{marker}' в файле {os.path.basename(file_path)}. Невозможно извлечь команду.")
-            return ""
-            
-        # ИСПРАВЛЕНО: Извлекаем второй элемент (с индексом 1) из списка `parts`.
-        # Это строка, содержащая аргументы команды.
-        command_part = parts
-        
-        # Теперь `command_part` является строкой, и к ней можно применять .replace()
-        command_str = command_part.replace('^', ' ').replace('\n', ' ').strip()
-        
-        if not command_str:
-            log_callback(f"ПРЕДУПРЕЖДЕНИЕ: Команда в файле {os.path.basename(file_path)} пуста после обработки.")
-            return ""
-            
-        log_callback(f"ИНФО: Успешно извлечена команда из {os.path.basename(file_path)}")
-        return command_str
-    except Exception as e:
-        log_callback(f"КРИТИЧЕСКАЯ ОШИБКА при чтении и разборе файла {os.path.basename(file_path)}: {e}")
-        return ""
-
-def run_bat_file(file_path, app_base_path, log_callback):
-    log_callback("\n--- Подготовка к запуску процесса ---")
-    bat_base_dir = os.path.dirname(file_path)
-    custom_list_path = os.path.join(app_base_path, 'custom_list.txt')
-    custom_list_is_valid = is_custom_list_valid(custom_list_path, log_callback)
-    game_filter = get_game_filter_value(bat_base_dir)
-    
-    raw_command_str = parse_command_from_bat(file_path, log_callback)
-    
-    if not raw_command_str:
-        log_callback("\n" + "="*40)
-        log_callback(f"КРИТИЧЕСКАЯ ОШИБКА: Не удалось извлечь команду из файла:")
-        log_callback(f"  -> {os.path.basename(file_path)}")
-        log_callback("  Проверьте содержимое .bat файла или логи выше на наличие ошибок разбора.")
-        log_callback("  ЗАПУСК ОТМЕНЕН.")
-        log_callback("="*40 + "\n")
-        return None
-        
-    bin_path_with_sep = os.path.join(bat_base_dir, 'bin') + os.sep
-    lists_path_with_sep = os.path.join(bat_base_dir, 'lists') + os.sep
-    substituted_str = raw_command_str.replace('%GameFilter%', game_filter)
-    substituted_str = substituted_str.replace('%BIN%', bin_path_with_sep)
-    substituted_str = substituted_str.replace('%LISTS%', lists_path_with_sep)
-    try:
-        args = shlex.split(substituted_str, posix=False)
-    except ValueError as e:
-        log_callback(f"КРИТИЧЕСКАЯ ОШИБКА РАЗБОРА КОМАНДЫ: {e}")
-        return None
-    cleaned_args = []
-    pattern = re.compile(r"(--[a-zA-Z0-9_-]+)=(.+)")
-    for arg in args:
-        match = pattern.match(arg)
-        if match:
-            cleaned_args.extend([match.group(1), match.group(2).strip('"')])
-        else:
-            cleaned_args.append(arg)
-    final_args = []
-    blocks, current_block = [], []
-    for arg in cleaned_args:
-        if arg.lower() == '--new':
-            if current_block: blocks.append(current_block)
-            current_block = []
-        else:
-            current_block.append(arg)
-    if current_block: blocks.append(current_block)
-    for i, block in enumerate(blocks):
-        has_hostlist_param = any('--hostlist' in arg.lower() for arg in block)
-        final_args.extend(block)
-        if has_hostlist_param and custom_list_is_valid:
-            final_args.extend(['--hostlist', custom_list_path])
-        if i < len(blocks) - 1:
-            final_args.append('--new')
-    executable_path = os.path.join(bat_base_dir, 'bin', 'winws.exe')
-    final_command = [executable_path] + final_args
-    log_callback("="*40)
-    log_callback("ДЕТАЛИ ЗАПУСКА ПРОЦЕССА")
-    log_callback(f"ИСПОЛНЯЕМЫЙ ФАЙЛ:\n  {executable_path}")
-    log_callback("АРГУМЕНТЫ:")
-    for i, arg in enumerate(final_args):
-        log_callback(f"  [{i}]: {arg}")
-    log_callback("="*40)
-    try:
-        process = subprocess.Popen(
-            final_command, cwd=bat_base_dir, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True,
-            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
-            encoding='utf-8', errors='ignore'
-        )
-        return process
-    except Exception as e:
-        log_callback(f"КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ ПРОЦЕССА: {e}")
-        return None
