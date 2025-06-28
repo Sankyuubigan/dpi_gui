@@ -128,18 +128,28 @@ def parse_command_from_bat(file_path, log_callback):
         parts = content.split(marker, 1)
         
         if len(parts) < 2:
-            log_callback(f"DEBUG: Не удалось найти маркер '{marker}' в файле {os.path.basename(file_path)}")
+            log_callback(f"ОШИБКА: Не удалось найти маркер '{marker}' в файле {os.path.basename(file_path)}. Невозможно извлечь команду.")
             return ""
             
-        command_str = parts
-        command_str = command_str.replace('^', ' ').replace('\n', ' ').strip()
-        log_callback(f"DEBUG: Успешно извлечена команда из {os.path.basename(file_path)}")
+        # ИСПРАВЛЕНО: Извлекаем второй элемент (с индексом 1) из списка `parts`.
+        # Это строка, содержащая аргументы команды.
+        command_part = parts
+        
+        # Теперь `command_part` является строкой, и к ней можно применять .replace()
+        command_str = command_part.replace('^', ' ').replace('\n', ' ').strip()
+        
+        if not command_str:
+            log_callback(f"ПРЕДУПРЕЖДЕНИЕ: Команда в файле {os.path.basename(file_path)} пуста после обработки.")
+            return ""
+            
+        log_callback(f"ИНФО: Успешно извлечена команда из {os.path.basename(file_path)}")
         return command_str
     except Exception as e:
-        log_callback(f"DEBUG: Критическая ошибка при чтении файла {os.path.basename(file_path)}: {e}")
+        log_callback(f"КРИТИЧЕСКАЯ ОШИБКА при чтении и разборе файла {os.path.basename(file_path)}: {e}")
         return ""
 
 def run_bat_file(file_path, app_base_path, log_callback):
+    log_callback("\n--- Подготовка к запуску процесса ---")
     bat_base_dir = os.path.dirname(file_path)
     custom_list_path = os.path.join(app_base_path, 'custom_list.txt')
     custom_list_is_valid = is_custom_list_valid(custom_list_path, log_callback)
@@ -148,7 +158,12 @@ def run_bat_file(file_path, app_base_path, log_callback):
     raw_command_str = parse_command_from_bat(file_path, log_callback)
     
     if not raw_command_str:
-        log_callback(f"ERROR: Не удалось извлечь команду из файла {os.path.basename(file_path)}. Проверьте содержимое .bat файла.")
+        log_callback("\n" + "="*40)
+        log_callback(f"КРИТИЧЕСКАЯ ОШИБКА: Не удалось извлечь команду из файла:")
+        log_callback(f"  -> {os.path.basename(file_path)}")
+        log_callback("  Проверьте содержимое .bat файла или логи выше на наличие ошибок разбора.")
+        log_callback("  ЗАПУСК ОТМЕНЕН.")
+        log_callback("="*40 + "\n")
         return None
         
     bin_path_with_sep = os.path.join(bat_base_dir, 'bin') + os.sep
@@ -203,5 +218,5 @@ def run_bat_file(file_path, app_base_path, log_callback):
         )
         return process
     except Exception as e:
-        log_callback(f"КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ: {e}")
+        log_callback(f"КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ ПРОЦЕССА: {e}")
         return None

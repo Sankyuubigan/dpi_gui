@@ -10,6 +10,7 @@ import requests
 import zipfile
 import shutil
 import time
+import traceback
 
 # Определяем базовую директорию приложения (папка app_src)
 APP_SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -92,9 +93,17 @@ class App:
         setup_text_widget_bindings(self.bat_listbox)
 
     def open_add_site_dialog(self):
-        dialog = AnalysisDialog(self.root, title="Анализ сайта для добавления доменов")
-        if dialog.result_domains:
-            self.add_domains_to_list(dialog.result_domains)
+        try:
+            dialog = AnalysisDialog(self.root, title="Анализ сайта для добавления доменов")
+            if dialog.result_domains:
+                self.add_domains_to_list(dialog.result_domains)
+        except Exception as e:
+            error_details = traceback.format_exc()
+            self.log_message("\n" + "="*20 + " КРИТИЧЕСКАЯ ОШИБКА " + "="*20)
+            self.log_message("Произошла ошибка при открытии диалога анализа сайта:")
+            self.log_message(error_details)
+            self.log_message("="*58 + "\n")
+            messagebox.showerror("Критическая ошибка", f"Произошла ошибка:\n{e}\n\nПодробности записаны в окне логов.")
 
     def open_zapret_update_dialog(self):
         if messagebox.askyesno("Подтверждение", "Это скачает последнюю версию утилиты Zapret от разработчика Flowseal.\n\nВсе активные процессы будут остановлены. Продолжить?"):
@@ -164,16 +173,28 @@ class App:
             self.bat_listbox.insert(tk.END, display_path)
 
     def select_and_run_bat(self):
-        if self.process and self.process.poll() is None:
-            messagebox.showinfo("Информация", "Процесс уже запущен.")
-            return
-        selected_indices = self.bat_listbox.curselection()
-        if not selected_indices:
-            messagebox.showwarning("Предупреждение", "Пожалуйста, выберите профиль из списка.")
-            return
-        selected_index = selected_indices
-        file_path = self.bat_files[selected_index]
-        self.run_process(file_path)
+        try:
+            if self.process and self.process.poll() is None:
+                messagebox.showinfo("Информация", "Процесс уже запущен.")
+                return
+            
+            selected_indices = self.bat_listbox.curselection()
+            if not selected_indices:
+                messagebox.showwarning("Предупреждение", "Пожалуйста, выберите профиль из списка.")
+                return
+            
+            # --- ИСПРАВЛЕНО ---
+            selected_index = selected_indices[0]
+            
+            file_path = self.bat_files[selected_index]
+            self.run_process(file_path)
+        except Exception as e:
+            error_details = traceback.format_exc()
+            self.log_message("\n" + "="*20 + " КРИТИЧЕСКАЯ ОШИБКА " + "="*20)
+            self.log_message("Произошла непредвиденная ошибка при попытке запуска:")
+            self.log_message(error_details)
+            self.log_message("="*58 + "\n")
+            messagebox.showerror("Критическая ошибка", f"Произошла ошибка:\n{e}\n\nПодробности записаны в окне логов.")
 
     def run_process(self, file_path):
         self.log_window.config(state='normal')
@@ -183,7 +204,7 @@ class App:
         self.log_message(f"Запуск профиля: {os.path.basename(file_path)}")
         self.process = run_bat_file(file_path, self.app_dir, self.log_message)
         if not self.process:
-            self.log_message("Не удалось запустить процесс.")
+            self.log_message("Не удалось запустить процесс. Проверьте логи выше на наличие ошибок.")
             return
         self.run_button.config(state=tk.DISABLED)
         self.bat_listbox.config(state=tk.DISABLED)
