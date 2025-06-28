@@ -29,7 +29,7 @@ sys.path.insert(0, APP_SOURCE_DIR)
 from executor import update_zapret_tool, is_custom_list_valid
 from domain_finder import AnalysisDialog
 from text_utils import setup_text_widget_bindings
-from version_checker import check_zapret_version
+# from version_checker import check_zapret_version # УДАЛЕНО
 from profiles import PROFILES
 import process_manager
 import settings_manager
@@ -49,9 +49,8 @@ class App:
         self.populate_profiles_list()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
-        # Первоначальная проверка и запуск фоновых задач
+        # Первоначальная проверка
         self.update_game_filter_checkbox()
-        threading.Thread(target=check_zapret_version, args=(self.log_message,), daemon=True).start()
 
     def setup_window(self):
         version_hash = "unknown"
@@ -180,12 +179,13 @@ class App:
 
     def get_selected_profile(self):
         selected_indices = self.profiles_listbox.curselection()
+        
         if not selected_indices:
             messagebox.showwarning("Предупреждение", "Пожалуйста, выберите профиль из списка.")
             return None
-        # ИСПРАВЛЕНО: .curselection() возвращает кортеж (tuple) со строковыми индексами.
-        # Нам нужен первый элемент, преобразованный в целое число (integer).
-        selected_index = int(selected_indices)
+        
+        # ОКОНЧАТЕЛЬНОЕ ИСПРАВЛЕНИЕ: Извлечь первый элемент из кортежа.
+        selected_index = int(selected_indices[0])
         return self.profiles[selected_index]
 
     def run_selected_profile(self):
