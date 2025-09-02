@@ -1,7 +1,6 @@
-# Это ваш личный список доменов. Добавляйте по одному домену на строку.
-# Строки, начинающиеся с #, игнорируются.
-# Например:
-# my-blocked-site.com
+googleapis.com
+gvt1.com
+video.google.com
 
 nhentai.net
 nhentai.to

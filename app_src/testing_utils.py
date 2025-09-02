@@ -1,10 +1,8 @@
 import urllib.request
 import time
 import subprocess
-
 import process_manager
 from executor import is_custom_list_valid
-
 def check_connection(url, log_callback):
     """Проверяет доступность URL."""
     if not url.startswith('http'):
@@ -17,7 +15,6 @@ def check_connection(url, log_callback):
     except Exception as e:
         log_callback(f"  -> Соединение не удалось: {e}")
         return False
-
 def run_site_test(domain, profiles, base_dir, game_filter_enabled, log_callback):
     """Запускает автоматический тест доступности сайта по всем профилям."""
     log_callback("\n" + "="*40)
@@ -30,13 +27,11 @@ def run_site_test(domain, profiles, base_dir, game_filter_enabled, log_callback)
         log_callback("\n[!] Сайт доступен без обхода. Тестирование не имеет смысла.")
         log_callback("="*40 + "\n")
         return
-
     log_callback("[+] Отлично, сайт заблокирован. Начинаем тестирование профилей.\n")
     
     results = {}
     custom_list_path = f"{base_dir}\\lists\\custom_list.txt"
     use_custom_list = is_custom_list_valid(custom_list_path)
-
     for i, profile in enumerate(profiles):
         log_callback(f"--- Тест {i+1}/{len(profiles)}: \"{profile['name']}\" ---")
         process = process_manager.start_process(profile, base_dir, game_filter_enabled, use_custom_list, log_callback)
@@ -52,13 +47,11 @@ def run_site_test(domain, profiles, base_dir, game_filter_enabled, log_callback)
         log_callback(f"  Результат: {results[profile['name']]}\n")
         process_manager.stop_all_processes(lambda msg: None) # Тихая остановка
         time.sleep(1)
-
     log_callback("="*40)
     log_callback("--- РЕЗУЛЬТАТЫ АВТОМАТИЧЕСКОГО ТЕСТА ---")
     for name, status in results.items():
         log_callback(f"  {name:<30} : {status}")
     log_callback("="*40 + "\n")
-
 def run_discord_test(profiles, base_dir, game_filter_enabled, log_callback, ask_user_callback):
     """Запускает интерактивный тест для Discord."""
     log_callback("\n" + "="*40)
@@ -73,7 +66,6 @@ def run_discord_test(profiles, base_dir, game_filter_enabled, log_callback, ask_
     results = {}
     custom_list_path = f"{base_dir}\\lists\\custom_list.txt"
     use_custom_list = is_custom_list_valid(custom_list_path)
-
     for i, profile in enumerate(profiles):
         log_callback(f"--- Тест {i+1}/{len(profiles)}: \"{profile['name']}\" ---")
         process = process_manager.start_process(profile, base_dir, game_filter_enabled, use_custom_list, log_callback)
@@ -90,7 +82,6 @@ def run_discord_test(profiles, base_dir, game_filter_enabled, log_callback, ask_
         log_callback(f"  Результат: {results[profile['name']]}\n")
         process_manager.stop_all_processes(lambda msg: None) # Тихая остановка
         time.sleep(1)
-
     log_callback("="*40)
     log_callback("--- РЕЗУЛЬТАТЫ ИНТЕРАКТИВНОГО ТЕСТА ---")
     for name, status in results.items():
