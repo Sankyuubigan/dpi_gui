@@ -55,7 +55,7 @@ class App:
                 full_hash = f.read().strip()
                 if full_hash:
                     version_hash = full_hash[:7]
-        self.root.title(f"Zapret Launcher (Commit: {version_hash})")
+        self.root.title(f"DPI_GUI Launcher (Commit: {version_hash})")
         self.root.geometry("850x700")
         try:
             icon_path = os.path.join(self.app_dir, 'icon.ico')
@@ -118,7 +118,7 @@ class App:
         general_frame.pack(fill=tk.X, pady=5)
         
         ttk.Button(general_frame, text="Проверить статус", command=self.check_status).pack(side=tk.LEFT, padx=5, pady=5)
-        ttk.Button(general_frame, text="Обновить Zapret", command=self.run_zapret_update).pack(side=tk.LEFT, padx=5, pady=5)
+        ttk.Button(general_frame, text="Обновить программу", command=self.run_zapret_update).pack(side=tk.LEFT, padx=5, pady=5)
         ttk.Button(general_frame, text="Обновить списки IP", command=lambda: self.run_in_thread(settings_manager.update_ipset_list, self.app_dir, self.log_message)).pack(side=tk.LEFT, padx=5, pady=5)
         settings_frame = ttk.LabelFrame(parent, text="Настройки")
         settings_frame.pack(fill=tk.X, pady=10)

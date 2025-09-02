@@ -68,7 +68,7 @@ class ListManager:
     
     def get_combined_list_path(self):
         """Возвращает путь к временному файлу с объединенными выбранными списками."""
-        combined_path = os.path.join(self.lists_dir, 'combined_selected_lists.txt')
+        combined_path = os.path.join(self.lists_dir, 'last_session_domains_lists.txt')
         
         with open(combined_path, 'w', encoding='utf-8') as combined_file:
             for list_name, is_selected in self.selected_lists.items():
