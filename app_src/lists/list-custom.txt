@@ -37,3 +37,4 @@ docker.io
 huggingface.co
 glama.ai
 static.glama.ai
+twitter.com
