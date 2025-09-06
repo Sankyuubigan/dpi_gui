@@ -46,3 +46,13 @@ gvt1.com
 video.google.com
 video.l.google.com
 youtubeembeddedplayer.googleapis.com
+
+manifest.googlevideo.com
+manifest.youtube.com
+s.youtube.com
+i.ytimg.com
+lh3.googleusercontent.com
+yt3.ggpht.com
+
+rr1---sn-ug5onuxaxjv.googlevideo.com
+rr2---sn-aigzrne7.googlevideo.com
