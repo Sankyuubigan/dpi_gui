@@ -38,3 +38,4 @@ huggingface.co
 glama.ai
 static.glama.ai
 twitter.com
+jnn-pa.googleapis.com

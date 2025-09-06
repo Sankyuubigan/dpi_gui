@@ -20,3 +20,5 @@ app_src/.version_hash # Игнорируем только файл версии,
 
 # Файлы антизапрета (пользовательские данные)
 zapret-discord-youtube*
+/env
+/roo_tests
