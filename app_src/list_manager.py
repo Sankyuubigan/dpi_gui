@@ -1,4 +1,5 @@
 import os
+import tempfile
 import tkinter as tk
 from tkinter import ttk
 
@@ -21,7 +22,7 @@ class ListManager:
         if not os.path.exists(self.lists_dir):
             return lists
             
-        # Исключаем служебные файлы и файлы, которые не должны быть доступны для выбора
+        # Исключаем служебные файлы
         exclude_files = {'custom_list.txt', 'ipset-all.txt'}
         
         for filename in os.listdir(self.lists_dir):
@@ -38,7 +39,9 @@ class ListManager:
         
         self.checkboxes = {}
         
-        for list_name, filename in self.available_lists.items():
+        sorted_list_names = sorted(self.available_lists.keys())
+
+        for list_name in sorted_list_names:
             var = tk.BooleanVar(value=self.selected_lists.get(list_name, True))
             self.checkboxes[list_name] = var
             
@@ -55,22 +58,29 @@ class ListManager:
     def _on_list_toggle(self, list_name):
         """Обработчик изменения состояния чекбокса."""
         self.selected_lists[list_name] = self.checkboxes[list_name].get()
-    
-    def get_selected_lists_paths(self):
-        """Возвращает пути к выбранным спискам доменов."""
-        selected_paths = []
-        for list_name, is_selected in self.selected_lists.items():
-            if is_selected:
-                filename = self.available_lists.get(list_name)
-                if filename:
-                    selected_paths.append(os.path.join(self.lists_dir, filename))
-        return selected_paths
-    
-    def get_combined_list_path(self):
-        """Возвращает путь к временному файлу с объединенными выбранными списками."""
-        combined_path = os.path.join(self.lists_dir, 'last_session_domains_lists.txt')
+
+    def set_selection_state(self, selection_data):
+        """Загружает состояние чекбоксов из сохраненных настроек."""
+        if not isinstance(selection_data, dict):
+            return
+            
+        for list_name, var in self.checkboxes.items():
+            # Устанавливаем значение из конфига, если оно там есть, иначе оставляем по умолчанию (True)
+            saved_state = selection_data.get(list_name, True)
+            var.set(saved_state)
+            self.selected_lists[list_name] = saved_state
+
+    def get_combined_list_path(self, custom_list_path=None):
+        """
+        Создает и возвращает путь к временному файлу в системной папке Temp,
+        объединяя выбранные списки из UI и опционально custom_list.txt.
+        """
+        temp_dir = tempfile.gettempdir()
+        combined_path = os.path.join(temp_dir, 'dpi_gui_combined_list.txt')
         
+        has_content = False
         with open(combined_path, 'w', encoding='utf-8') as combined_file:
+            # 1. Добавляем выбранные списки
             for list_name, is_selected in self.selected_lists.items():
                 if is_selected:
                     filename = self.available_lists.get(list_name)
@@ -78,8 +88,21 @@ class ListManager:
                         list_path = os.path.join(self.lists_dir, filename)
                         if os.path.exists(list_path):
                             with open(list_path, 'r', encoding='utf-8') as list_file:
-                                combined_file.write(f"# Содержимое из {filename}\n")
-                                combined_file.write(list_file.read())
-                                combined_file.write("\n")
-        
-        return combined_path
+                                content = list_file.read()
+                                if content.strip():
+                                    combined_file.write(f"# Содержимое из {filename}\n")
+                                    combined_file.write(content)
+                                    combined_file.write("\n\n")
+                                    has_content = True
+            
+            # 2. Добавляем custom_list.txt, если он предоставлен и валиден
+            if custom_list_path and os.path.exists(custom_list_path) and os.path.getsize(custom_list_path) > 0:
+                with open(custom_list_path, 'r', encoding='utf-8') as custom_file:
+                    content = custom_file.read()
+                    if content.strip():
+                        combined_file.write("# Содержимое из custom_list.txt\n")
+                        combined_file.write(content)
+                        combined_file.write("\n")
+                        has_content = True
+
+        return combined_path if has_content else None

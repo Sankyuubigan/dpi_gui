@@ -1,47 +1,36 @@
 import os
 import subprocess
-import urllib.request
 import shutil
 import time
+import json
 
 from process_manager import is_process_running, is_service_running, ZAPRET_SERVICE_NAME, WINWS_EXE
 
+def save_app_settings(settings_data, app_dir):
+    """Сохраняет настройки GUI в файл settings.json."""
+    settings_file = os.path.join(app_dir, 'settings.json')
+    try:
+        with open(settings_file, 'w', encoding='utf-8') as f:
+            json.dump(settings_data, f, indent=4)
+    except Exception as e:
+        print(f"Ошибка сохранения настроек: {e}")
+
+def load_app_settings(app_dir):
+    """Загружает настройки GUI из файла settings.json."""
+    settings_file = os.path.join(app_dir, 'settings.json')
+    if os.path.exists(settings_file):
+        try:
+            with open(settings_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, TypeError):
+            print("Ошибка чтения файла настроек. Будут использованы значения по умолчанию.")
+            return {}
+    return {}
+
 def get_game_filter_status(base_dir):
-    """Проверяет, включен ли игровой фильтр."""
+    """Проверяет, включен ли игровой фильтр (устаревший метод)."""
     game_flag_file = os.path.join(base_dir, 'bin', 'game_filter.enabled')
     return os.path.exists(game_flag_file)
-
-def toggle_game_filter(base_dir, log_callback):
-    """Включает или выключает игровой фильтр."""
-    game_flag_file = os.path.join(base_dir, 'bin', 'game_filter.enabled')
-    if get_game_filter_status(base_dir):
-        log_callback("Выключение игрового фильтра...")
-        try:
-            os.remove(game_flag_file)
-            log_callback("[+] Фильтр выключен.")
-        except OSError as e:
-            log_callback(f"[!] Ошибка: {e}")
-    else:
-        log_callback("Включение игрового фильтра...")
-        try:
-            open(game_flag_file, 'w').close()
-            log_callback("[+] Фильтр включен.")
-        except OSError as e:
-            log_callback(f"[!] Ошибка: {e}")
-    log_callback("(!) Перезапустите обход или службу, чтобы изменения вступили в силу.")
-
-def update_ipset_list(base_dir, log_callback):
-    """Обновляет список ipset-all.txt с GitHub."""
-    log_callback("\n--- Обновление списка ipset-all.txt ---")
-    IPSET_URL = "https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/lists/ipset-all.txt"
-    target_path = os.path.join(base_dir, 'lists', 'ipset-all.txt')
-    try:
-        with urllib.request.urlopen(IPSET_URL) as response, open(target_path, 'wb') as out_file:
-            shutil.copyfileobj(response, out_file)
-        log_callback("[+] Список ipset-all.txt успешно обновлен.")
-    except Exception as e:
-        log_callback(f"\n[!] Не удалось обновить список: {e}")
-    log_callback("-------------------------------------\n")
 
 def check_status(base_dir, log_callback, log_header=True):
     """Проверяет и выводит в лог статус процессов и настроек."""
@@ -59,11 +48,12 @@ def check_status(base_dir, log_callback, log_header=True):
     else:
         log_callback(f"[-] Автозапуск (служба {ZAPRET_SERVICE_NAME}): НЕ АКТИВЕН")
         
-    if get_game_filter_status(base_dir):
-        log_callback("[+] Игровой фильтр: ВКЛЮЧЕН")
+    app_settings = load_app_settings(base_dir)
+    if app_settings.get("game_filter", False):
+         log_callback("[+] Игровой фильтр: ВКЛЮЧЕН (в настройках)")
     else:
-        log_callback("[-] Игровой фильтр: ВЫКЛЮЧЕН")
-    
+         log_callback("[-] Игровой фильтр: ВЫКЛЮЧЕН (в настройках)")
+
     if log_header:
         log_callback("="*40 + "\n")
 
@@ -75,7 +65,6 @@ def install_service(base_dir, log_callback, profile):
     lists_dir = os.path.join(base_dir, 'lists')
     executable_path = os.path.join(bin_dir, WINWS_EXE)
     
-    # Для службы игровой фильтр всегда включен, как в оригинальном скрипте
     game_filter_value = "1024-65535"
     
     args_str = profile["args"].format(
@@ -84,21 +73,17 @@ def install_service(base_dir, log_callback, profile):
         GAME_FILTER=game_filter_value
     )
     
-    # sc.exe требует особого форматирования binPath
     bin_path = f'"{executable_path}" {args_str}'
 
     try:
-        # Сначала останавливаем и удаляем старую службу, если она есть
         subprocess.run(['sc', 'stop', ZAPRET_SERVICE_NAME], capture_output=True)
         subprocess.run(['sc', 'delete', ZAPRET_SERVICE_NAME], capture_output=True)
-        time.sleep(1) # Пауза на удаление
+        time.sleep(1)
 
-        # Создаем новую службу
         create_cmd = ['sc', 'create', ZAPRET_SERVICE_NAME, 'binPath=', bin_path, 'start=', 'auto', 'DisplayName=', 'Zapret DPI Bypass']
         log_callback(f"Выполняю: {' '.join(create_cmd)}")
         subprocess.run(create_cmd, check=True, capture_output=True)
         
-        # Запускаем службу
         subprocess.run(['sc', 'start', ZAPRET_SERVICE_NAME], check=True, capture_output=True)
         
         log_callback("\n[+] УСПЕХ! Служба запущена и добавлена в автозапуск.")
@@ -112,11 +97,9 @@ def uninstall_service(base_dir, log_callback):
     """Удаляет службу из автозапуска."""
     log_callback(f"\n--- Удаление службы '{ZAPRET_SERVICE_NAME}' ---")
     try:
-        # Останавливаем службу
         subprocess.run(['sc', 'stop', ZAPRET_SERVICE_NAME], capture_output=True)
         time.sleep(1)
 
-        # Удаляем службу
         delete_result = subprocess.run(['sc', 'delete', ZAPRET_SERVICE_NAME], capture_output=True, text=True, encoding='cp866')
         
         if "SUCCESS" in delete_result.stdout or "[SC] DeleteService УСПЕХ" in delete_result.stdout:
@@ -139,7 +122,7 @@ def clear_discord_cache(base_dir, log_callback):
             subprocess.run(['taskkill', '/F', '/IM', 'Discord.exe'], capture_output=True)
             time.sleep(1)
     except FileNotFoundError:
-        pass # tasklist не найден, ничего страшного
+        pass
 
     appdata_path = os.getenv('APPDATA')
     if appdata_path:

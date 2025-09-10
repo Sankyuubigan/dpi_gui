@@ -7,6 +7,8 @@ import queue
 import subprocess
 import traceback
 import ctypes
+import logging
+import datetime
 # --- Начальная настройка и проверка прав ---
 def is_admin():
     try:
@@ -22,11 +24,10 @@ def run_as_admin():
 APP_SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP_SOURCE_DIR)
 # --- Импорты модулей проекта ---
-from executor import update_zapret_tool, is_custom_list_valid
-from domain_finder import AnalysisDialog
+from executor import is_custom_list_valid
+from domain_finder import show_domain_finder
 from text_utils import setup_text_widget_bindings
 from list_manager import ListManager
-# from version_checker import check_zapret_version # УДАЛЕНО
 from profiles import PROFILES
 import process_manager
 import settings_manager
@@ -40,13 +41,22 @@ class App:
         self.profiles = PROFILES
         self.test_thread = None
         self.list_manager = ListManager(self.app_dir)
+
+        # Настройка логирования для status indicator
+        os.makedirs("roo_tests", exist_ok=True)
+        self.status_logger = logging.getLogger("status_indicators")
+        handler = logging.FileHandler("roo_tests/status_runtime.log")
+        formatter = logging.Formatter("%(asctime)s - %(message)s")
+        handler.setFormatter(formatter)
+        self.status_logger.addHandler(handler)
+        self.status_logger.setLevel(logging.INFO)
+
         self.setup_window()
         self.create_widgets()
         self.populate_profiles_list()
+        self.load_app_settings()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
-        # Первоначальная проверка
-        self.update_game_filter_checkbox()
     def setup_window(self):
         version_hash = "unknown"
         version_file_path = os.path.join(self.app_dir, ".version_hash")
@@ -64,7 +74,6 @@ class App:
         except Exception:
             pass
     def create_widgets(self):
-        # --- ОСНОВНАЯ СТРУКТУРА С ВКЛАДКАМИ ---
         notebook = ttk.Notebook(self.root)
         notebook.pack(expand=True, fill="both", padx=10, pady=5)
         tab_control = ttk.Frame(notebook, padding=10)
@@ -73,69 +82,71 @@ class App:
         notebook.add(tab_control, text="Управление")
         notebook.add(tab_tools, text="Инструменты и Настройки")
         notebook.add(tab_testing, text="Тестирование")
-        # --- ВКЛАДКА "УПРАВЛЕНИЕ" ---
+        
         self.create_control_tab(tab_control)
-        # --- ВКЛАДКА "ИНСТРУМЕНТЫ И НАСТРОЙКИ" ---
         self.create_tools_tab(tab_tools)
-        # --- ВКЛАДКА "ТЕСТИРОВАНИЕ" ---
         self.create_testing_tab(tab_testing)
-        # --- ОКНО ЛОГОВ ---
+        
         log_frame = tk.Frame(self.root)
         log_frame.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
         tk.Label(log_frame, text="Логи:").pack(anchor=tk.W)
         self.log_window = scrolledtext.ScrolledText(log_frame, height=10, state='disabled', bg='black', fg='white', relief=tk.SUNKEN, borderwidth=1)
         self.log_window.pack(fill=tk.BOTH, expand=True)
         setup_text_widget_bindings(self.log_window)
+
     def create_control_tab(self, parent):
-        list_frame = ttk.LabelFrame(parent, text="Профили")
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        profile_frame = ttk.LabelFrame(parent, text="Профиль обхода")
+        profile_frame.pack(fill=tk.X, pady=5)
+
+        self.profile_var = tk.StringVar()
+        self.profiles_combobox = ttk.Combobox(profile_frame, textvariable=self.profile_var, state="readonly")
+        self.profiles_combobox.pack(fill=tk.X, padx=5, pady=5)
         
-        self.profiles_listbox = tk.Listbox(list_frame)
-        self.profiles_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
-        scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.profiles_listbox.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.profiles_listbox.config(yscrollcommand=scrollbar.set)
-        setup_text_widget_bindings(self.profiles_listbox)
-        
-        # Добавляем интерфейс для выбора списков доменов
         self.list_manager.create_list_selection_ui(parent)
         
         actions_frame = ttk.Frame(parent)
         actions_frame.pack(fill=tk.X, pady=5)
         
-        self.run_button = ttk.Button(actions_frame, text="Запустить профиль", command=self.run_selected_profile)
+        self.run_button = ttk.Button(actions_frame, text="Запустить", command=self.run_selected_profile)
         self.run_button.pack(side=tk.LEFT, padx=5)
         self.stop_button = ttk.Button(actions_frame, text="Остановить", command=self.stop_process)
         self.stop_button.pack(side=tk.LEFT, padx=5)
+
+        self.status_label = tk.Label(actions_frame, text="Статус:")
+        self.status_label.pack(side=tk.LEFT, padx=5, pady=5)
+
+        self.status_indicator = tk.Label(actions_frame, text="ОСТАНОВЛЕНО", bg="#cccccc", fg="white", padx=10, pady=2, relief=tk.RAISED, borderwidth=2)
+        self.status_indicator.pack(side=tk.LEFT, padx=10, pady=5)
+
+    def create_tools_tab(self, parent):
+        tools_top_frame = ttk.Frame(parent)
+        tools_top_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(tools_top_frame, text="Проверить статус", command=self.check_status).pack(side=tk.LEFT, padx=5, pady=5)
+        
+        settings_frame = ttk.LabelFrame(parent, text="Настройки")
+        settings_frame.pack(fill=tk.X, pady=10)
+        
+        self.game_filter_var = tk.BooleanVar()
+        self.game_filter_check = ttk.Checkbutton(settings_frame, text="Игровой фильтр (для всех профилей)", variable=self.game_filter_var)
+        self.game_filter_check.pack(anchor=tk.W, padx=5, pady=5)
+        
+        self.use_ipset_var = tk.BooleanVar(value=False)
+        self.use_ipset_check = ttk.Checkbutton(settings_frame, text="Использовать IPSet (требует ручного обновления)", variable=self.use_ipset_var)
+        self.use_ipset_check.pack(anchor=tk.W, padx=5, pady=5)
+        
         service_frame = ttk.LabelFrame(parent, text="Автозапуск (Системная служба)")
         service_frame.pack(fill=tk.X, pady=10)
         self.install_service_button = ttk.Button(service_frame, text="Установить в автозапуск", command=self.install_service)
         self.install_service_button.pack(side=tk.LEFT, padx=5, pady=5)
         self.uninstall_service_button = ttk.Button(service_frame, text="Удалить из автозапуска", command=self.uninstall_service)
         self.uninstall_service_button.pack(side=tk.LEFT, padx=5, pady=5)
-    def create_tools_tab(self, parent):
-        general_frame = ttk.LabelFrame(parent, text="Общие инструменты")
-        general_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Button(general_frame, text="Проверить статус", command=self.check_status).pack(side=tk.LEFT, padx=5, pady=5)
-        ttk.Button(general_frame, text="Обновить программу", command=self.run_zapret_update).pack(side=tk.LEFT, padx=5, pady=5)
-        ttk.Button(general_frame, text="Обновить списки IP", command=lambda: self.run_in_thread(settings_manager.update_ipset_list, self.app_dir, self.log_message)).pack(side=tk.LEFT, padx=5, pady=5)
-        settings_frame = ttk.LabelFrame(parent, text="Настройки")
-        settings_frame.pack(fill=tk.X, pady=10)
-        
-        self.game_filter_var = tk.BooleanVar()
-        self.game_filter_check = ttk.Checkbutton(settings_frame, text="Игровой фильтр (для всех профилей)", variable=self.game_filter_var, command=self.toggle_game_filter)
-        self.game_filter_check.pack(anchor=tk.W, padx=5, pady=5)
-        
-        # Добавляем чекбокс для использования IPSet
-        self.use_ipset_var = tk.BooleanVar(value=False)  # По умолчанию выключен
-        self.use_ipset_check = ttk.Checkbutton(settings_frame, text="Использовать IPSet (дополнительные списки IP)", variable=self.use_ipset_var)
-        self.use_ipset_check.pack(anchor=tk.W, padx=5, pady=5)
         
         domain_frame = ttk.LabelFrame(parent, text="Пользовательские списки")
         domain_frame.pack(fill=tk.X, pady=10)
         ttk.Button(domain_frame, text="Добавить домены с сайта...", command=self.open_add_site_dialog).pack(side=tk.LEFT, padx=5, pady=5)
         ttk.Button(domain_frame, text="Открыть custom_list.txt", command=self.open_custom_list).pack(side=tk.LEFT, padx=5, pady=5)
+
     def create_testing_tab(self, parent):
         site_test_frame = ttk.LabelFrame(parent, text="Автоматический тест по сайту")
         site_test_frame.pack(fill=tk.X, pady=5)
@@ -149,30 +160,39 @@ class App:
         
         ttk.Button(discord_test_frame, text="Очистить кэш Discord", command=lambda: self.run_in_thread(settings_manager.clear_discord_cache, self.app_dir, self.log_message)).pack(side=tk.LEFT, padx=5, pady=5)
         ttk.Button(discord_test_frame, text="Начать тест для Discord", command=self.run_discord_test).pack(side=tk.LEFT, padx=5, pady=5)
+
     def _handle_ui_error(self, e):
-        """Централизованный обработчик ошибок для предотвращения падения GUI."""
         error_details = traceback.format_exc()
         self.log_message("\n" + "="*20 + " КРИТИЧЕСКАЯ ОШИБКА GUI " + "="*20)
         self.log_message("Произошла непредвиденная ошибка в интерфейсе:")
         self.log_message(error_details)
         self.log_message("="*62 + "\n")
         messagebox.showerror("Критическая ошибка", f"Произошла ошибка:\n{e}\n\nПодробности записаны в окне логов.")
+
     def populate_profiles_list(self):
-        self.profiles_listbox.delete(0, tk.END)
-        for profile in self.profiles:
-            self.profiles_listbox.insert(tk.END, profile['name'])
-        if self.profiles:
-            self.profiles_listbox.select_set(0)
+        profile_names = [p['name'] for p in self.profiles]
+        self.profiles_combobox['values'] = profile_names
+        if profile_names:
+            self.profiles_combobox.current(0)
+
     def get_selected_profile(self):
-        selected_indices = self.profiles_listbox.curselection()
-        
-        if not selected_indices:
+        selected_name = self.profile_var.get()
+        if not selected_name:
             messagebox.showwarning("Предупреждение", "Пожалуйста, выберите профиль из списка.")
             return None
         
-        # ОКОНЧАТЕЛЬНОЕ ИСПРАВЛЕНИЕ: Извлечь первый элемент из кортежа.
-        selected_index = int(selected_indices[0])
-        return self.profiles[selected_index]
+        return next((p for p in self.profiles if p['name'] == selected_name), None)
+
+    def update_status_indicator(self, is_running):
+        time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        bg_color = "#4CAF50" if is_running else "#cccccc"
+        self.status_logger.info(f"time={time_str}, is_running={is_running}, bg_color={bg_color}")
+
+        if is_running:
+            self.status_indicator.config(text="ЗАПУЩЕНО", bg="#4CAF50")
+        else:
+            self.status_indicator.config(text="ОСТАНОВЛЕНО", bg="#cccccc")
+
     def run_selected_profile(self):
         try:
             if self.process and self.process.poll() is None:
@@ -188,41 +208,41 @@ class App:
             process_manager.stop_all_processes(self.log_message)
             self.log_message(f"Запуск профиля: {profile['name']}")
             game_filter_enabled = self.game_filter_var.get()
-            custom_list_path = os.path.join(self.app_dir, 'lists', 'custom_list.txt')
-            use_custom_list = is_custom_list_valid(custom_list_path)
             use_ipset = self.use_ipset_var.get()
             
-            # Если включен IPSet, проверяем наличие файла и скачиваем при необходимости
-            if use_ipset:
-                ipset_path = os.path.join(self.app_dir, 'lists', 'ipset-all.txt')
-                if not os.path.exists(ipset_path):
-                    self.log_message("Файл ipset-all.txt не найден. Скачиваю...")
-                    settings_manager.update_ipset_list(self.app_dir, self.log_message)
+            if use_ipset and not os.path.exists(os.path.join(self.app_dir, 'lists', 'ipset-all.txt')):
+                self.log_message("ВНИМАНИЕ: ipset-all.txt не найден. Запустите обновление вручную в `launcher.py` или скачайте его.")
+
+            custom_list_path = os.path.join(self.app_dir, 'lists', 'custom_list.txt')
+            combined_list_path = self.list_manager.get_combined_list_path(custom_list_path)
             
-            # Получаем путь к объединенному списку выбранных доменов
-            selected_lists_path = None
-            if any(self.list_manager.selected_lists.values()):
-                selected_lists_path = self.list_manager.get_combined_list_path()
-                self.log_message(f"Используются выбранные списки доменов: {', '.join([name for name, selected in self.list_manager.selected_lists.items() if selected])}")
+            if combined_list_path:
+                 self.log_message("Используются выбранные списки доменов и/или custom_list.txt.")
             else:
-                self.log_message("Не выбрано ни одного списка доменов. Будут использованы списки по умолчанию из профиля.")
-            
-            self.process = process_manager.start_process(profile, self.app_dir, game_filter_enabled, use_custom_list, self.log_message, selected_lists_path, use_ipset)
+                 self.log_message("ВНИМАНИЕ: Не выбрано ни одного списка доменов, и custom_list.txt пуст. Обход будет неактивен.")
+
+            self.process = process_manager.start_process(
+                profile, self.app_dir, game_filter_enabled, 
+                self.log_message, combined_list_path, use_ipset
+            )
             
             if not self.process:
                 self.log_message("Не удалось запустить процесс. Проверьте логи выше на наличие ошибок.")
                 return
                 
             self.set_controls_state(tk.DISABLED)
+            self.update_status_indicator(True)
             self.worker_thread = threading.Thread(target=self.read_process_output, daemon=True)
             self.worker_thread.start()
             self.monitor_process()
         except Exception as e:
             self._handle_ui_error(e)
+
     def read_process_output(self):
         for line in iter(self.process.stdout.readline, ''):
             self.log_queue.put(line)
         self.log_queue.put(None)
+
     def monitor_process(self):
         try:
             line = self.log_queue.get_nowait()
@@ -232,13 +252,18 @@ class App:
             self.log_message(line.strip())
         except queue.Empty:
             pass
-        if self.process:
+        if self.process and self.process.poll() is None:
             self.root.after(100, self.monitor_process)
+        elif self.process:
+            self.process_finished()
+
     def process_finished(self):
         return_code = self.process.poll() if self.process else 'N/A'
         self.log_message(f"\nПроцесс завершен с кодом {return_code}.")
         self.set_controls_state(tk.NORMAL)
+        self.update_status_indicator(False)
         self.process = None
+
     def stop_process(self):
         try:
             self.log_message("\n" + "="*40)
@@ -246,51 +271,73 @@ class App:
             process_manager.stop_all_processes(self.log_message)
             self.check_status(log_header=False)
             self.set_controls_state(tk.NORMAL)
-            self.process = None
+            self.update_status_indicator(False)
+            if self.process:
+                self.process = None
         except Exception as e:
             self._handle_ui_error(e)
+
     def check_status(self, log_header=True):
         try:
             settings_manager.check_status(self.app_dir, self.log_message, log_header)
         except Exception as e:
             self._handle_ui_error(e)
+
     def set_controls_state(self, state):
         self.run_button.config(state=state)
-        self.profiles_listbox.config(state=state)
         self.install_service_button.config(state=state)
+        combobox_state = "readonly" if state == tk.NORMAL else tk.DISABLED
+        self.profiles_combobox.config(state=combobox_state)
+
     def on_closing(self):
         try:
+            self.save_app_settings()
             if self.process and self.process.poll() is None:
                 if messagebox.askyesno("Подтверждение", "Процесс еще активен. Остановить его перед выходом?"):
                     self.stop_process()
             self.root.destroy()
         except Exception as e:
             self._handle_ui_error(e)
+
     def log_message(self, message):
         if self.log_window.winfo_exists():
             self.log_window.config(state='normal')
             self.log_window.insert(tk.END, str(message) + "\n")
             self.log_window.config(state='disabled')
             self.log_window.see(tk.END)
+
     def run_in_thread(self, target_func, *args):
         thread = threading.Thread(target=target_func, args=args, daemon=True)
         thread.start()
-    def run_zapret_update(self):
-        try:
-            if messagebox.askyesno("Подтверждение", "Это скачает последнюю версию утилиты Zapret от Flowseal.\n\nВсе активные процессы будут остановлены. Продолжить?"):
-                update_thread = threading.Thread(target=update_zapret_tool, args=(self.app_dir, self.log_message), daemon=True)
-                update_thread.start()
-        except Exception as e:
-            self._handle_ui_error(e)
-    def update_game_filter_checkbox(self):
-        is_enabled = settings_manager.get_game_filter_status(self.app_dir)
-        self.game_filter_var.set(is_enabled)
-    def toggle_game_filter(self):
-        try:
-            settings_manager.toggle_game_filter(self.app_dir, self.log_message)
-            self.update_game_filter_checkbox()
-        except Exception as e:
-            self._handle_ui_error(e)
+
+    def save_app_settings(self):
+        settings_data = {
+            "selected_profile": self.profile_var.get(),
+            "game_filter": self.game_filter_var.get(),
+            "use_ipset": self.use_ipset_var.get(),
+            "selected_lists": self.list_manager.selected_lists
+        }
+        settings_manager.save_app_settings(settings_data, self.app_dir)
+        self.log_message("Настройки сохранены.")
+
+    def load_app_settings(self):
+        settings = settings_manager.load_app_settings(self.app_dir)
+        if not settings:
+            self.log_message("Файл настроек не найден, используются значения по умолчанию.")
+            return
+        
+        profile_name = settings.get("selected_profile")
+        profile_names = self.profiles_combobox['values']
+        if profile_name in profile_names:
+            self.profile_var.set(profile_name)
+        
+        self.game_filter_var.set(settings.get("game_filter", False))
+        self.use_ipset_var.set(settings.get("use_ipset", False))
+        
+        self.list_manager.set_selection_state(settings.get("selected_lists"))
+        
+        self.log_message("Настройки успешно загружены.")
+        
     def open_custom_list(self):
         try:
             list_path = os.path.join(self.app_dir, 'lists', 'custom_list.txt')
@@ -300,13 +347,15 @@ class App:
             os.startfile(list_path)
         except Exception as e:
             self._handle_ui_error(e)
+
     def open_add_site_dialog(self):
         try:
-            dialog = AnalysisDialog(self.root, title="Анализ сайта для добавления доменов")
-            if dialog.result_domains:
-                self.add_domains_to_list(dialog.result_domains)
+            domains = show_domain_finder(self.root)
+            if domains:
+                self.add_domains_to_list(domains)
         except Exception as e:
             self._handle_ui_error(e)
+
     def add_domains_to_list(self, new_domains):
         try:
             custom_list_path = os.path.join(self.app_dir, 'lists', 'custom_list.txt')
@@ -333,6 +382,7 @@ class App:
             self.log_message("--------------------------------------------------")
         except Exception as e:
             self._handle_ui_error(e)
+
     def install_service(self):
         try:
             profile = self.get_selected_profile()
@@ -341,17 +391,20 @@ class App:
                 self.run_in_thread(settings_manager.install_service, self.app_dir, self.log_message, profile)
         except Exception as e:
             self._handle_ui_error(e)
+
     def uninstall_service(self):
         try:
             if messagebox.askyesno("Подтверждение", "Удалить службу автозапуска Zapret?"):
                 self.run_in_thread(settings_manager.uninstall_service, self.app_dir, self.log_message)
         except Exception as e:
             self._handle_ui_error(e)
+
     def _check_test_running(self):
         if self.test_thread and self.test_thread.is_alive():
             messagebox.showwarning("Внимание", "Тест уже запущен. Дождитесь его окончания.")
             return True
         return False
+
     def run_site_test(self):
         try:
             if self._check_test_running(): return
@@ -368,6 +421,7 @@ class App:
             self.test_thread.start()
         except Exception as e:
             self._handle_ui_error(e)
+
     def run_discord_test(self):
         try:
             if self._check_test_running(): return
@@ -385,6 +439,7 @@ class App:
             self.test_thread.start()
         except Exception as e:
             self._handle_ui_error(e)
+            
 if __name__ == "__main__":
     if not is_admin():
         run_as_admin()

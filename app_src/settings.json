@@ -1,0 +1,11 @@
+{
+    "selected_profile": "1.8.3 - General (ALT2)",
+    "game_filter": false,
+    "use_ipset": false,
+    "selected_lists": {
+        "discord": true,
+        "list-custom": true,
+        "list-general": false,
+        "youtube": true
+    }
+}
