@@ -1,7 +1,7 @@
 import os
 import tempfile
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, filedialog, messagebox
 
 class ListManager:
     """Класс для управления списками доменов и их выбора в интерфейсе."""
@@ -11,6 +11,7 @@ class ListManager:
         self.lists_dir = os.path.join(app_dir, 'lists')
         self.available_lists = self._discover_available_lists()
         self.selected_lists = {}
+        self.custom_list_path = None
         
         # Инициализируем выбор всех списков по умолчанию
         for list_name in self.available_lists:
@@ -95,14 +96,22 @@ class ListManager:
                                     combined_file.write("\n\n")
                                     has_content = True
             
-            # 2. Добавляем custom_list.txt, если он предоставлен и валиден
+            # 2. Добавляем кастомный список, если он предоставлен и валиден
             if custom_list_path and os.path.exists(custom_list_path) and os.path.getsize(custom_list_path) > 0:
                 with open(custom_list_path, 'r', encoding='utf-8') as custom_file:
                     content = custom_file.read()
                     if content.strip():
-                        combined_file.write("# Содержимое из custom_list.txt\n")
+                        combined_file.write(f"# Содержимое из {os.path.basename(custom_list_path)}\n")
                         combined_file.write(content)
                         combined_file.write("\n")
                         has_content = True
 
         return combined_path if has_content else None
+
+    def set_custom_list_path(self, path):
+        """Устанавливает путь к кастомному списку."""
+        self.custom_list_path = path
+
+    def get_custom_list_path(self):
+        """Возвращает путь к кастомному списку."""
+        return self.custom_list_path

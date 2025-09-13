@@ -4,8 +4,9 @@
     "use_ipset": false,
     "selected_lists": {
         "discord": true,
-        "list-custom": true,
         "list-general": false,
         "youtube": true
-    }
+    },
+    "use_custom_list": true,
+    "custom_list_path": "C:/Users/user/Desktop/list-custom.txt"
 }

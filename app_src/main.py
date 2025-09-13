@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox, simpledialog
+from tkinter import ttk, scrolledtext, messagebox, simpledialog, filedialog
 import os
 import sys
 import threading
@@ -104,6 +104,22 @@ class App:
         
         self.list_manager.create_list_selection_ui(parent)
         
+        # Добавляем чекбокс для выбора кастомного списка
+        custom_list_frame = ttk.Frame(parent)
+        custom_list_frame.pack(fill=tk.X, pady=5, padx=5)
+        
+        self.use_custom_list_var = tk.BooleanVar()
+        self.use_custom_list_check = ttk.Checkbutton(
+            custom_list_frame, 
+            text="Использовать кастомный список", 
+            variable=self.use_custom_list_var,
+            command=self.on_custom_list_toggle
+        )
+        self.use_custom_list_check.pack(side=tk.LEFT, padx=5)
+        
+        self.custom_list_path_label = tk.Label(custom_list_frame, text="(не выбран)", fg="gray")
+        self.custom_list_path_label.pack(side=tk.LEFT, padx=5)
+        
         actions_frame = ttk.Frame(parent)
         actions_frame.pack(fill=tk.X, pady=5)
         
@@ -117,6 +133,27 @@ class App:
 
         self.status_indicator = tk.Label(actions_frame, text="ОСТАНОВЛЕНО", bg="#cccccc", fg="white", padx=10, pady=2, relief=tk.RAISED, borderwidth=2)
         self.status_indicator.pack(side=tk.LEFT, padx=10, pady=5)
+
+    def on_custom_list_toggle(self):
+        """Обработчик переключения чекбокса кастомного списка."""
+        if self.use_custom_list_var.get():
+            self.select_custom_list_file()
+        else:
+            self.list_manager.set_custom_list_path(None)
+            self.custom_list_path_label.config(text="(не выбран)", fg="gray")
+
+    def select_custom_list_file(self):
+        """Открывает диалог выбора файла для кастомного списка."""
+        file_path = filedialog.askopenfilename(
+            title="Выберите файл со списком доменов",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if file_path:
+            self.list_manager.set_custom_list_path(file_path)
+            self.custom_list_path_label.config(text=os.path.basename(file_path), fg="black")
+        else:
+            self.use_custom_list_var.set(False)
+            self.list_manager.set_custom_list_path(None)
 
     def create_tools_tab(self, parent):
         tools_top_frame = ttk.Frame(parent)
@@ -145,7 +182,8 @@ class App:
         domain_frame = ttk.LabelFrame(parent, text="Пользовательские списки")
         domain_frame.pack(fill=tk.X, pady=10)
         ttk.Button(domain_frame, text="Добавить домены с сайта...", command=self.open_add_site_dialog).pack(side=tk.LEFT, padx=5, pady=5)
-        ttk.Button(domain_frame, text="Открыть custom_list.txt", command=self.open_custom_list).pack(side=tk.LEFT, padx=5, pady=5)
+        ttk.Button(domain_frame, text="Открыть кастомный список", command=self.open_custom_list).pack(side=tk.LEFT, padx=5, pady=5)
+        ttk.Button(domain_frame, text="Выбрать кастомный список...", command=self.select_custom_list_file).pack(side=tk.LEFT, padx=5, pady=5)
 
     def create_testing_tab(self, parent):
         site_test_frame = ttk.LabelFrame(parent, text="Автоматический тест по сайту")
@@ -213,13 +251,19 @@ class App:
             if use_ipset and not os.path.exists(os.path.join(self.app_dir, 'lists', 'ipset-all.txt')):
                 self.log_message("ВНИМАНИЕ: ipset-all.txt не найден. Запустите обновление вручную в `launcher.py` или скачайте его.")
 
-            custom_list_path = os.path.join(self.app_dir, 'lists', 'custom_list.txt')
+            custom_list_path = None
+            if self.use_custom_list_var.get():
+                custom_list_path = self.list_manager.get_custom_list_path()
+                if not custom_list_path or not os.path.exists(custom_list_path):
+                    messagebox.showwarning("Предупреждение", "Кастомный список не выбран или файл не существует.")
+                    return
+
             combined_list_path = self.list_manager.get_combined_list_path(custom_list_path)
             
             if combined_list_path:
-                 self.log_message("Используются выбранные списки доменов и/или custom_list.txt.")
+                 self.log_message("Используются выбранные списки доменов и/или кастомный список.")
             else:
-                 self.log_message("ВНИМАНИЕ: Не выбрано ни одного списка доменов, и custom_list.txt пуст. Обход будет неактивен.")
+                 self.log_message("ВНИМАНИЕ: Не выбрано ни одного списка доменов, и кастомный список пуст. Обход будет неактивен.")
 
             self.process = process_manager.start_process(
                 profile, self.app_dir, game_filter_enabled, 
@@ -288,6 +332,7 @@ class App:
         self.install_service_button.config(state=state)
         combobox_state = "readonly" if state == tk.NORMAL else tk.DISABLED
         self.profiles_combobox.config(state=combobox_state)
+        self.use_custom_list_check.config(state=state)
 
     def on_closing(self):
         try:
@@ -315,7 +360,9 @@ class App:
             "selected_profile": self.profile_var.get(),
             "game_filter": self.game_filter_var.get(),
             "use_ipset": self.use_ipset_var.get(),
-            "selected_lists": self.list_manager.selected_lists
+            "selected_lists": self.list_manager.selected_lists,
+            "use_custom_list": self.use_custom_list_var.get(),
+            "custom_list_path": self.list_manager.get_custom_list_path()
         }
         settings_manager.save_app_settings(settings_data, self.app_dir)
         self.log_message("Настройки сохранены.")
@@ -333,6 +380,12 @@ class App:
         
         self.game_filter_var.set(settings.get("game_filter", False))
         self.use_ipset_var.set(settings.get("use_ipset", False))
+        self.use_custom_list_var.set(settings.get("use_custom_list", False))
+        
+        custom_list_path = settings.get("custom_list_path")
+        if custom_list_path and os.path.exists(custom_list_path):
+            self.list_manager.set_custom_list_path(custom_list_path)
+            self.custom_list_path_label.config(text=os.path.basename(custom_list_path), fg="black")
         
         self.list_manager.set_selection_state(settings.get("selected_lists"))
         
@@ -340,11 +393,14 @@ class App:
         
     def open_custom_list(self):
         try:
-            list_path = os.path.join(self.app_dir, 'lists', 'custom_list.txt')
-            if not os.path.exists(list_path):
-                with open(list_path, 'w', encoding='utf-8') as f:
-                    f.write("# Это ваш личный список доменов. Добавляйте по одному домену на строку.\n")
-            os.startfile(list_path)
+            custom_list_path = self.list_manager.get_custom_list_path()
+            if not custom_list_path:
+                # Если кастомный список не выбран, используем стандартный
+                custom_list_path = os.path.join(self.app_dir, 'lists', 'custom_list.txt')
+                if not os.path.exists(custom_list_path):
+                    with open(custom_list_path, 'w', encoding='utf-8') as f:
+                        f.write("# Это ваш личный список доменов. Добавляйте по одному домену на строку.\n")
+            os.startfile(custom_list_path)
         except Exception as e:
             self._handle_ui_error(e)
 
@@ -358,7 +414,10 @@ class App:
 
     def add_domains_to_list(self, new_domains):
         try:
-            custom_list_path = os.path.join(self.app_dir, 'lists', 'custom_list.txt')
+            custom_list_path = self.list_manager.get_custom_list_path()
+            if not custom_list_path:
+                custom_list_path = os.path.join(self.app_dir, 'lists', 'custom_list.txt')
+            
             existing_domains = set()
             if os.path.exists(custom_list_path):
                 with open(custom_list_path, 'r', encoding='utf-8') as f:
@@ -376,7 +435,7 @@ class App:
                 f.write("# Строки, начинающиеся с #, игнорируются.\n")
                 for domain in all_domains:
                     f.write(domain + '\n')
-            self.log_message("\n--- Добавлены новые домены в custom_list.txt: ---")
+            self.log_message("\n--- Добавлены новые домены в кастомный список: ---")
             for domain in sorted(added_domains):
                 self.log_message(f"  + {domain}")
             self.log_message("--------------------------------------------------")
