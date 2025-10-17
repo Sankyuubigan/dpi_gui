@@ -9,6 +9,8 @@ import traceback
 import ctypes
 import logging
 import datetime
+import win32con
+import win32api
 # --- Начальная настройка и проверка прав ---
 def is_admin():
     try:
@@ -32,6 +34,36 @@ from profiles import PROFILES
 import process_manager
 import settings_manager
 import testing_utils
+
+class PowerEventHandler:
+    """Класс для обработки событий питания (спящий/гибернация режим)"""
+    def __init__(self, app_instance):
+        self.app = app_instance
+        
+    def handle_power_event(self, hwnd, msg, wparam, lparam):
+        """Обработчик событий питания"""
+        if msg == win32con.WM_POWERBROADCAST:
+            if wparam == win32con.PBT_APMRESUMEAUTOMATIC:
+                # Система вышла из спящего режима
+                if process_manager.is_process_running():
+                    self.app.log_message("\n[СИСТЕМА] Обнаружен выход из спящего режима")
+                    # Запускаем перезапуск в отдельном потоке
+                    threading.Thread(target=self._restart_after_sleep, daemon=True).start()
+        return True
+        
+    def _restart_after_sleep(self):
+        """Перезапускает процесс после выхода из спящего режима"""
+        time.sleep(3)  # Даем системе время на инициализацию сети
+        new_process = process_manager.restart_process()
+        if new_process:
+            self.app.process = new_process
+            self.app.worker_thread = threading.Thread(target=self.app.read_process_output, daemon=True)
+            self.app.worker_thread.start()
+            self.app.monitor_process()
+            self.app.log_message("[СИСТЕМА] Профиль успешно перезапущен после выхода из спящего режима")
+        else:
+            self.app.log_message("[СИСТЕМА] ОШИБКА: Не удалось перезапустить профиль")
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -58,6 +90,9 @@ class App:
         self.load_app_settings()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
+        # Устанавливаем обработчик событий питания
+        self.setup_power_handler()
+        
     def setup_window(self):
         version_hash = "unknown"
         version_file_path = os.path.join(self.app_dir, ".version_hash")
@@ -74,6 +109,31 @@ class App:
                 self.root.iconbitmap(icon_path)
         except Exception:
             pass
+            
+    def setup_power_handler(self):
+        """Устанавливает обработчик событий питания"""
+        try:
+            # Создаем скрытое окно для получения сообщений системы
+            self.hwnd = win32api.CreateWindowEx(
+                0, "STATIC", "PowerHandler", 0, 0, 0, 0, 0, 0, 0, 0, None
+            )
+            
+            # Регистрируем обработчик сообщений о питании
+            self.power_handler = PowerEventHandler(self)
+            win32api.SetWindowLong(self.hwnd, win32con.GWL_WNDPROC, self.power_handler.handle_power_event)
+            
+            # Регистрируем получение сообщений о питании
+            win32api.RegisterPowerSettingNotification(
+                self.hwnd, 
+                win32api.GUID_SYSTEM_AWAYMODE, 
+                win32con.DEVICE_NOTIFY_WINDOW_HANDLE
+            )
+            
+            self.log_message("[СИСТЕМА] Обработчик событий питания успешно установлен")
+        except Exception as e:
+            self.log_message(f"[СИСТЕМА] Предупреждение: Не удалось установить обработчик событий питания: {e}")
+            self.log_message("[СИСТЕМА] Автоматический перезапуск после спящего режима будет недоступен")
+
     def create_widgets(self):
         notebook = ttk.Notebook(self.root)
         notebook.pack(expand=True, fill="both", padx=10, pady=5)

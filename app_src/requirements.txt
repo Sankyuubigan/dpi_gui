@@ -3,3 +3,4 @@ beautifulsoup4
 lxml
 selenium==4.15.2
 playwright
+pywin32

@@ -1,12 +1,33 @@
 import os
 import subprocess
 import shlex
+import threading
+import time
 
 WINWS_EXE = "winws.exe"
 ZAPRET_SERVICE_NAME = "ZapretDPIBypass"
 
+# Глобальные переменные для хранения параметров последнего запуска
+_last_profile = None
+_last_base_dir = None
+_last_game_filter_enabled = None
+_last_log_callback = None
+_last_combined_list_path = None
+_last_use_ipset = None
+
 def start_process(profile, base_dir, game_filter_enabled, log_callback, combined_list_path=None, use_ipset=False):
     """Собирает команду и запускает процесс winws.exe."""
+    global _last_profile, _last_base_dir, _last_game_filter_enabled
+    global _last_log_callback, _last_combined_list_path, _last_use_ipset
+    
+    # Сохраняем параметры для возможного перезапуска
+    _last_profile = profile
+    _last_base_dir = base_dir
+    _last_game_filter_enabled = game_filter_enabled
+    _last_log_callback = log_callback
+    _last_combined_list_path = combined_list_path
+    _last_use_ipset = use_ipset
+    
     bin_dir = os.path.join(base_dir, 'bin')
     executable_path = os.path.join(bin_dir, WINWS_EXE)
     
@@ -76,6 +97,35 @@ def start_process(profile, base_dir, game_filter_enabled, log_callback, combined
     except Exception as e:
         log_callback(f"КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ ПРОЦЕССА: {e}")
         return None
+
+def restart_process():
+    """Перезапускает процесс с последними использованными параметрами."""
+    global _last_profile, _last_base_dir, _last_game_filter_enabled
+    global _last_log_callback, _last_combined_list_path, _last_use_ipset
+    
+    if not _last_profile or not _last_log_callback:
+        return None
+    
+    _last_log_callback("\n" + "="*40)
+    _last_log_callback("ОБНАРУЖЕН ВЫХОД ИЗ СПЯЩЕГО РЕЖИМА")
+    _last_log_callback("Выполняю перезапуск профиля обхода...")
+    _last_log_callback("="*40 + "\n")
+    
+    # Сначала останавливаем все процессы
+    stop_all_processes(_last_log_callback)
+    
+    # Ждем немного для корректного освобождения ресурсов
+    time.sleep(2)
+    
+    # Перезапускаем с теми же параметрами
+    return start_process(
+        _last_profile, 
+        _last_base_dir, 
+        _last_game_filter_enabled,
+        _last_log_callback,
+        _last_combined_list_path,
+        _last_use_ipset
+    )
 
 def stop_all_processes(log_callback):
     """Принудительно останавливает все процессы winws.exe."""
