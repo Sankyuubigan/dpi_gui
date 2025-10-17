@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import QThread, Signal, Qt
 import concurrent.futures
 import time
+import chardet
 
 # === НАСТРОЙКИ ===
 TIMEOUT = 5  # секунд на ожидание ответа от домена
@@ -105,6 +106,14 @@ class DomainAnalyzerApp(QMainWindow):
         self.analyze_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; }")
         input_layout.addWidget(self.analyze_button)
         
+        self.cache_button = QPushButton("Из кэша Google")
+        self.cache_button.setStyleSheet("QPushButton { background-color: #2196F3; color: white; }")
+        input_layout.addWidget(self.cache_button)
+
+        self.wayback_button = QPushButton("Из Wayback Machine")
+        self.wayback_button.setStyleSheet("QPushButton { background-color: #FF9800; color: white; }")
+        input_layout.addWidget(self.wayback_button)
+        
         main_layout.addLayout(input_layout)
 
         # Прогресс-бар
@@ -158,6 +167,8 @@ class DomainAnalyzerApp(QMainWindow):
     def setup_connections(self):
         self.browse_button.clicked.connect(self.browse_file)
         self.analyze_button.clicked.connect(self.start_analysis)
+        self.cache_button.clicked.connect(self.load_from_cache)
+        self.wayback_button.clicked.connect(self.load_from_wayback)
 
     def log(self, message):
         """Выводит сообщение в лог и в консоль"""
@@ -198,6 +209,100 @@ class DomainAnalyzerApp(QMainWindow):
         self.analysis_thread.error.connect(self.on_analysis_error)
         self.analysis_thread.log_message.connect(self.log)
         self.analysis_thread.start()
+
+    def load_from_cache(self):
+        url = self.url_input.text().strip()
+        if not url.startswith(('http://', 'https://')):
+            self.log("Ошибка: Для загрузки из кэша нужен URL, а не файл!")
+            return
+        
+        # Очищаем таблицы и лог
+        self.all_domains_table.setRowCount(0)
+        self.inaccessible_table.setRowCount(0)
+        self.accessible_table.setRowCount(0)
+        self.log_text.clear()
+        
+        # Показываем прогресс-бар
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.analyze_button.setEnabled(False)
+        
+        html = self.get_from_google_cache(url)
+        if html:
+            self.process_html(html, url)
+        else:
+            self.progress_bar.setVisible(False)
+            self.analyze_button.setEnabled(True)
+
+    def load_from_wayback(self):
+        url = self.url_input.text().strip()
+        if not url.startswith(('http://', 'https://')):
+            self.log("Ошибка: Для загрузки из Wayback нужен URL, а не файл!")
+            return
+        
+        # Очищаем таблицы и лог
+        self.all_domains_table.setRowCount(0)
+        self.inaccessible_table.setRowCount(0)
+        self.accessible_table.setRowCount(0)
+        self.log_text.clear()
+        
+        # Показываем прогресс-бар
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.analyze_button.setEnabled(False)
+        
+        html = self.get_from_wayback(url)
+        if html:
+            self.process_html(html, url)
+        else:
+            self.progress_bar.setVisible(False)
+            self.analyze_button.setEnabled(True)
+
+    def get_from_google_cache(self, url):
+        """Получает страницу из кэша Google"""
+        try:
+            cache_url = f"http://webcache.googleusercontent.com/search?q=cache:{url}"
+            self.log(f"Пытаюсь загрузить из кэша Google: {cache_url}")
+            response = requests.get(cache_url, timeout=TIMEOUT)
+            if response.status_code == 200 and "cache" in response.text.lower():
+                return response.text
+            else:
+                self.log("Не удалось получить страницу из кэша Google")
+                return None
+        except Exception as e:
+            self.log(f"Ошибка при загрузке из кэша Google: {str(e)}")
+            return None
+
+    def get_from_wayback(self, url):
+        """Получает последнюю сохраненную версию из Wayback Machine"""
+        try:
+            api_url = f"http://archive.org/wayback/available?url={url}"
+            self.log(f"Проверяю наличие копии в Wayback Machine...")
+            response = requests.get(api_url, timeout=TIMEOUT)
+            data = response.json()
+            if 'archived_snapshots' in data and 'closest' in data['archived_snapshots']:
+                archive_url = data['archived_snapshots']['closest']['url']
+                self.log(f"Найдена копия в Wayback Machine: {archive_url}")
+                response = requests.get(archive_url, timeout=TIMEOUT)
+                return response.text
+            else:
+                self.log("Не найдено сохраненных копий в Wayback Machine")
+                return None
+        except Exception as e:
+            self.log(f"Ошибка при загрузке из Wayback Machine: {str(e)}")
+            return None
+
+    def process_html(self, html, source_url):
+        """Обрабатывает HTML и запускает анализ доменов"""
+        # Получаем домен из URL
+        parsed_url = urlparse(source_url)
+        base_domain = parsed_url.netloc
+        
+        # Извлекаем домены
+        domains = self.get_domains_from_html(html, base_domain)
+        
+        # Запускаем проверку
+        self.on_domains_found(domains)
 
     def on_domains_found(self, domains):
         self.log(f"Найдено доменов: {len(domains)}")
@@ -251,6 +356,25 @@ class DomainAnalyzerApp(QMainWindow):
         self.progress_bar.setVisible(False)
         self.analyze_button.setEnabled(True)
 
+    def get_domains_from_html(self, html, base_domain=None):
+        """Извлекает все уникальные домены из HTML."""
+        soup = BeautifulSoup(html, 'html.parser')
+        domains = set()
+        
+        for tag, attr in TAGS_ATTRS.items():
+            for element in soup.find_all(tag):
+                url = element.get(attr)
+                if url:
+                    parsed = urlparse(url)
+                    domain = parsed.netloc
+                    if domain:
+                        domains.add(domain)
+        
+        if base_domain:
+            domains.add(base_domain)
+        
+        return sorted(domains)
+
 # === ПОТОК ДЛЯ АНАЛИЗА HTML ===
 class AnalysisThread(QThread):
     domains_found = Signal(list)
@@ -277,14 +401,38 @@ class AnalysisThread(QThread):
                 self.log_message.emit(f"Основной домен: {base_domain}")
             else:
                 self.log_message.emit(f"Читаю HTML из файла: {self.source}")
-                with open(self.source, 'r', encoding='utf-8') as f:
-                    html = f.read()
+                html = self.read_file_with_encoding(self.source)
 
             domains = self.get_domains_from_html(html, base_domain)
             self.domains_found.emit(domains)
             self.finished.emit()
         except Exception as e:
             self.error.emit(str(e))
+
+    def read_file_with_encoding(self, file_path):
+        """Читает файл с автоматическим определением кодировки"""
+        # Сначала пробуем определить кодировку
+        try:
+            with open(file_path, 'rb') as f:
+                raw_data = f.read()
+                result = chardet.detect(raw_data)
+                encoding = result['encoding']
+                self.log_message.emit(f"Обнаружена кодировка: {encoding}")
+                return raw_data.decode(encoding)
+        except Exception as e:
+            self.log_message.emit(f"Ошибка при определении кодировки: {str(e)}")
+        
+        # Если не удалось, пробуем распространенные кодировки
+        encodings = ['utf-8', 'windows-1251', 'iso-8859-1', 'cp1251']
+        for enc in encodings:
+            try:
+                with open(file_path, 'r', encoding=enc) as f:
+                    self.log_message.emit(f"Использую кодировку: {enc}")
+                    return f.read()
+            except UnicodeDecodeError:
+                continue
+        
+        raise Exception("Не удалось прочитать файл: не поддерживаемая кодировка")
 
     def get_domains_from_html(self, html, base_domain=None):
         """Извлекает все уникальные домены из HTML."""

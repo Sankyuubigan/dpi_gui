@@ -29,30 +29,28 @@ def start_process(profile, base_dir, game_filter_enabled, log_callback, combined
         log_callback(f"КРИТИЧЕСКАЯ ОШИБКА РАЗБОРА АРГУМЕНТОВ: {e}")
         return None
     
-    # 2. Фильтруем аргументы, удаляя ненужные
+    # 2. Обрабатываем аргументы, корректно заменяя hostlist и управляя ipset
     final_args = []
-    i = 0
-    while i < len(base_args):
-        arg = base_args[i]
-        
-        # Удаляем все стандартные --hostlist, так как мы будем использовать свой объединенный список
-        if arg == '--hostlist':
-            i += 2  # Пропускаем сам --hostlist и его значение
-            continue
-            
-        # Удаляем --ipset, если он не выбран в UI
-        if arg == '--ipset' and not use_ipset:
-            i += 2  # Пропускаем --ipset и его значение
-            continue
-            
-        final_args.append(arg)
-        i += 1
-        
-    # 3. Добавляем наш объединенный список, если он существует
-    if combined_list_path:
-        final_args.extend(['--hostlist', combined_list_path])
+    for arg in base_args:
+        # Ищем аргумент вида --hostlist=path
+        if arg.startswith('--hostlist=') and 'list-general.txt' in arg:
+            if combined_list_path:
+                final_args.append(f'--hostlist={combined_list_path}')
+                log_callback(f"!!! УСПЕХ: Аргумент '{arg}' заменен на '--hostlist={combined_list_path}'")
+            else:
+                # Если объединенного списка нет, пропускаем этот аргумент
+                log_callback(f"WARNING: Объединенный список пуст, аргумент '{arg}' пропущен.")
+        # Управляем --ipset в зависимости от настройки в UI
+        elif arg.startswith('--ipset='):
+            if use_ipset:
+                final_args.append(arg)
+            else:
+                log_callback(f"INFO: IPSet отключен в настройках, аргумент '{arg}' пропущен.")
+        else:
+            # Все остальные аргументы оставляем как есть
+            final_args.append(arg)
     
-    # 4. Собираем и запускаем финальную команду
+    # 3. Собираем и запускаем финальную команду
     final_command = [executable_path] + final_args
     
     log_callback("="*40)

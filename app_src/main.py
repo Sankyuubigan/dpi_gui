@@ -25,7 +25,7 @@ APP_SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP_SOURCE_DIR)
 # --- Импорты модулей проекта ---
 from executor import is_custom_list_valid
-from domain_finder import show_domain_finder
+from domain_finder import check_dependencies, analyze_site_domains_performance, analyze_site_domains_playwright, analyze_site_domains_selenium, analyze_site_domains_simple
 from text_utils import setup_text_widget_bindings
 from list_manager import ListManager
 from profiles import PROFILES
@@ -41,6 +41,7 @@ class App:
         self.profiles = PROFILES
         self.test_thread = None
         self.list_manager = ListManager(self.app_dir)
+        self.domain_analysis_thread = None
 
         # Настройка логирования для status indicator
         os.makedirs("roo_tests", exist_ok=True)
@@ -79,13 +80,16 @@ class App:
         tab_control = ttk.Frame(notebook, padding=10)
         tab_tools = ttk.Frame(notebook, padding=10)
         tab_testing = ttk.Frame(notebook, padding=10)
+        tab_domains = ttk.Frame(notebook, padding=10)
         notebook.add(tab_control, text="Управление")
         notebook.add(tab_tools, text="Инструменты и Настройки")
         notebook.add(tab_testing, text="Тестирование")
+        notebook.add(tab_domains, text="Домены")
         
         self.create_control_tab(tab_control)
         self.create_tools_tab(tab_tools)
         self.create_testing_tab(tab_testing)
+        self.create_domains_tab(tab_domains)
         
         log_frame = tk.Frame(self.root)
         log_frame.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
@@ -134,26 +138,69 @@ class App:
         self.status_indicator = tk.Label(actions_frame, text="ОСТАНОВЛЕНО", bg="#cccccc", fg="white", padx=10, pady=2, relief=tk.RAISED, borderwidth=2)
         self.status_indicator.pack(side=tk.LEFT, padx=10, pady=5)
 
-    def on_custom_list_toggle(self):
-        """Обработчик переключения чекбокса кастомного списка."""
-        if self.use_custom_list_var.get():
-            self.select_custom_list_file()
-        else:
-            self.list_manager.set_custom_list_path(None)
-            self.custom_list_path_label.config(text="(не выбран)", fg="gray")
+    def create_domains_tab(self, parent):
+        # Метод анализа
+        method_frame = ttk.LabelFrame(parent, text="Метод анализа")
+        method_frame.pack(fill=tk.X, pady=5)
 
-    def select_custom_list_file(self):
-        """Открывает диалог выбора файла для кастомного списка."""
-        file_path = filedialog.askopenfilename(
-            title="Выберите файл со списком доменов",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
-        )
-        if file_path:
-            self.list_manager.set_custom_list_path(file_path)
-            self.custom_list_path_label.config(text=os.path.basename(file_path), fg="black")
-        else:
-            self.use_custom_list_var.set(False)
-            self.list_manager.set_custom_list_path(None)
+        self.domain_method_var = tk.StringVar()
+        method_choices = []
+        self.domain_method_map = {}
+        
+        available_methods = check_dependencies()
+
+        if available_methods.get('selenium', False):
+            display_name = "Performance API (рекомендуется)"
+            method_choices.append(display_name)
+            self.domain_method_map[display_name] = "performance"
+
+        if available_methods.get('simple', False):
+            display_name = "Simple Parser (без браузера)"
+            method_choices.append(display_name)
+            self.domain_method_map[display_name] = "simple"
+
+        if available_methods.get('playwright', False):
+            display_name = "Playwright (быстрый, современный)"
+            method_choices.append(display_name)
+            self.domain_method_map[display_name] = "playwright"
+        
+        if available_methods.get('selenium', False):
+            display_name = "Selenium (классический)"
+            method_choices.append(display_name)
+            self.domain_method_map[display_name] = "selenium"
+            
+        if not method_choices:
+            method_choices.append("Нет доступных методов")
+            self.domain_method_map["Нет доступных методов"] = "none"
+            
+        self.domain_method_combo = ttk.Combobox(method_frame, textvariable=self.domain_method_var, 
+                                               values=method_choices, state="readonly")
+        self.domain_method_combo.pack(fill=tk.X, padx=5, pady=5)
+        if method_choices:
+            self.domain_method_combo.current(0)
+
+        # URL сайта
+        url_frame = ttk.LabelFrame(parent, text="URL сайта для анализа")
+        url_frame.pack(fill=tk.X, pady=5)
+        self.domain_url_entry = tk.Entry(url_frame, width=60)
+        self.domain_url_entry.pack(fill=tk.X, padx=5, pady=5)
+
+        # Создаем контекстное меню для поля ввода URL
+        self.domain_url_menu = tk.Menu(self.root, tearoff=0)
+        self.domain_url_menu.add_command(label="Вставить", command=self.paste_domain_url)
+        self.domain_url_entry.bind("<Button-3>", self.show_domain_url_menu)
+        self.domain_url_entry.bind("<Control-v>", lambda e: self.paste_domain_url()) # Привязка Ctrl+V
+        
+        # Кнопка анализа
+        self.domain_start_btn = ttk.Button(parent, text="🔍 Начать анализ и добавить домены", command=self.start_domain_analysis, state=tk.DISABLED)
+        self.domain_start_btn.pack(pady=10)
+
+        # Лог
+        log_frame = ttk.LabelFrame(parent, text="Лог анализа доменов")
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        self.domain_log_text = scrolledtext.ScrolledText(log_frame, height=15, bg='black', fg='white', state=tk.DISABLED)
+        self.domain_log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        setup_text_widget_bindings(self.domain_log_text)
 
     def create_tools_tab(self, parent):
         tools_top_frame = ttk.Frame(parent)
@@ -181,7 +228,6 @@ class App:
         
         domain_frame = ttk.LabelFrame(parent, text="Пользовательские списки")
         domain_frame.pack(fill=tk.X, pady=10)
-        ttk.Button(domain_frame, text="Добавить домены с сайта...", command=self.open_add_site_dialog).pack(side=tk.LEFT, padx=5, pady=5)
         ttk.Button(domain_frame, text="Открыть кастомный список", command=self.open_custom_list).pack(side=tk.LEFT, padx=5, pady=5)
         ttk.Button(domain_frame, text="Выбрать кастомный список...", command=self.select_custom_list_file).pack(side=tk.LEFT, padx=5, pady=5)
 
@@ -191,7 +237,15 @@ class App:
         
         ttk.Label(site_test_frame, text="Адрес сайта (например, rutracker.org):").pack(anchor=tk.W, padx=5, pady=(5,0))
         self.site_test_url = tk.StringVar(value="rutracker.org")
-        ttk.Entry(site_test_frame, textvariable=self.site_test_url).pack(fill=tk.X, padx=5, pady=5)
+        self.site_test_url_entry = ttk.Entry(site_test_frame, textvariable=self.site_test_url)
+        self.site_test_url_entry.pack(fill=tk.X, padx=5, pady=5)
+
+        # Создаем контекстное меню для поля ввода URL теста
+        self.site_test_url_menu = tk.Menu(self.root, tearoff=0)
+        self.site_test_url_menu.add_command(label="Вставить", command=self.paste_site_test_url)
+        self.site_test_url_entry.bind("<Button-3>", self.show_site_test_url_menu)
+        self.site_test_url_entry.bind("<Control-v>", lambda e: self.paste_site_test_url()) # Привязка Ctrl+V
+
         ttk.Button(site_test_frame, text="Начать тест по сайту", command=self.run_site_test).pack(pady=5)
         discord_test_frame = ttk.LabelFrame(parent, text="Интерактивный тест для Discord")
         discord_test_frame.pack(fill=tk.X, pady=10)
@@ -212,6 +266,16 @@ class App:
         self.profiles_combobox['values'] = profile_names
         if profile_names:
             self.profiles_combobox.current(0)
+        # Добавляем обработчик смены профиля
+        self.profiles_combobox.bind("<<ComboboxSelected>>", self.on_profile_change)
+
+    def on_profile_change(self, event=None):
+        """Обработчик изменения профиля. Обновляет состояние обязательных списков."""
+        profile = self.get_selected_profile()
+        if profile:
+            required_lists = profile.get('required_lists', [])
+            self.list_manager.set_required_lists(required_lists)
+            self.log_message(f"Выбран профиль: {profile['name']}. Обязательные списки: {required_lists}")
 
     def get_selected_profile(self):
         selected_name = self.profile_var.get()
@@ -228,10 +292,13 @@ class App:
 
         if is_running:
             self.status_indicator.config(text="ЗАПУЩЕНО", bg="#4CAF50")
+            self.domain_start_btn.config(state=tk.NORMAL)
         else:
             self.status_indicator.config(text="ОСТАНОВЛЕНО", bg="#cccccc")
+            self.domain_start_btn.config(state=tk.DISABLED)
 
     def run_selected_profile(self):
+        print("!!! ДИАГНОСТИКА: ВЫПОЛНЯЕТСЯ НОВАЯ ВЕРСИЯ RUN_SELECTED_PROFILE !!!")
         try:
             if self.process and self.process.poll() is None:
                 messagebox.showinfo("Информация", "Процесс уже запущен.")
@@ -254,16 +321,20 @@ class App:
             custom_list_path = None
             if self.use_custom_list_var.get():
                 custom_list_path = self.list_manager.get_custom_list_path()
+                self.log_message(f"--- [Main] Использование кастомного списка ВКЛЮЧЕНО. Путь: {custom_list_path} ---")
                 if not custom_list_path or not os.path.exists(custom_list_path):
                     messagebox.showwarning("Предупреждение", "Кастомный список не выбран или файл не существует.")
                     return
+            else:
+                self.log_message("--- [Main] Использование кастомного списка ВЫКЛЮЧЕНО ---")
 
-            combined_list_path = self.list_manager.get_combined_list_path(custom_list_path)
+            # Передаем log_callback в get_combined_list_path для детального логирования
+            combined_list_path = self.list_manager.get_combined_list_path(custom_list_path, self.log_message)
             
             if combined_list_path:
-                 self.log_message("Используются выбранные списки доменов и/или кастомный список.")
+                 self.log_message(f"--- [Main] Объединенный список для запуска: {combined_list_path} ---")
             else:
-                 self.log_message("ВНИМАНИЕ: Не выбрано ни одного списка доменов, и кастомный список пуст. Обход будет неактивен.")
+                 self.log_message("--- [Main] ВНИМАНИЕ: Объединенный список не был создан (пуст или не выбран). Обход будет работать без списков доменов. ---")
 
             self.process = process_manager.start_process(
                 profile, self.app_dir, game_filter_enabled, 
@@ -338,11 +409,65 @@ class App:
         try:
             self.save_app_settings()
             if self.process and self.process.poll() is None:
-                if messagebox.askyesno("Подтверждение", "Процесс еще активен. Остановить его перед выходом?"):
+                choice = self._ask_to_stop_on_close()
+                if choice == 'yes':
                     self.stop_process()
-            self.root.destroy()
+                    self.root.destroy()
+                elif choice == 'no':
+                    self.root.destroy()
+                # Если choice == 'cancel' или None, ничего не делаем
+            else:
+                self.root.destroy()
         except Exception as e:
             self._handle_ui_error(e)
+
+    def _ask_to_stop_on_close(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Подтверждение выхода")
+        dialog.geometry("350x120")
+        dialog.resizable(False, False)
+        
+        # Делаем окно модальным
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Переменная для хранения результата
+        result = {'choice': None}
+
+        # Сообщение
+        message = "Процесс еще активен. Остановить его перед выходом?"
+        tk.Label(dialog, text=message, wraplength=300).pack(pady=10)
+
+        # Фрейм для кнопок
+        button_frame = tk.Frame(dialog)
+        button_frame.pack(pady=10)
+
+        def on_yes():
+            result['choice'] = 'yes'
+            dialog.destroy()
+
+        def on_no():
+            result['choice'] = 'no'
+            dialog.destroy()
+
+        def on_cancel():
+            result['choice'] = 'cancel'
+            dialog.destroy()
+
+        tk.Button(button_frame, text="Да", command=on_yes, width=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(button_frame, text="Нет", command=on_no, width=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(button_frame, text="Отмена", command=on_cancel, width=10).pack(side=tk.LEFT, padx=5)
+        
+        # Центрируем диалог относительно главного окна
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (dialog.winfo_width() // 2)
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (dialog.winfo_height() // 2)
+        dialog.geometry(f"+{x}+{y}")
+        
+        # Ждем закрытия диалога
+        self.root.wait_window(dialog)
+        
+        return result['choice']
 
     def log_message(self, message):
         if self.log_window.winfo_exists():
@@ -389,6 +514,9 @@ class App:
         
         self.list_manager.set_selection_state(settings.get("selected_lists"))
         
+        # Вызываем обработчик смены профиля, чтобы применить обязательные списки
+        self.on_profile_change()
+        
         self.log_message("Настройки успешно загружены.")
         
     def open_custom_list(self):
@@ -404,13 +532,26 @@ class App:
         except Exception as e:
             self._handle_ui_error(e)
 
-    def open_add_site_dialog(self):
-        try:
-            domains = show_domain_finder(self.root)
-            if domains:
-                self.add_domains_to_list(domains)
-        except Exception as e:
-            self._handle_ui_error(e)
+    def on_custom_list_toggle(self):
+        """Обработчик переключения чекбокса кастомного списка."""
+        if self.use_custom_list_var.get():
+            self.select_custom_list_file()
+        else:
+            self.list_manager.set_custom_list_path(None)
+            self.custom_list_path_label.config(text="(не выбран)", fg="gray")
+
+    def select_custom_list_file(self):
+        """Открывает диалог выбора файла для кастомного списка."""
+        file_path = filedialog.askopenfilename(
+            title="Выберите файл со списком доменов",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if file_path:
+            self.list_manager.set_custom_list_path(file_path)
+            self.custom_list_path_label.config(text=os.path.basename(file_path), fg="black")
+        else:
+            self.use_custom_list_var.set(False)
+            self.list_manager.set_custom_list_path(None)
 
     def add_domains_to_list(self, new_domains):
         try:
@@ -427,20 +568,153 @@ class App:
                             existing_domains.add(line)
             added_domains = [d for d in new_domains if d not in existing_domains]
             if not added_domains:
-                self.log_message("\n--- Анализ сайта завершен. Новых доменов для добавления не найдено. ---")
+                self.domain_log("Новых доменов для добавления не найдено.")
                 return
+            
             all_domains = sorted(list(existing_domains.union(set(new_domains))))
             with open(custom_list_path, 'w', encoding='utf-8') as f:
                 f.write("# Это ваш личный список доменов. Добавляйте по одному домену на строку.\n")
                 f.write("# Строки, начинающиеся с #, игнорируются.\n")
                 for domain in all_domains:
                     f.write(domain + '\n')
-            self.log_message("\n--- Добавлены новые домены в кастомный список: ---")
+            
+            self.domain_log(f"Автоматически добавлено {len(added_domains)} новых доменов в кастомный список.")
             for domain in sorted(added_domains):
-                self.log_message(f"  + {domain}")
-            self.log_message("--------------------------------------------------")
+                self.domain_log(f"  + {domain}")
+            
+            # Предлагаем перезапустить профиль, если он активен
+            self.root.after(0, self._propose_restart_after_domain_update)
+
         except Exception as e:
+            self.domain_log(f"ОШИБКА при добавлении доменов: {e}")
             self._handle_ui_error(e)
+
+    def _propose_restart_after_domain_update(self):
+        """Предлагает перезапустить профиль после обновления списка доменов."""
+        if process_manager.is_process_running():
+            if messagebox.askyesno(
+                "Перезапустить профиль?",
+                "Новые домены добавлены. Для их применения требуется перезапустить профиль.\n\nСделать это сейчас?"
+            ):
+                self.domain_log("Перезапускаю профиль для применения новых доменов...")
+                self.stop_process()
+                # Даем время на полную остановку процесса перед запуском
+                self.root.after(1500, self.run_selected_profile)
+
+    def domain_log(self, message):
+        def _log():
+            self.domain_log_text.config(state=tk.NORMAL)
+            self.domain_log_text.insert(tk.END, message + "\n")
+            self.domain_log_text.config(state=tk.DISABLED)
+            self.domain_log_text.see(tk.END)
+        if self.domain_log_text.winfo_exists():
+            self.root.after(0, _log)
+
+    def start_domain_analysis(self):
+        if not process_manager.is_process_running():
+            messagebox.showerror("Ошибка", "Сначала запустите профиль на вкладке 'Управление'.")
+            return
+
+        url = self.domain_url_entry.get().strip()
+        if not url:
+            messagebox.showerror("Ошибка", "Введите URL!")
+            return
+            
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+            
+        method_text = self.domain_method_var.get()
+        method = self.domain_method_map.get(method_text)
+        if not method or method == "none":
+            messagebox.showerror("Ошибка", "Выберите доступный метод анализа.")
+            return
+            
+        self.domain_start_btn.config(state=tk.DISABLED, text="⏳ Анализ...")
+        self.domain_log_text.config(state='normal')
+        self.domain_log_text.delete('1.0', tk.END)
+        self.domain_log_text.config(state='disabled')
+        
+        self.domain_analysis_thread = threading.Thread(target=self.run_domain_analysis_loop, args=(url, method), daemon=True)
+        self.domain_analysis_thread.start()
+
+    def run_domain_analysis_loop(self, url, method):
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            self.domain_log(f"=== ПОПЫТКА {attempt}/{max_attempts} ===")
+            domains = self.run_single_analysis(url, method)
+            
+            if domains:
+                self.domain_log(f"Найдено {len(domains)} доменов. Добавляю в список...")
+                self.add_domains_to_list(domains)
+                # Проверяем, был ли таймаут
+                if "ПРЕДУПРЕЖДЕНИЕ: Страница не загрузилась за 30 секунд" in self.domain_log_text.get('1.0', tk.END):
+                    if attempt < max_attempts:
+                        self.domain_log("Попытка завершилась по таймауту. Перезапускаю анализ...")
+                        continue
+                else:
+                    # Успешное завершение без таймаута
+                    self.domain_log("=== АНАЛИЗ УСПЕШНО ЗАВЕРШЕН ===")
+                    break
+            else:
+                self.domain_log("Не удалось получить домены на этой попытке.")
+                if attempt < max_attempts:
+                    self.domain_log("Перезапускаю анализ...")
+                else:
+                    self.domain_log("=== АНАЛИЗ НЕ УДАЛСЯ ПОСЛЕ НЕСКОЛЬКИХ ПОПЫТОК ===")
+
+        self.root.after(0, lambda: self.domain_start_btn.config(state=tk.NORMAL, text="🔍 Начать анализ и добавить домены"))
+
+    def run_single_analysis(self, url, method):
+        try:
+            domains = None
+            if method == "performance":
+                domains = analyze_site_domains_performance(url, self.domain_log)
+            elif method == "playwright":
+                domains = analyze_site_domains_playwright(url, self.domain_log)
+            elif method == "selenium":
+                domains = analyze_site_domains_selenium(url, self.domain_log)
+            elif method == "simple":
+                domains = analyze_site_domains_simple(url, self.domain_log)
+            else:
+                self.domain_log("НЕИЗВЕСТНЫЙ МЕТОД")
+            return domains
+        except Exception as e:
+            self.domain_log(f"КРИТИЧЕСКАЯ ОШИБКА: {e}")
+            return None
+
+    def show_domain_url_menu(self, event):
+        """Показывает контекстное меню для поля ввода URL."""
+        try:
+            self.domain_url_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.domain_url_menu.grab_release()
+
+    def paste_domain_url(self):
+        """Вставляет текст из буфера обмена в поле ввода URL."""
+        try:
+            text = self.root.clipboard_get()
+            self.domain_url_entry.delete(0, tk.END)
+            self.domain_url_entry.insert(0, text)
+        except tk.TclError:
+            # Буфер обмена пуст или содержит не текстовые данные
+            pass
+
+    def show_site_test_url_menu(self, event):
+        """Показывает контекстное меню для поля ввода URL теста."""
+        try:
+            self.site_test_url_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.site_test_url_menu.grab_release()
+
+    def paste_site_test_url(self):
+        """Вставляет текст из буфера обмена в поле ввода URL теста."""
+        try:
+            text = self.root.clipboard_get()
+            self.site_test_url_entry.delete(0, tk.END)
+            self.site_test_url_entry.insert(0, text)
+        except tk.TclError:
+            # Буфер обмена пуст или содержит не текстовые данные
+            pass
 
     def install_service(self):
         try:

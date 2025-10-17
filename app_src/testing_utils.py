@@ -31,10 +31,11 @@ def run_site_test(domain, profiles, base_dir, game_filter_enabled, log_callback)
     
     results = {}
     custom_list_path = f"{base_dir}\\lists\\custom_list.txt"
-    use_custom_list = is_custom_list_valid(custom_list_path)
+    list_to_use = custom_list_path if is_custom_list_valid(custom_list_path) else None
+    
     for i, profile in enumerate(profiles):
         log_callback(f"--- Тест {i+1}/{len(profiles)}: \"{profile['name']}\" ---")
-        process = process_manager.start_process(profile, base_dir, game_filter_enabled, use_custom_list, log_callback)
+        process = process_manager.start_process(profile, base_dir, game_filter_enabled, log_callback, list_to_use, False)
         
         if process:
             time.sleep(4) # Даем время на запуск и применение правил
@@ -65,10 +66,11 @@ def run_discord_test(profiles, base_dir, game_filter_enabled, log_callback, ask_
     
     results = {}
     custom_list_path = f"{base_dir}\\lists\\custom_list.txt"
-    use_custom_list = is_custom_list_valid(custom_list_path)
+    list_to_use = custom_list_path if is_custom_list_valid(custom_list_path) else None
+    
     for i, profile in enumerate(profiles):
         log_callback(f"--- Тест {i+1}/{len(profiles)}: \"{profile['name']}\" ---")
-        process = process_manager.start_process(profile, base_dir, game_filter_enabled, use_custom_list, log_callback)
+        process = process_manager.start_process(profile, base_dir, game_filter_enabled, log_callback, list_to_use, False)
         
         if process:
             # Даем время на запуск и даем управление GUI для вопроса

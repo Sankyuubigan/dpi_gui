@@ -14,7 +14,9 @@ def is_custom_list_valid(filepath):
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
-                if line.strip() and not line.strip().startswith('#'):
+                # Убираем пробелы и проверяем, что строка не пустая и не комментарий
+                stripped_line = line.strip()
+                if stripped_line and not stripped_line.startswith('#'):
                     return True
     except Exception:
         return False
