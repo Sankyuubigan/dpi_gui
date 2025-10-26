@@ -6,22 +6,11 @@ import threading
 import queue
 import subprocess
 import traceback
-import ctypes
 import logging
 import datetime
-import win32con
-import win32api
+import ctypes
+import time
 # --- Начальная настройка и проверка прав ---
-def is_admin():
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
-        return False
-def run_as_admin():
-    try:
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
-    except Exception as e:
-        messagebox.showerror("Ошибка запуска", f"Не удалось перезапустить с правами администратора:\n{e}")
 # Определяем базовую директорию приложения (папка app_src)
 APP_SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP_SOURCE_DIR)
@@ -34,35 +23,13 @@ from profiles import PROFILES
 import process_manager
 import settings_manager
 import testing_utils
+import power_handler
 
-class PowerEventHandler:
-    """Класс для обработки событий питания (спящий/гибернация режим)"""
-    def __init__(self, app_instance):
-        self.app = app_instance
-        
-    def handle_power_event(self, hwnd, msg, wparam, lparam):
-        """Обработчик событий питания"""
-        if msg == win32con.WM_POWERBROADCAST:
-            if wparam == win32con.PBT_APMRESUMEAUTOMATIC:
-                # Система вышла из спящего режима
-                if process_manager.is_process_running():
-                    self.app.log_message("\n[СИСТЕМА] Обнаружен выход из спящего режима")
-                    # Запускаем перезапуск в отдельном потоке
-                    threading.Thread(target=self._restart_after_sleep, daemon=True).start()
-        return True
-        
-    def _restart_after_sleep(self):
-        """Перезапускает процесс после выхода из спящего режима"""
-        time.sleep(3)  # Даем системе время на инициализацию сети
-        new_process = process_manager.restart_process()
-        if new_process:
-            self.app.process = new_process
-            self.app.worker_thread = threading.Thread(target=self.app.read_process_output, daemon=True)
-            self.app.worker_thread.start()
-            self.app.monitor_process()
-            self.app.log_message("[СИСТЕМА] Профиль успешно перезапущен после выхода из спящего режима")
-        else:
-            self.app.log_message("[СИСТЕМА] ОШИБКА: Не удалось перезапустить профиль")
+def run_as_admin():
+    try:
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
+    except Exception as e:
+        messagebox.showerror("Ошибка запуска", f"Не удалось перезапустить с правами администратора:\n{e}")
 
 class App:
     def __init__(self, root):
@@ -74,6 +41,7 @@ class App:
         self.test_thread = None
         self.list_manager = ListManager(self.app_dir)
         self.domain_analysis_thread = None
+        self._monitoring_active = False
 
         # Настройка логирования для status indicator
         os.makedirs("roo_tests", exist_ok=True)
@@ -91,7 +59,7 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
         # Устанавливаем обработчик событий питания
-        self.setup_power_handler()
+        power_handler.setup_power_handler(self)
         
     def setup_window(self):
         version_hash = "unknown"
@@ -109,30 +77,6 @@ class App:
                 self.root.iconbitmap(icon_path)
         except Exception:
             pass
-            
-    def setup_power_handler(self):
-        """Устанавливает обработчик событий питания"""
-        try:
-            # Создаем скрытое окно для получения сообщений системы
-            self.hwnd = win32api.CreateWindowEx(
-                0, "STATIC", "PowerHandler", 0, 0, 0, 0, 0, 0, 0, 0, None
-            )
-            
-            # Регистрируем обработчик сообщений о питании
-            self.power_handler = PowerEventHandler(self)
-            win32api.SetWindowLong(self.hwnd, win32con.GWL_WNDPROC, self.power_handler.handle_power_event)
-            
-            # Регистрируем получение сообщений о питании
-            win32api.RegisterPowerSettingNotification(
-                self.hwnd, 
-                win32api.GUID_SYSTEM_AWAYMODE, 
-                win32con.DEVICE_NOTIFY_WINDOW_HANDLE
-            )
-            
-            self.log_message("[СИСТЕМА] Обработчик событий питания успешно установлен")
-        except Exception as e:
-            self.log_message(f"[СИСТЕМА] Предупреждение: Не удалось установить обработчик событий питания: {e}")
-            self.log_message("[СИСТЕМА] Автоматический перезапуск после спящего режима будет недоступен")
 
     def create_widgets(self):
         notebook = ttk.Notebook(self.root)
@@ -141,22 +85,18 @@ class App:
         tab_tools = ttk.Frame(notebook, padding=10)
         tab_testing = ttk.Frame(notebook, padding=10)
         tab_domains = ttk.Frame(notebook, padding=10)
+        tab_logs = ttk.Frame(notebook, padding=10)
         notebook.add(tab_control, text="Управление")
         notebook.add(tab_tools, text="Инструменты и Настройки")
         notebook.add(tab_testing, text="Тестирование")
         notebook.add(tab_domains, text="Домены")
+        notebook.add(tab_logs, text="Логи")
         
         self.create_control_tab(tab_control)
         self.create_tools_tab(tab_tools)
         self.create_testing_tab(tab_testing)
         self.create_domains_tab(tab_domains)
-        
-        log_frame = tk.Frame(self.root)
-        log_frame.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
-        tk.Label(log_frame, text="Логи:").pack(anchor=tk.W)
-        self.log_window = scrolledtext.ScrolledText(log_frame, height=10, state='disabled', bg='black', fg='white', relief=tk.SUNKEN, borderwidth=1)
-        self.log_window.pack(fill=tk.BOTH, expand=True)
-        setup_text_widget_bindings(self.log_window)
+        self.create_logs_tab(tab_logs)
 
     def create_control_tab(self, parent):
         profile_frame = ttk.LabelFrame(parent, text="Профиль обхода")
@@ -197,6 +137,18 @@ class App:
 
         self.status_indicator = tk.Label(actions_frame, text="ОСТАНОВЛЕНО", bg="#cccccc", fg="white", padx=10, pady=2, relief=tk.RAISED, borderwidth=2)
         self.status_indicator.pack(side=tk.LEFT, padx=10, pady=5)
+        
+        # Добавляем индикатор статуса на основную вкладку - РАСТЯГИВАЕМ НА ВСЮ ВЫСОТУ
+        status_frame = ttk.LabelFrame(parent, text="Индикатор статуса")
+        status_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        self.status_text = tk.Text(status_frame, state='disabled', bg='black', fg='white', relief=tk.SUNKEN, borderwidth=1)
+        self.status_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        setup_text_widget_bindings(self.status_text)
+        
+        # Кнопка очистки статуса
+        clear_status_btn = ttk.Button(status_frame, text="Очистить", command=self.clear_status)
+        clear_status_btn.pack(pady=5)
 
     def create_domains_tab(self, parent):
         # Метод анализа
@@ -249,18 +201,51 @@ class App:
         self.domain_url_menu = tk.Menu(self.root, tearoff=0)
         self.domain_url_menu.add_command(label="Вставить", command=self.paste_domain_url)
         self.domain_url_entry.bind("<Button-3>", self.show_domain_url_menu)
-        self.domain_url_entry.bind("<Control-v>", lambda e: self.paste_domain_url()) # Привязка Ctrl+V
+        self.domain_url_entry.bind("<Control-v>", lambda e: self.paste_domain_url())
         
         # Кнопка анализа
-        self.domain_start_btn = ttk.Button(parent, text="🔍 Начать анализ и добавить домены", command=self.start_domain_analysis, state=tk.DISABLED)
+        self.domain_start_btn = ttk.Button(parent, text="🔍 Начать анализ и добавить домены", command=self.start_domain_analysis, state=tk.NORMAL)
         self.domain_start_btn.pack(pady=10)
+        
+        # Информационная метка о логах
+        info_label = tk.Label(parent, text="Все логи анализа отображаются на вкладке 'Логи'", fg="gray")
+        info_label.pack(pady=5)
 
-        # Лог
-        log_frame = ttk.LabelFrame(parent, text="Лог анализа доменов")
+    def create_logs_tab(self, parent):
+        """Создает вкладку с объединенными логами"""
+        # Заголовок
+        header_frame = ttk.Frame(parent)
+        header_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(header_frame, text="Объединенные логи приложения", font=('Arial', 12, 'bold')).pack(side=tk.LEFT)
+        
+        # Кнопки управления
+        ttk.Button(header_frame, text="Очистить все", command=self.clear_all_logs).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(header_frame, text="Сохранить в файл", command=self.save_logs_to_file).pack(side=tk.RIGHT, padx=5)
+        
+        # Основное окно логов
+        log_frame = ttk.Frame(parent)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        self.domain_log_text = scrolledtext.ScrolledText(log_frame, height=15, bg='black', fg='white', state=tk.DISABLED)
-        self.domain_log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        setup_text_widget_bindings(self.domain_log_text)
+        
+        self.log_window = scrolledtext.ScrolledText(log_frame, state='disabled', bg='black', fg='white', relief=tk.SUNKEN, borderwidth=1)
+        self.log_window.pack(fill=tk.BOTH, expand=True)
+        setup_text_widget_bindings(self.log_window)
+        
+        # Фильтры логов
+        filter_frame = ttk.LabelFrame(parent, text="Фильтры логов")
+        filter_frame.pack(fill=tk.X, pady=5)
+        
+        self.show_main_logs = tk.BooleanVar(value=True)
+        self.show_domain_logs = tk.BooleanVar(value=True)
+        self.show_status_logs = tk.BooleanVar(value=True)
+        
+        ttk.Checkbutton(filter_frame, text="Основные логи", variable=self.show_main_logs, command=self.update_log_filter).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(filter_frame, text="Логи анализа доменов", variable=self.show_domain_logs, command=self.update_log_filter).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(filter_frame, text="Логи статуса", variable=self.show_status_logs, command=self.update_log_filter).pack(side=tk.LEFT, padx=5)
+        
+        # Хранилище всех логов
+        self.all_logs = []
+        self.filtered_logs = []
 
     def create_tools_tab(self, parent):
         tools_top_frame = ttk.Frame(parent)
@@ -304,7 +289,7 @@ class App:
         self.site_test_url_menu = tk.Menu(self.root, tearoff=0)
         self.site_test_url_menu.add_command(label="Вставить", command=self.paste_site_test_url)
         self.site_test_url_entry.bind("<Button-3>", self.show_site_test_url_menu)
-        self.site_test_url_entry.bind("<Control-v>", lambda e: self.paste_site_test_url()) # Привязка Ctrl+V
+        self.site_test_url_entry.bind("<Control-v>", lambda e: self.paste_site_test_url())
 
         ttk.Button(site_test_frame, text="Начать тест по сайту", command=self.run_site_test).pack(pady=5)
         discord_test_frame = ttk.LabelFrame(parent, text="Интерактивный тест для Discord")
@@ -315,10 +300,10 @@ class App:
 
     def _handle_ui_error(self, e):
         error_details = traceback.format_exc()
-        self.log_message("\n" + "="*20 + " КРИТИЧЕСКАЯ ОШИБКА GUI " + "="*20)
-        self.log_message("Произошла непредвиденная ошибка в интерфейсе:")
-        self.log_message(error_details)
-        self.log_message("="*62 + "\n")
+        self.log_message("\n" + "="*20 + " КРИТИЧЕСКАЯ ОШИБКА GUI " + "="*20, "error")
+        self.log_message("Произошла непредвиденная ошибка в интерфейсе:", "error")
+        self.log_message(error_details, "error")
+        self.log_message("="*62 + "\n", "error")
         messagebox.showerror("Критическая ошибка", f"Произошла ошибка:\n{e}\n\nПодробности записаны в окне логов.")
 
     def populate_profiles_list(self):
@@ -335,7 +320,7 @@ class App:
         if profile:
             required_lists = profile.get('required_lists', [])
             self.list_manager.set_required_lists(required_lists)
-            self.log_message(f"Выбран профиль: {profile['name']}. Обязательные списки: {required_lists}")
+            self.log_message(f"Выбран профиль: {profile['name']}. Обязательные списки: {required_lists}", "main")
 
     def get_selected_profile(self):
         selected_name = self.profile_var.get()
@@ -355,7 +340,7 @@ class App:
             self.domain_start_btn.config(state=tk.NORMAL)
         else:
             self.status_indicator.config(text="ОСТАНОВЛЕНО", bg="#cccccc")
-            self.domain_start_btn.config(state=tk.DISABLED)
+            self.domain_start_btn.config(state=tk.NORMAL)
 
     def run_selected_profile(self):
         print("!!! ДИАГНОСТИКА: ВЫПОЛНЯЕТСЯ НОВАЯ ВЕРСИЯ RUN_SELECTED_PROFILE !!!")
@@ -366,35 +351,32 @@ class App:
             
             profile = self.get_selected_profile()
             if not profile: return
-            self.log_window.config(state='normal')
-            self.log_window.delete('1.0', tk.END)
-            self.log_window.config(state='disabled')
             
+            self.log_message(f"Запуск профиля: {profile['name']}", "main")
             process_manager.stop_all_processes(self.log_message)
-            self.log_message(f"Запуск профиля: {profile['name']}")
+            
             game_filter_enabled = self.game_filter_var.get()
             use_ipset = self.use_ipset_var.get()
             
             if use_ipset and not os.path.exists(os.path.join(self.app_dir, 'lists', 'ipset-all.txt')):
-                self.log_message("ВНИМАНИЕ: ipset-all.txt не найден. Запустите обновление вручную в `launcher.py` или скачайте его.")
+                self.log_message("ВНИМАНИЕ: ipset-all.txt не найден. Запустите обновление вручную в `launcher.py` или скачайте его.", "status")
 
             custom_list_path = None
             if self.use_custom_list_var.get():
                 custom_list_path = self.list_manager.get_custom_list_path()
-                self.log_message(f"--- [Main] Использование кастомного списка ВКЛЮЧЕНО. Путь: {custom_list_path} ---")
+                self.log_message(f"Использование кастомного списка ВКЛЮЧЕНО. Путь: {custom_list_path}", "main")
                 if not custom_list_path or not os.path.exists(custom_list_path):
                     messagebox.showwarning("Предупреждение", "Кастомный список не выбран или файл не существует.")
                     return
             else:
-                self.log_message("--- [Main] Использование кастомного списка ВЫКЛЮЧЕНО ---")
+                self.log_message("Использование кастомного списка ВЫКЛЮЧЕНО", "main")
 
-            # Передаем log_callback в get_combined_list_path для детального логирования
             combined_list_path = self.list_manager.get_combined_list_path(custom_list_path, self.log_message)
             
             if combined_list_path:
-                 self.log_message(f"--- [Main] Объединенный список для запуска: {combined_list_path} ---")
+                 self.log_message(f"Объединенный список для запуска: {combined_list_path}", "main")
             else:
-                 self.log_message("--- [Main] ВНИМАНИЕ: Объединенный список не был создан (пуст или не выбран). Обход будет работать без списков доменов. ---")
+                 self.log_message("ВНИМАНИЕ: Объединенный список не был создан (пуст или не выбран). Обход будет работать без списков доменов.", "status")
 
             self.process = process_manager.start_process(
                 profile, self.app_dir, game_filter_enabled, 
@@ -402,7 +384,7 @@ class App:
             )
             
             if not self.process:
-                self.log_message("Не удалось запустить процесс. Проверьте логи выше на наличие ошибок.")
+                self.log_message("Не удалось запустить процесс. Проверьте логи выше на наличие ошибок.", "error")
                 return
                 
             self.set_controls_state(tk.DISABLED)
@@ -419,38 +401,70 @@ class App:
         self.log_queue.put(None)
 
     def monitor_process(self):
+        """Мониторит процесс с защитой от рекурсивного создания"""
         try:
+            if hasattr(self, '_monitoring_active') and self._monitoring_active:
+                return
+                
+            self._monitoring_active = True
+            
             line = self.log_queue.get_nowait()
             if line is None:
                 self.process_finished()
+                self._monitoring_active = False
                 return
-            self.log_message(line.strip())
+            self.log_message(line.strip(), "main")
         except queue.Empty:
             pass
+        except Exception as e:
+            self.log_message(f"Ошибка в мониторе процесса: {e}", "error")
+            self._monitoring_active = False
+            return
+            
         if self.process and self.process.poll() is None:
             self.root.after(100, self.monitor_process)
         elif self.process:
             self.process_finished()
+            self._monitoring_active = False
+        else:
+            self._monitoring_active = False
 
     def process_finished(self):
         return_code = self.process.poll() if self.process else 'N/A'
-        self.log_message(f"\nПроцесс завершен с кодом {return_code}.")
+        self.log_message(f"Процесс завершен с кодом {return_code}", "status")
         self.set_controls_state(tk.NORMAL)
         self.update_status_indicator(False)
         self.process = None
 
     def stop_process(self):
         try:
-            self.log_message("\n" + "="*40)
-            self.log_message("--- ОСТАНОВКА ПРОЦЕССА ---")
+            self.log_message("ОСТАНОВКА ПРОЦЕССА", "status")
+            
+            self.stop_button.config(state=tk.DISABLED, text="Остановка...")
+            self.root.update()
+            
             process_manager.stop_all_processes(self.log_message)
+            
+            time.sleep(2)
+            
+            if not process_manager.is_process_running():
+                self.log_message("✓ Все процессы успешно остановлены", "success")
+            else:
+                self.log_message("⚠ Некоторые процессы все еще активны", "error")
+            
             self.check_status(log_header=False)
             self.set_controls_state(tk.NORMAL)
             self.update_status_indicator(False)
+            
             if self.process:
                 self.process = None
+                
+            self.stop_button.config(state=tk.NORMAL, text="Остановить")
+            
         except Exception as e:
             self._handle_ui_error(e)
+        finally:
+            self.stop_button.config(state=tk.NORMAL, text="Остановить")
 
     def check_status(self, log_header=True):
         try:
@@ -475,7 +489,6 @@ class App:
                     self.root.destroy()
                 elif choice == 'no':
                     self.root.destroy()
-                # Если choice == 'cancel' или None, ничего не делаем
             else:
                 self.root.destroy()
         except Exception as e:
@@ -487,18 +500,14 @@ class App:
         dialog.geometry("350x120")
         dialog.resizable(False, False)
         
-        # Делаем окно модальным
         dialog.transient(self.root)
         dialog.grab_set()
         
-        # Переменная для хранения результата
         result = {'choice': None}
 
-        # Сообщение
         message = "Процесс еще активен. Остановить его перед выходом?"
         tk.Label(dialog, text=message, wraplength=300).pack(pady=10)
 
-        # Фрейм для кнопок
         button_frame = tk.Frame(dialog)
         button_frame.pack(pady=10)
 
@@ -518,23 +527,135 @@ class App:
         tk.Button(button_frame, text="Нет", command=on_no, width=10).pack(side=tk.LEFT, padx=5)
         tk.Button(button_frame, text="Отмена", command=on_cancel, width=10).pack(side=tk.LEFT, padx=5)
         
-        # Центрируем диалог относительно главного окна
         dialog.update_idletasks()
         x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (dialog.winfo_width() // 2)
         y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (dialog.winfo_height() // 2)
         dialog.geometry(f"+{x}+{y}")
         
-        # Ждем закрытия диалога
         self.root.wait_window(dialog)
         
         return result['choice']
 
-    def log_message(self, message):
-        if self.log_window.winfo_exists():
+    def log_message(self, message, log_type="main"):
+        """Универсальная функция логирования с типом"""
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        
+        prefix = ""
+        if log_type == "domain":
+            prefix = "[ДОМЕНЫ] "
+        elif log_type == "status":
+            prefix = "[СТАТУС] "
+        elif log_type == "error":
+            prefix = "[ОШИБКА] "
+        elif log_type == "success":
+            prefix = "[УСПЕХ] "
+        
+        formatted_message = f"[{timestamp}] {prefix}{message}"
+        
+        log_entry = {"text": formatted_message, "type": log_type, "timestamp": timestamp}
+        self.all_logs.append(log_entry)
+        
+        self.update_log_display()
+        
+        if log_type in ["main", "status", "error", "success"]:
+            self.update_status_display(message, log_type)
+    
+    def update_status_display(self, message, log_type):
+        """Обновляет индикатор статуса на основной вкладке"""
+        try:
+            self.status_text.config(state='normal')
+            
+            color = "white"
+            if log_type == "error":
+                color = "#ff6b6b"
+            elif log_type == "success":
+                color = "#51cf66"
+            elif log_type == "status":
+                color = "#74c0fc"
+            
+            self.status_text.tag_configure(log_type, foreground=color)
+            self.status_text.insert(tk.END, f"{message}\n", log_type)
+            self.status_text.see(tk.END)
+            
+            lines = int(self.status_text.index('end-1c').split('.')[0])
+            if lines > 50:
+                self.status_text.delete('1.0', '2.0')
+            
+            self.status_text.config(state='disabled')
+        except:
+            pass
+    
+    def update_log_display(self):
+        """Обновляет отображение логов согласно фильтрам"""
+        if not hasattr(self, 'log_window'):
+            return
+            
+        try:
             self.log_window.config(state='normal')
-            self.log_window.insert(tk.END, str(message) + "\n")
+            self.log_window.delete('1.0', tk.END)
+            
+            self.filtered_logs = []
+            for log_entry in self.all_logs:
+                if (log_entry["type"] == "main" and self.show_main_logs.get()) or \
+                   (log_entry["type"] == "domain" and self.show_domain_logs.get()) or \
+                   (log_entry["type"] in ["status", "error", "success"] and self.show_status_logs.get()):
+                    self.filtered_logs.append(log_entry)
+                    self.log_window.insert(tk.END, log_entry["text"] + "\n")
+            
             self.log_window.config(state='disabled')
             self.log_window.see(tk.END)
+        except:
+            pass
+    
+    def update_log_filter(self):
+        """Обновляет фильтр логов"""
+        self.update_log_display()
+    
+    def clear_all_logs(self):
+        """Очищает все логи"""
+        self.all_logs.clear()
+        self.filtered_logs.clear()
+        if hasattr(self, 'log_window'):
+            self.log_window.config(state='normal')
+            self.log_window.delete('1.0', tk.END)
+            self.log_window.config(state='disabled')
+        self.log_message("Все логи очищены", "status")
+    
+    def clear_status(self):
+        """Очищает индикатор статуса"""
+        if hasattr(self, 'status_text'):
+            self.status_text.config(state='normal')
+            self.status_text.delete('1.0', tk.END)
+            self.status_text.config(state='disabled')
+    
+    def save_logs_to_file(self):
+        """Сохраняет логи в файл"""
+        try:
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+                initialfile=f"logs_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            )
+            
+            if filename:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write("Логи DPI GUI\n")
+                    f.write("=" * 50 + "\n")
+                    f.write(f"Сохранено: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write("=" * 50 + "\n\n")
+                    
+                    for log_entry in self.all_logs:
+                        f.write(log_entry["text"] + "\n")
+                
+                messagebox.showinfo("Успех", f"Логи сохранены в файл:\n{filename}")
+                self.log_message(f"Логи сохранены в файл: {filename}", "success")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось сохранить логи:\n{e}")
+            self.log_message(f"Ошибка сохранения логов: {e}", "error")
+    
+    def domain_log(self, message):
+        """Логирование для анализа доменов"""
+        self.log_message(message, "domain")
 
     def run_in_thread(self, target_func, *args):
         thread = threading.Thread(target=target_func, args=args, daemon=True)
@@ -550,12 +671,12 @@ class App:
             "custom_list_path": self.list_manager.get_custom_list_path()
         }
         settings_manager.save_app_settings(settings_data, self.app_dir)
-        self.log_message("Настройки сохранены.")
+        self.log_message("Настройки сохранены.", "success")
 
     def load_app_settings(self):
         settings = settings_manager.load_app_settings(self.app_dir)
         if not settings:
-            self.log_message("Файл настроек не найден, используются значения по умолчанию.")
+            self.log_message("Файл настроек не найден, используются значения по умолчанию.", "status")
             return
         
         profile_name = settings.get("selected_profile")
@@ -574,16 +695,14 @@ class App:
         
         self.list_manager.set_selection_state(settings.get("selected_lists"))
         
-        # Вызываем обработчик смены профиля, чтобы применить обязательные списки
         self.on_profile_change()
         
-        self.log_message("Настройки успешно загружены.")
+        self.log_message("Настройки успешно загружены.", "success")
         
     def open_custom_list(self):
         try:
             custom_list_path = self.list_manager.get_custom_list_path()
             if not custom_list_path:
-                # Если кастомный список не выбран, используем стандартный
                 custom_list_path = os.path.join(self.app_dir, 'lists', 'custom_list.txt')
                 if not os.path.exists(custom_list_path):
                     with open(custom_list_path, 'w', encoding='utf-8') as f:
@@ -615,34 +734,61 @@ class App:
 
     def add_domains_to_list(self, new_domains):
         try:
+            log_callback = self.domain_log
+            
             custom_list_path = self.list_manager.get_custom_list_path()
             if not custom_list_path:
                 custom_list_path = os.path.join(self.app_dir, 'lists', 'custom_list.txt')
+                log_callback(f"Кастомный список не выбран, использую стандартный: {custom_list_path}")
             
             existing_domains = set()
             if os.path.exists(custom_list_path):
+                log_callback("Читаю существующий список доменов...")
                 with open(custom_list_path, 'r', encoding='utf-8') as f:
-                    for line in f:
+                    for line_num, line in enumerate(f, 1):
                         line = line.strip()
                         if line and not line.startswith('#'):
                             existing_domains.add(line)
-            added_domains = [d for d in new_domains if d not in existing_domains]
+                log_callback(f"Найдено существующих доменов: {len(existing_domains)}")
+            else:
+                log_callback("Создаю новый файл списка доменов...")
+            
+            added_domains = []
+            skipped_domains = []
+            
+            log_callback("Анализирую найденные домены:")
+            for domain in new_domains:
+                if domain in existing_domains:
+                    skipped_domains.append(domain)
+                    log_callback(f"  - {domain} (УЖЕ ЕСТЬ В СПИСКЕ)")
+                else:
+                    added_domains.append(domain)
+                    log_callback(f"  + {domain} (НОВЫЙ ДОМЕН)")
+            
             if not added_domains:
-                self.domain_log("Новых доменов для добавления не найдено.")
+                log_callback("НОВЫХ ДОМЕНОВ ДЛЯ ДОБАВЛЕНИЯ НЕ НАЙДЕНО")
+                if skipped_domains:
+                    log_callback(f"Все найденные домены уже существуют в списке ({len(skipped_domains)} шт.)")
                 return
             
+            log_callback(f"ДОБАВЛЯЮ {len(added_domains)} НОВЫХ ДОМЕНОВ В СПИСОК...")
+            
             all_domains = sorted(list(existing_domains.union(set(new_domains))))
+            
             with open(custom_list_path, 'w', encoding='utf-8') as f:
                 f.write("# Это ваш личный список доменов. Добавляйте по одному домену на строку.\n")
                 f.write("# Строки, начинающиеся с #, игнорируются.\n")
+                f.write(f"# Обновлено: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("#\n")
                 for domain in all_domains:
                     f.write(domain + '\n')
             
-            self.domain_log(f"Автоматически добавлено {len(added_domains)} новых доменов в кастомный список.")
-            for domain in sorted(added_domains):
-                self.domain_log(f"  + {domain}")
+            log_callback(f"✓ УСПЕШНО ДОБАВЛЕНО {len(added_domains)} НОВЫХ ДОМЕНОВ:")
+            for domain in added_domains:
+                log_callback(f"  ✓ {domain}")
             
-            # Предлагаем перезапустить профиль, если он активен
+            log_callback(f"✓ ОБЩЕЕ КОЛИЧЕСТВО ДОМЕНОВ В СПИСКЕ: {len(all_domains)}")
+            
             self.root.after(0, self._propose_restart_after_domain_update)
 
         except Exception as e:
@@ -658,23 +804,9 @@ class App:
             ):
                 self.domain_log("Перезапускаю профиль для применения новых доменов...")
                 self.stop_process()
-                # Даем время на полную остановку процесса перед запуском
                 self.root.after(1500, self.run_selected_profile)
 
-    def domain_log(self, message):
-        def _log():
-            self.domain_log_text.config(state=tk.NORMAL)
-            self.domain_log_text.insert(tk.END, message + "\n")
-            self.domain_log_text.config(state=tk.DISABLED)
-            self.domain_log_text.see(tk.END)
-        if self.domain_log_text.winfo_exists():
-            self.root.after(0, _log)
-
     def start_domain_analysis(self):
-        if not process_manager.is_process_running():
-            messagebox.showerror("Ошибка", "Сначала запустите профиль на вкладке 'Управление'.")
-            return
-
         url = self.domain_url_entry.get().strip()
         if not url:
             messagebox.showerror("Ошибка", "Введите URL!")
@@ -690,9 +822,6 @@ class App:
             return
             
         self.domain_start_btn.config(state=tk.DISABLED, text="⏳ Анализ...")
-        self.domain_log_text.config(state='normal')
-        self.domain_log_text.delete('1.0', tk.END)
-        self.domain_log_text.config(state='disabled')
         
         self.domain_analysis_thread = threading.Thread(target=self.run_domain_analysis_loop, args=(url, method), daemon=True)
         self.domain_analysis_thread.start()
@@ -701,22 +830,25 @@ class App:
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             self.domain_log(f"=== ПОПЫТКА {attempt}/{max_attempts} ===")
+            self.domain_log(f"Анализирую URL: {url}")
+            self.domain_log(f"Метод анализа: {method}")
+            
             domains = self.run_single_analysis(url, method)
             
             if domains:
-                self.domain_log(f"Найдено {len(domains)} доменов. Добавляю в список...")
+                self.domain_log(f"✓ АНАЛИЗ УСПЕШЕН - НАЙДЕНО {len(domains)} ДОМЕН(ОВ)")
+                self.domain_log("НАЧИНАЮ ДОБАВЛЕНИЕ В СПИСОК...")
                 self.add_domains_to_list(domains)
-                # Проверяем, был ли таймаут
+                
                 if "ПРЕДУПРЕЖДЕНИЕ: Страница не загрузилась за 30 секунд" in self.domain_log_text.get('1.0', tk.END):
                     if attempt < max_attempts:
                         self.domain_log("Попытка завершилась по таймауту. Перезапускаю анализ...")
                         continue
                 else:
-                    # Успешное завершение без таймаута
                     self.domain_log("=== АНАЛИЗ УСПЕШНО ЗАВЕРШЕН ===")
                     break
             else:
-                self.domain_log("Не удалось получить домены на этой попытке.")
+                self.domain_log("✗ НЕ УДАЛОСЬ ПОЛУЧИТЬ ДОМЕНЫ НА ЭТОЙ ПОПЫТКЕ")
                 if attempt < max_attempts:
                     self.domain_log("Перезапускаю анализ...")
                 else:
@@ -756,7 +888,6 @@ class App:
             self.domain_url_entry.delete(0, tk.END)
             self.domain_url_entry.insert(0, text)
         except tk.TclError:
-            # Буфер обмена пуст или содержит не текстовые данные
             pass
 
     def show_site_test_url_menu(self, event):
@@ -773,7 +904,6 @@ class App:
             self.site_test_url_entry.delete(0, tk.END)
             self.site_test_url_entry.insert(0, text)
         except tk.TclError:
-            # Буфер обмена пуст или содержит не текстовые данные
             pass
 
     def install_service(self):
@@ -834,7 +964,7 @@ class App:
             self._handle_ui_error(e)
             
 if __name__ == "__main__":
-    if not is_admin():
+    if not process_manager.is_admin():
         run_as_admin()
         sys.exit()
     

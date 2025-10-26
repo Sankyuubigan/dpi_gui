@@ -6,6 +6,8 @@ import sys
 import os
 import re
 from urllib.parse import urlparse
+import gc
+import psutil
 
 def check_dependencies():
     """Проверяет какие библиотеки доступны"""
@@ -80,8 +82,27 @@ def extract_domain_from_url(url):
     except:
         return None
 
+def cleanup_browser_resources():
+    """Очищает ресурсы браузеров для предотвращения утечек памяти"""
+    try:
+        # Закрываем все процессы chrome/chromium
+        for proc in psutil.process_iter(['pid', 'name']):
+            try:
+                if proc.info['name'] and ('chrome' in proc.info['name'].lower() or 'chromium' in proc.info['name'].lower()):
+                    if proc.pid != os.getpid():  # Не убиваем свой процесс
+                        proc.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        
+        # Принудительная сборка мусора
+        gc.collect()
+        
+    except Exception as e:
+        print(f"Ошибка при очистке ресурсов: {e}")
+
 def analyze_site_domains_performance(url: str, log_callback):
-    """Анализ через Performance API (JavaScript)"""
+    """Анализ через Performance API (JavaScript) с улучшенным управлением памятью"""
+    driver = None
     try:
         from selenium import webdriver
         from selenium.webdriver.chrome.options import Options
@@ -96,26 +117,36 @@ def analyze_site_domains_performance(url: str, log_callback):
         if is_media_url(url):
             domain = extract_domain_from_url(url)
             if domain:
-                log_callback(f"Обнаружена прямая ссылка на медиафайл. Добавляю домен: {domain}")
+                log_callback(f"Обнаружена прямая ссылка на медиафайл. Найден домен: {domain}")
                 return [domain]
             else:
                 log_callback("Не удалось извлечь домен из URL медиафайла.")
                 return None
         
+        # ВСЕГДА добавляем основной домен из URL
+        main_domain = extract_domain_from_url(url)
+        if main_domain:
+            log_callback(f"ОСНОВНОЙ ДОМЕН ИЗ URL: {main_domain}")
+        else:
+            log_callback("ПРЕДУПРЕЖДЕНИЕ: Не удалось извлечь основной домен из URL")
+        
         chrome_options = Options()
-        chrome_options.add_argument("--headless=new")  # Используем новый режим headless
+        chrome_options.add_argument("--headless=new")
         chrome_options.add_argument("--log-level=3")
         chrome_options.add_argument("--disable-gpu")
         chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")  # Для предотвращения проблем с ресурсами
-        chrome_options.add_argument("--disable-blink-features=AutomationControlled")  # Убираем флаг автоматизации
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument("--disable-plugins")
+        # Временно включаем изображения для лучшего анализа
+        # chrome_options.add_argument("--disable-images")
+        chrome_options.add_argument("--memory-pressure-off")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
         
-        driver = None
         try:
             driver = webdriver.Chrome(options=chrome_options)
-            # Устанавливаем таймаут для загрузки страницы в 30 секунд
             driver.set_page_load_timeout(30)
             
             log_callback(f"Перехожу на {url}...")
@@ -137,24 +168,57 @@ def analyze_site_domains_performance(url: str, log_callback):
             
             domains = driver.execute_script(script)
             
+            # ВСЕГДА добавляем основной домен к найденным
+            all_domains = set()
+            if main_domain:
+                all_domains.add(main_domain)
+                log_callback(f"✓ ДОБАВЛЕН ОСНОВНОЙ ДОМЕН: {main_domain}")
+            
             if domains:
-                # Удаляем дубликаты и сортируем
-                unique_domains = sorted(list(set(domains)))
+                for domain in domains:
+                    if domain:  # Проверяем, что домен не пустой
+                        all_domains.add(domain)
+            
+            if all_domains:
+                unique_domains = sorted(list(all_domains))
                 log_callback(f"Найдено доменов: {len(unique_domains)}")
+                log_callback("СПИСОК НАЙДЕННЫХ ДОМЕНОВ:")
+                for i, domain in enumerate(unique_domains, 1):
+                    if domain == main_domain:
+                        log_callback(f"  {i}. {domain} (ОСНОВНОЙ)")
+                    else:
+                        log_callback(f"  {i}. {domain}")
                 return unique_domains
             else:
                 log_callback("Не удалось получить домены через Performance API (возможно, ничего не загрузилось).")
+                # Если ничего не найдено, но есть основной домен, возвращаем его
+                if main_domain:
+                    log_callback(f"ВОЗВРАЩАЮ ТОЛЬКО ОСНОВНОЙ ДОМЕН: {main_domain}")
+                    return [main_domain]
                 return None
             
         finally:
             if driver:
-                driver.quit()
+                try:
+                    driver.quit()
+                except:
+                    pass
+                # Принудительно закрываем все процессы chrome
+                cleanup_browser_resources()
+                
     except Exception as e:
         log_callback(f"ОШИБКА Performance API: {str(e)}")
+        cleanup_browser_resources()
+        # В случае ошибки, если есть основной домен, возвращаем его
+        main_domain = extract_domain_from_url(url)
+        if main_domain:
+            log_callback(f"ВОЗВРАЩАЮ ОСНОВНОЙ ДОМЕН ПОСЛЕ ОШИБКИ: {main_domain}")
+            return [main_domain]
         return None
 
 def analyze_site_domains_selenium(url: str, log_callback):
-    """Анализ через Selenium"""
+    """Анализ через Selenium с улучшенным управлением памятью"""
+    driver = None
     try:
         from selenium import webdriver
         from selenium.webdriver.chrome.options import Options
@@ -168,11 +232,18 @@ def analyze_site_domains_selenium(url: str, log_callback):
         if is_media_url(url):
             domain = extract_domain_from_url(url)
             if domain:
-                log_callback(f"Обнаружена прямая ссылка на медиафайл. Добавляю домен: {domain}")
+                log_callback(f"Обнаружена прямая ссылка на медиафайл. Найден домен: {domain}")
                 return [domain]
             else:
                 log_callback("Не удалось извлечь домен из URL медиафайла.")
                 return None
+        
+        # ВСЕГДА добавляем основной домен из URL
+        main_domain = extract_domain_from_url(url)
+        if main_domain:
+            log_callback(f"ОСНОВНОЙ ДОМЕН ИЗ URL: {main_domain}")
+        else:
+            log_callback("ПРЕДУПРЕЖДЕНИЕ: Не удалось извлечь основной домен из URL")
         
         chrome_options = Options()
         chrome_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
@@ -180,8 +251,12 @@ def analyze_site_domains_selenium(url: str, log_callback):
         chrome_options.add_argument("--log-level=3")
         chrome_options.add_argument("--disable-gpu")
         chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument("--disable-plugins")
+        # Временно включаем изображения для лучшего анализа
+        # chrome_options.add_argument("--disable-images")
+        chrome_options.add_argument("--memory-pressure-off")
         
-        driver = None
         try:
             driver = webdriver.Chrome(options=chrome_options)
             log_callback(f"Перехожу на {url}...")
@@ -192,6 +267,12 @@ def analyze_site_domains_selenium(url: str, log_callback):
             logs = driver.get_log('performance')
             domains = set()
             
+            # ВСЕГДА добавляем основной домен
+            all_domains = set()
+            if main_domain:
+                all_domains.add(main_domain)
+                log_callback(f"✓ ДОБАВЛЕН ОСНОВНОЙ ДОМЕН: {main_domain}")
+            
             for entry in logs:
                 try:
                     log = json.loads(entry['message'])['message']
@@ -199,23 +280,41 @@ def analyze_site_domains_selenium(url: str, log_callback):
                         request_url = log['params']['request']['url']
                         domain = urlparse(request_url).netloc
                         if domain:
-                            domains.add(domain)
+                            all_domains.add(domain)
                 except:
                     continue
             
-            found_domains = sorted(list(domains))
+            found_domains = sorted(list(all_domains))
             log_callback(f"Найдено доменов: {len(found_domains)}")
+            log_callback("СПИСОК НАЙДЕННЫХ ДОМЕНОВ:")
+            for i, domain in enumerate(found_domains, 1):
+                if domain == main_domain:
+                    log_callback(f"  {i}. {domain} (ОСНОВНОЙ)")
+                else:
+                    log_callback(f"  {i}. {domain}")
             return found_domains
             
         finally:
             if driver:
-                driver.quit()
+                try:
+                    driver.quit()
+                except:
+                    pass
+                cleanup_browser_resources()
+                
     except Exception as e:
         log_callback(f"ОШИБКА Selenium: {str(e)}")
+        cleanup_browser_resources()
+        # В случае ошибки, если есть основной домен, возвращаем его
+        main_domain = extract_domain_from_url(url)
+        if main_domain:
+            log_callback(f"ВОЗВРАЩАЮ ОСНОВНОЙ ДОМЕН ПОСЛЕ ОШИБКИ: {main_domain}")
+            return [main_domain]
         return None
 
 def analyze_site_domains_playwright(url: str, log_callback):
-    """Анализ через Playwright"""
+    """Анализ через Playwright с улучшенным управлением памятью"""
+    browser = None
     try:
         from playwright.sync_api import sync_playwright
         from urllib.parse import urlparse
@@ -226,15 +325,36 @@ def analyze_site_domains_playwright(url: str, log_callback):
         if is_media_url(url):
             domain = extract_domain_from_url(url)
             if domain:
-                log_callback(f"Обнаружена прямая ссылка на медиафайл. Добавляю домен: {domain}")
+                log_callback(f"Обнаружена прямая ссылка на медиафайл. Найден домен: {domain}")
                 return [domain]
             else:
                 log_callback("Не удалось извлечь домен из URL медиафайла.")
                 return None
         
+        # ВСЕГДА добавляем основной домен из URL
+        main_domain = extract_domain_from_url(url)
+        if main_domain:
+            log_callback(f"ОСНОВНОЙ ДОМЕН ИЗ URL: {main_domain}")
+        else:
+            log_callback("ПРЕДУПРЕЖДЕНИЕ: Не удалось извлечь основной домен из URL")
+        
         with sync_playwright() as p:
             try:
-                browser = p.chromium.launch(headless=True)
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--disable-gpu',
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-extensions',
+                        '--disable-plugins',
+                        # Временно включаем изображения для лучшего анализа
+                        # '--disable-images',
+                        '--disable-background-timer-throttling',
+                        '--disable-backgrounding-occluded-windows',
+                        '--disable-renderer-backgrounding'
+                    ]
+                )
             except Exception as e:
                 log_callback(f"Не удалось запустить браузер Playwright: {e}")
                 log_callback("Попробуйте перезапустить программу, чтобы лаунчер установил браузеры.")
@@ -242,13 +362,21 @@ def analyze_site_domains_playwright(url: str, log_callback):
 
             page = browser.new_page()
             
-            domains = set()
+            # Отключаем загрузку некоторых ресурсов для экономии памяти, но оставляем важные
+            route_block = lambda route: route.abort() if route.resource_type in ['font', 'media'] else route.continue_()
+            page.route('**/*', route_block)
+            
+            # ВСЕГДА добавляем основной домен
+            all_domains = set()
+            if main_domain:
+                all_domains.add(main_domain)
+                log_callback(f"✓ ДОБАВЛЕН ОСНОВНОЙ ДОМЕН: {main_domain}")
             
             def handle_request(request):
                 try:
                     domain = urlparse(request.url).netloc
                     if domain:
-                        domains.add(domain)
+                        all_domains.add(domain)
                 except:
                     pass
             
@@ -265,12 +393,28 @@ def analyze_site_domains_playwright(url: str, log_callback):
             
             browser.close()
             
-            found_domains = sorted(list(domains))
+            found_domains = sorted(list(all_domains))
             log_callback(f"Найдено доменов: {len(found_domains)}")
+            log_callback("СПИСОК НАЙДЕННЫХ ДОМЕНОВ:")
+            for i, domain in enumerate(found_domains, 1):
+                if domain == main_domain:
+                    log_callback(f"  {i}. {domain} (ОСНОВНОЙ)")
+                else:
+                    log_callback(f"  {i}. {domain}")
             return found_domains
             
     except Exception as e:
         log_callback(f"ОШИБКА Playwright: {str(e)}")
+        if browser:
+            try:
+                browser.close()
+            except:
+                pass
+        # В случае ошибки, если есть основной домен, возвращаем его
+        main_domain = extract_domain_from_url(url)
+        if main_domain:
+            log_callback(f"ВОЗВРАЩАЮ ОСНОВНОЙ ДОМЕН ПОСЛЕ ОШИБКИ: {main_domain}")
+            return [main_domain]
         return None
 
 def analyze_site_domains_simple(url: str, log_callback):
@@ -287,7 +431,7 @@ def analyze_site_domains_simple(url: str, log_callback):
         if is_media_url(url):
             domain = extract_domain_from_url(url)
             if domain:
-                log_callback(f"Обнаружена прямая ссылка на медиафайл. Добавляю домен: {domain}")
+                log_callback(f"Обнаружена прямая ссылка на медиафайл. Найден домен: {domain}")
                 return [domain]
             else:
                 log_callback("Не удалось извлечь домен из URL медиафайла.")
@@ -295,6 +439,13 @@ def analyze_site_domains_simple(url: str, log_callback):
         
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
+
+        # ВСЕГДА добавляем основной домен из URL
+        main_domain = extract_domain_from_url(url)
+        if main_domain:
+            log_callback(f"ОСНОВНОЙ ДОМЕН ИЗ URL: {main_domain}")
+        else:
+            log_callback("ПРЕДУПРЕЖДЕНИЕ: Не удалось извлечь основной домен из URL")
 
         session = requests.Session()
         session.headers.update({
@@ -306,7 +457,12 @@ def analyze_site_domains_simple(url: str, log_callback):
         response.raise_for_status()
         
         soup = BeautifulSoup(response.text, 'html.parser')
-        domains = set([urlparse(url).netloc])
+        
+        # ВСЕГДА начинаем с основного домена
+        domains = set()
+        if main_domain:
+            domains.add(main_domain)
+            log_callback(f"✓ ДОБАВЛЕН ОСНОВНОЙ ДОМЕН: {main_domain}")
         
         for tag in soup.find_all(['a', 'link', 'script', 'img', 'iframe', 'frame', 'source']):
             attr = None
@@ -329,8 +485,19 @@ def analyze_site_domains_simple(url: str, log_callback):
         
         found_domains = sorted(list(domains))
         log_callback(f"Найдено доменов: {len(found_domains)}")
+        log_callback("СПИСОК НАЙДЕННЫХ ДОМЕНОВ:")
+        for i, domain in enumerate(found_domains, 1):
+            if domain == main_domain:
+                log_callback(f"  {i}. {domain} (ОСНОВНОЙ)")
+            else:
+                log_callback(f"  {i}. {domain}")
         return found_domains
         
     except Exception as e:
         log_callback(f"ОШИБКА простого парсера: {str(e)}")
+        # В случае ошибки, если есть основной домен, возвращаем его
+        main_domain = extract_domain_from_url(url)
+        if main_domain:
+            log_callback(f"ВОЗВРАЩАЮ ОСНОВНОЙ ДОМЕН ПОСЛЕ ОШИБКИ: {main_domain}")
+            return [main_domain]
         return None
