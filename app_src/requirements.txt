@@ -5,4 +5,3 @@ selenium==4.15.2
 playwright
 pywin32
 psutil
-gc
