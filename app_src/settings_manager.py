@@ -7,7 +7,6 @@ import json
 from process_manager import is_process_running, is_service_running, ZAPRET_SERVICE_NAME, WINWS_EXE
 
 def save_app_settings(settings_data, app_dir):
-    """Сохраняет настройки GUI в файл settings.json."""
     settings_file = os.path.join(app_dir, 'settings.json')
     try:
         with open(settings_file, 'w', encoding='utf-8') as f:
@@ -16,24 +15,16 @@ def save_app_settings(settings_data, app_dir):
         print(f"Ошибка сохранения настроек: {e}")
 
 def load_app_settings(app_dir):
-    """Загружает настройки GUI из файла settings.json."""
     settings_file = os.path.join(app_dir, 'settings.json')
     if os.path.exists(settings_file):
         try:
             with open(settings_file, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except (json.JSONDecodeError, TypeError):
-            print("Ошибка чтения файла настроек. Будут использованы значения по умолчанию.")
+        except:
             return {}
     return {}
 
-def get_game_filter_status(base_dir):
-    """Проверяет, включен ли игровой фильтр (устаревший метод)."""
-    game_flag_file = os.path.join(base_dir, 'bin', 'game_filter.enabled')
-    return os.path.exists(game_flag_file)
-
 def check_status(base_dir, log_callback, log_header=True):
-    """Проверяет и выводит в лог статус процессов и настроек."""
     if log_header:
         log_callback("\n" + "="*40)
         log_callback("--- ПРОВЕРКА СТАТУСА ---")
@@ -50,27 +41,30 @@ def check_status(base_dir, log_callback, log_header=True):
         
     app_settings = load_app_settings(base_dir)
     if app_settings.get("game_filter", False):
-         log_callback("[+] Игровой фильтр: ВКЛЮЧЕН (в настройках)")
+         log_callback("[+] Игровой фильтр: ВКЛЮЧЕН")
     else:
-         log_callback("[-] Игровой фильтр: ВЫКЛЮЧЕН (в настройках)")
+         log_callback("[-] Игровой фильтр: ВЫКЛЮЧЕН")
+
+    ipset_sel = app_settings.get("ipset_selection", "OFF")
+    if ipset_sel != "OFF":
+        log_callback(f"[+] IPSet: ВКЛЮЧЕН (Файл: {ipset_sel})")
+    else:
+        log_callback("[-] IPSet: ВЫКЛЮЧЕН")
 
     if log_header:
         log_callback("="*40 + "\n")
 
 def install_service(base_dir, log_callback, profile):
-    """Устанавливает профиль как службу Windows."""
     log_callback(f"\n--- Установка службы для профиля: {profile['name']} ---")
     
     bin_dir = os.path.join(base_dir, 'bin')
     lists_dir = os.path.join(base_dir, 'lists')
     executable_path = os.path.join(bin_dir, WINWS_EXE)
     
-    game_filter_value = "1024-65535"
-    
     args_str = profile["args"].format(
         LISTS_DIR=lists_dir,
         BIN_DIR=bin_dir,
-        GAME_FILTER=game_filter_value
+        GAME_FILTER="1024-65535"
     )
     
     bin_path = f'"{executable_path}" {args_str}'
@@ -81,48 +75,30 @@ def install_service(base_dir, log_callback, profile):
         time.sleep(1)
 
         create_cmd = ['sc', 'create', ZAPRET_SERVICE_NAME, 'binPath=', bin_path, 'start=', 'auto', 'DisplayName=', 'Zapret DPI Bypass']
-        log_callback(f"Выполняю: {' '.join(create_cmd)}")
         subprocess.run(create_cmd, check=True, capture_output=True)
-        
         subprocess.run(['sc', 'start', ZAPRET_SERVICE_NAME], check=True, capture_output=True)
-        
-        log_callback("\n[+] УСПЕХ! Служба запущена и добавлена в автозапуск.")
+        log_callback("\n[+] УСПЕХ! Служба запущена.")
     except Exception as e:
-        log_callback(f"\n[!] ПРОИЗОШЛА ОШИБКА: {e}")
-        if hasattr(e, 'stderr'):
-            log_callback(f"    Детали: {e.stderr.decode('cp866', errors='ignore')}")
+        log_callback(f"\n[!] ОШИБКА: {e}")
     log_callback("--- Установка службы завершена ---\n")
 
 def uninstall_service(base_dir, log_callback):
-    """Удаляет службу из автозапуска."""
     log_callback(f"\n--- Удаление службы '{ZAPRET_SERVICE_NAME}' ---")
     try:
         subprocess.run(['sc', 'stop', ZAPRET_SERVICE_NAME], capture_output=True)
         time.sleep(1)
-
-        delete_result = subprocess.run(['sc', 'delete', ZAPRET_SERVICE_NAME], capture_output=True, text=True, encoding='cp866')
-        
-        if "SUCCESS" in delete_result.stdout or "[SC] DeleteService УСПЕХ" in delete_result.stdout:
-            log_callback("[+] Служба успешно удалена.")
-        elif "1060" in delete_result.stderr:
-            log_callback("(-) Служба не найдена (уже удалена).")
-        else:
-            log_callback(f"[!] Не удалось удалить службу: {delete_result.stderr or 'Неизвестная ошибка'}")
+        subprocess.run(['sc', 'delete', ZAPRET_SERVICE_NAME], capture_output=True)
+        log_callback("[+] Команда удаления отправлена.")
     except Exception as e:
-        log_callback(f"[!] Произошла ошибка: {e}")
+        log_callback(f"[!] Ошибка: {e}")
     log_callback("--- Удаление службы завершено ---\n")
 
 def clear_discord_cache(base_dir, log_callback):
-    """Очищает кэш Discord."""
     log_callback("\n--- Очистка кэша Discord ---")
     try:
-        result = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq Discord.exe'], capture_output=True, text=True, encoding='cp866')
-        if result.stdout.lower().count('discord.exe') > 0:
-            log_callback("Закрытие Discord...")
-            subprocess.run(['taskkill', '/F', '/IM', 'Discord.exe'], capture_output=True)
-            time.sleep(1)
-    except FileNotFoundError:
-        pass
+        subprocess.run(['taskkill', '/F', '/IM', 'Discord.exe'], capture_output=True)
+        time.sleep(1)
+    except: pass
 
     appdata_path = os.getenv('APPDATA')
     if appdata_path:
@@ -131,11 +107,7 @@ def clear_discord_cache(base_dir, log_callback):
             if os.path.exists(dir_to_delete):
                 try:
                     shutil.rmtree(dir_to_delete)
-                    log_callback(f"[+] Папка '{cache_dir}' удалена.")
-                except OSError as e:
-                    log_callback(f"[!] Не удалось удалить '{cache_dir}': {e}")
-            else:
-                log_callback(f"(-) Папка '{cache_dir}' не найдена.")
-    else:
-        log_callback("[!] Не удалось найти папку AppData.")
+                    log_callback(f"[+] Удалено: {cache_dir}")
+                except:
+                    log_callback(f"[!] Не удалось удалить: {cache_dir}")
     log_callback("--- Очистка кэша завершена ---\n")

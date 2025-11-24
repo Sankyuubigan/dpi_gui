@@ -3,7 +3,7 @@ from tkinter import ttk, scrolledtext, messagebox, simpledialog, filedialog
 import os
 import sys
 import datetime
-import ctypes
+import glob
 from text_utils import setup_text_widget_bindings
 
 class UIManager:
@@ -28,7 +28,7 @@ class UIManager:
                 if full_hash:
                     version_hash = full_hash[:7]
         self.app.root.title(f"DPI_GUI Launcher (Commit: {version_hash})")
-        self.app.root.geometry("850x700")
+        self.app.root.geometry("850x750")
         try:
             icon_path = os.path.join(self.app.app_dir, 'icon.ico')
             if os.path.exists(icon_path):
@@ -118,17 +118,14 @@ class UIManager:
 
     def create_logs_tab(self, parent):
         """Создает вкладку с объединенными логами"""
-        # Заголовок
         header_frame = ttk.Frame(parent)
         header_frame.pack(fill=tk.X, pady=5)
         
         ttk.Label(header_frame, text="Объединенные логи приложения", font=('Arial', 12, 'bold')).pack(side=tk.LEFT)
         
-        # Кнопки управления
         ttk.Button(header_frame, text="Очистить все", command=self.clear_all_logs).pack(side=tk.RIGHT, padx=5)
         ttk.Button(header_frame, text="Сохранить в файл", command=self.save_logs_to_file).pack(side=tk.RIGHT, padx=5)
         
-        # Основное окно логов
         log_frame = ttk.Frame(parent)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
@@ -136,7 +133,6 @@ class UIManager:
         self.log_window.pack(fill=tk.BOTH, expand=True)
         setup_text_widget_bindings(self.log_window)
         
-        # Фильтры логов
         filter_frame = ttk.LabelFrame(parent, text="Фильтры логов")
         filter_frame.pack(fill=tk.X, pady=5)
         
@@ -162,9 +158,31 @@ class UIManager:
         self.app.game_filter_check = ttk.Checkbutton(settings_frame, text="Игровой фильтр (для всех профилей)", variable=self.app.game_filter_var)
         self.app.game_filter_check.pack(anchor=tk.W, padx=5, pady=5)
         
-        self.app.use_ipset_var = tk.BooleanVar(value=False)
-        self.app.use_ipset_check = ttk.Checkbutton(settings_frame, text="Использовать IPSet (требует ручного обновления)", variable=self.app.use_ipset_var)
-        self.app.use_ipset_check.pack(anchor=tk.W, padx=5, pady=5)
+        # --- IPSet Selection UI ---
+        ipset_frame = ttk.LabelFrame(parent, text="Настройки IPSet")
+        ipset_frame.pack(fill=tk.X, pady=10, padx=0)
+        
+        self.app.ipset_selection_var = tk.StringVar(value="OFF")
+        
+        # Кнопка "Выкл"
+        ttk.Radiobutton(ipset_frame, text="Выключено (Не использовать IPSet)", 
+                        variable=self.app.ipset_selection_var, value="OFF").pack(anchor=tk.W, padx=5, pady=2)
+        
+        # Поиск файлов в папке ipsets
+        ipsets_dir = os.path.join(self.app.app_dir, 'ipsets')
+        if os.path.exists(ipsets_dir):
+            txt_files = glob.glob(os.path.join(ipsets_dir, '*.txt'))
+            if txt_files:
+                ttk.Label(ipset_frame, text="Выберите файл:", font=("", 8, "bold")).pack(anchor=tk.W, padx=5, pady=(5,0))
+                for file_path in txt_files:
+                    filename = os.path.basename(file_path)
+                    ttk.Radiobutton(ipset_frame, text=filename, 
+                                    variable=self.app.ipset_selection_var, value=filename).pack(anchor=tk.W, padx=15, pady=1)
+            else:
+                ttk.Label(ipset_frame, text="В папке ipsets нет .txt файлов", fg="gray").pack(anchor=tk.W, padx=5, pady=2)
+        else:
+            ttk.Label(ipset_frame, text="Папка ipsets не найдена", fg="red").pack(anchor=tk.W, padx=5, pady=2)
+        # --------------------------
         
         service_frame = ttk.LabelFrame(parent, text="Автозапуск (Системная служба)")
         service_frame.pack(fill=tk.X, pady=10)
@@ -188,7 +206,6 @@ class UIManager:
         self.app.site_test_url_entry = ttk.Entry(site_test_frame, textvariable=self.app.site_test_url)
         self.app.site_test_url_entry.pack(fill=tk.X, padx=5, pady=5)
 
-        # Создаем контекстное меню для поля ввода URL теста
         self.app.site_test_url_menu = tk.Menu(self.app.root, tearoff=0)
         self.app.site_test_url_menu.add_command(label="Вставить", command=self.app.paste_site_test_url)
         self.app.site_test_url_entry.bind("<Button-3>", self.app.show_site_test_url_menu)
@@ -204,22 +221,6 @@ class UIManager:
 
     def update_status_indicator(self, is_running):
         """Обновляет индикатор статуса"""
-        import logging
-        time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        bg_color = "#4CAF50" if is_running else "#cccccc"
-        
-        # Логирование статуса
-        status_logger = logging.getLogger("status_indicators")
-        if not status_logger.handlers:
-            os.makedirs("roo_tests", exist_ok=True)
-            handler = logging.FileHandler("roo_tests/status_runtime.log")
-            formatter = logging.Formatter("%(asctime)s - %(message)s")
-            handler.setFormatter(formatter)
-            status_logger.addHandler(handler)
-            status_logger.setLevel(logging.INFO)
-        
-        status_logger.info(f"time={time_str}, is_running={is_running}, bg_color={bg_color}")
-
         if self.status_indicator:
             if is_running:
                 self.status_indicator.config(text="ЗАПУЩЕНО", bg="#4CAF50")
@@ -235,14 +236,10 @@ class UIManager:
         try:
             if self.status_text:
                 self.status_text.config(state='normal')
-                
                 color = "white"
-                if log_type == "error":
-                    color = "#ff6b6b"
-                elif log_type == "success":
-                    color = "#51cf66"
-                elif log_type == "status":
-                    color = "#74c0fc"
+                if log_type == "error": color = "#ff6b6b"
+                elif log_type == "success": color = "#51cf66"
+                elif log_type == "status": color = "#74c0fc"
                 
                 self.status_text.tag_configure(log_type, foreground=color)
                 self.status_text.insert(tk.END, f"{message}\n", log_type)
@@ -251,20 +248,16 @@ class UIManager:
                 lines = int(self.status_text.index('end-1c').split('.')[0])
                 if lines > 50:
                     self.status_text.delete('1.0', '2.0')
-                
                 self.status_text.config(state='disabled')
         except:
             pass
 
     def update_log_display(self):
         """Обновляет отображение логов согласно фильтрам"""
-        if not self.log_window:
-            return
-            
+        if not self.log_window: return
         try:
             self.log_window.config(state='normal')
             self.log_window.delete('1.0', tk.END)
-            
             self.filtered_logs = []
             for log_entry in self.all_logs:
                 if (log_entry["type"] == "main" and self.show_main_logs.get()) or \
@@ -272,18 +265,15 @@ class UIManager:
                    (log_entry["type"] in ["status", "error", "success"] and self.show_status_logs.get()):
                     self.filtered_logs.append(log_entry)
                     self.log_window.insert(tk.END, log_entry["text"] + "\n")
-            
             self.log_window.config(state='disabled')
             self.log_window.see(tk.END)
         except:
             pass
 
     def update_log_filter(self):
-        """Обновляет фильтр логов"""
         self.update_log_display()
 
     def clear_all_logs(self):
-        """Очищает все логи"""
         self.all_logs.clear()
         self.filtered_logs.clear()
         if self.log_window:
@@ -293,39 +283,31 @@ class UIManager:
         self.app.log_message("Все логи очищены", "status")
 
     def clear_status(self):
-        """Очищает индикатор статуса"""
         if self.status_text:
             self.status_text.config(state='normal')
             self.status_text.delete('1.0', tk.END)
             self.status_text.config(state='disabled')
 
     def save_logs_to_file(self):
-        """Сохраняет логи в файл"""
         try:
             filename = filedialog.asksaveasfilename(
                 defaultextension=".txt",
                 filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
                 initialfile=f"logs_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             )
-            
             if filename:
                 with open(filename, 'w', encoding='utf-8') as f:
                     f.write("Логи DPI GUI\n")
                     f.write("=" * 50 + "\n")
                     f.write(f"Сохранено: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                     f.write("=" * 50 + "\n\n")
-                    
                     for log_entry in self.all_logs:
                         f.write(log_entry["text"] + "\n")
-                
                 messagebox.showinfo("Успех", f"Логи сохранены в файл:\n{filename}")
-                self.app.log_message(f"Логи сохранены в файл: {filename}", "success")
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось сохранить логи:\n{e}")
-            self.app.log_message(f"Ошибка сохранения логов: {e}", "error")
 
     def set_controls_state(self, state):
-        """Устанавливает состояние элементов управления"""
         self.app.run_button.config(state=state)
         self.app.install_service_button.config(state=state)
         combobox_state = "readonly" if state == tk.NORMAL else tk.DISABLED

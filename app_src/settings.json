@@ -1,7 +1,7 @@
 {
     "selected_profile": "1.8.5 - General (ALT7)",
     "game_filter": false,
-    "use_ipset": true,
+    "ipset_selection": "ipset-one.txt",
     "selected_lists": {
         "discord": true,
         "list-general": true,
