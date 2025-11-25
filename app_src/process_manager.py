@@ -52,6 +52,7 @@ def start_process(profile, base_dir, game_filter_enabled, log_callback, combined
             
         game_filter_value = "1024-65535" if game_filter_enabled else "0"
         
+        # Формируем базовые аргументы из профиля
         args_str = profile["args"].format(
             LISTS_DIR=os.path.join(base_dir, 'lists'),
             BIN_DIR=bin_dir,
@@ -66,17 +67,23 @@ def start_process(profile, base_dir, game_filter_enabled, log_callback, combined
         
         final_args = []
         for arg in base_args:
+            # Обработка списка хостов (доменов)
             if arg.startswith('--hostlist=') and 'list-general.txt' in arg:
                 if combined_list_path:
+                    # subprocess сам добавит кавычки если нужно, поэтому здесь подаем чистый путь
                     final_args.append(f'--hostlist={combined_list_path}')
                 else:
                     log_callback(f"WARNING: Объединенный список пуст, аргумент '{arg}' пропущен.")
+            
+            # Обработка IPSet (IP-адресов)
             elif arg.startswith('--ipset='):
                 if ipset_path:
-                    # Заменяем стандартный путь из профиля на выбранный пользователем
-                    final_args.append(f'--ipset="{ipset_path}"')
+                    # Заменяем путь из профиля на выбранный пользователем
+                    # ВАЖНО: Не добавляем лишние кавычки вручную, subprocess сделает это сам
+                    final_args.append(f'--ipset={ipset_path}')
                 else:
-                    # Если IPSet выключен, пропускаем аргумент
+                    # Если IPSet выключен (OFF), мы просто ПРОПУСКАЕМ этот аргумент.
+                    # Это отключает фильтрацию по IP, и winws начинает обрабатывать всё подряд.
                     pass 
             else:
                 final_args.append(arg)
@@ -86,9 +93,10 @@ def start_process(profile, base_dir, game_filter_enabled, log_callback, combined
         log_callback("="*40)
         log_callback("ЗАПУСК ПРОЦЕССА")
         log_callback(f"Файл: {executable_path}")
-        log_callback("Аргументы:")
-        for i, arg in enumerate(final_args):
+        log_callback("Аргументы (первые 5):")
+        for i, arg in enumerate(final_args[:5]):
             log_callback(f"  [{i}]: {arg}")
+        if len(final_args) > 5: log_callback("  ...")
         log_callback("="*40)
         
         if not is_admin():
