@@ -6,6 +6,8 @@ import zipfile
 import shutil
 import ctypes
 import datetime
+import stat
+import time
 
 # --- КОНФИГУРАЦИЯ ---
 if getattr(sys, 'frozen', False):
@@ -29,6 +31,26 @@ def show_critical_error(message):
 def print_status(message):
     if sys.stdout:
         print(f"[Launcher] >> {message}")
+
+def remove_readonly(func, path, excinfo):
+    """Обработчик ошибок для shutil.rmtree, снимающий атрибут Read-Only (WinError 5)"""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception:
+        pass
+
+def force_stop_processes():
+    """Принудительно останавливает процессы winws.exe и службу перед обновлением"""
+    print_status("Остановка процессов перед обновлением...")
+    try:
+        # Остановка службы
+        subprocess.run(['sc', 'stop', "ZapretDPIBypass"], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        # Убийство процесса
+        subprocess.run(['taskkill', '/F', '/IM', 'winws.exe'], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        time.sleep(1) # Даем системе время освободить файлы
+    except Exception as e:
+        print_status(f"Ошибка при остановке процессов: {e}")
 
 def get_latest_winpython_url():
     print_status("Поиск последней портативной версии WinPython на GitHub...")
@@ -95,7 +117,7 @@ def setup_python():
     print_status("Распаковываю Python...")
     temp_unpack_dir = os.path.join(BASE_DIR, "temp_python_unpack")
     if os.path.exists(temp_unpack_dir):
-        shutil.rmtree(temp_unpack_dir)
+        shutil.rmtree(temp_unpack_dir, onerror=remove_readonly)
     
     try:
         with zipfile.ZipFile(temp_zip_path, 'r') as zf:
@@ -110,7 +132,7 @@ def setup_python():
             raise RuntimeError("Не удалось найти папку 'python' в распакованном архиве.")
 
         if os.path.exists(PYTHON_DIR):
-            shutil.rmtree(PYTHON_DIR)
+            shutil.rmtree(PYTHON_DIR, onerror=remove_readonly)
         
         shutil.move(source_python_dir, PYTHON_DIR)
 
@@ -119,7 +141,7 @@ def setup_python():
         return False
     finally:
         if os.path.exists(temp_unpack_dir):
-            shutil.rmtree(temp_unpack_dir)
+            shutil.rmtree(temp_unpack_dir, onerror=remove_readonly)
         
     print_status("Портативный Python успешно установлен.")
     return True
@@ -144,12 +166,17 @@ def get_local_commit_hash():
 
 def update_app_scripts(commit_hash, commit_date):
     print_status("Обновляю скрипты приложения...")
+    
+    # 1. Сначала останавливаем процессы, которые могут держать файлы
+    force_stop_processes()
+
     zip_url = f"https://github.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/archive/{commit_hash}.zip"
     temp_zip_path = os.path.join(BASE_DIR, 'app_update.zip')
     if not download_file(zip_url, temp_zip_path): return False
 
     temp_extract_dir = os.path.join(BASE_DIR, "temp_extract")
-    if os.path.exists(temp_extract_dir): shutil.rmtree(temp_extract_dir)
+    if os.path.exists(temp_extract_dir): 
+        shutil.rmtree(temp_extract_dir, onerror=remove_readonly)
     
     print_status("Распаковываю скрипты во временную папку...")
     try:
@@ -162,20 +189,38 @@ def update_app_scripts(commit_hash, commit_date):
     source_dir = os.path.join(temp_extract_dir, f"{GITHUB_REPO_NAME}-{commit_hash}", "app_src")
     if not os.path.exists(source_dir) or not os.path.exists(os.path.join(source_dir, "main.py")):
         show_critical_error(f"Папка 'app_src' с файлом 'main.py' не найдена в скачанном архиве.")
-        shutil.rmtree(temp_extract_dir)
+        shutil.rmtree(temp_extract_dir, onerror=remove_readonly)
         return False
 
     print_status("Проверка пройдена. Заменяю старые файлы...")
-    if os.path.exists(APP_DIR): shutil.rmtree(APP_DIR)
-    shutil.move(source_dir, APP_DIR)
-    shutil.rmtree(temp_extract_dir)
+    
+    # 2. Удаляем старую папку с обработкой ошибок доступа (WinError 5)
+    if os.path.exists(APP_DIR): 
+        try:
+            shutil.rmtree(APP_DIR, onerror=remove_readonly)
+        except Exception as e:
+            show_critical_error(f"Не удалось удалить старую версию приложения.\nУбедитесь, что winws.exe закрыт.\n\nОшибка: {e}")
+            return False
+
+    # Небольшая пауза, чтобы файловая система "отпустила" папку
+    time.sleep(0.5)
+
+    try:
+        shutil.move(source_dir, APP_DIR)
+    except Exception as e:
+        show_critical_error(f"Не удалось переместить новые файлы.\n\nОшибка: {e}")
+        return False
+
+    shutil.rmtree(temp_extract_dir, onerror=remove_readonly)
 
     # Сохраняем хеш
-    with open(VERSION_FILE, 'w') as f: f.write(commit_hash)
-    
-    # Сохраняем дату, если она есть
-    if commit_date:
-        with open(VERSION_DATE_FILE, 'w') as f: f.write(commit_date)
+    try:
+        with open(VERSION_FILE, 'w') as f: f.write(commit_hash)
+        # Сохраняем дату, если она есть
+        if commit_date:
+            with open(VERSION_DATE_FILE, 'w') as f: f.write(commit_date)
+    except Exception:
+        pass
         
     print_status("Скрипты успешно обновлены.")
     return True
