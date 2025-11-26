@@ -16,7 +16,8 @@ __pycache__/
 # Папки и файлы, управляемые лаунчером
 /python_runtime/
 app_update.zip
-app_src/.version_hash # Игнорируем только файл версии, а не всю папку
+app_src/.version_hash 
+app_src/.version_date
 
 # Файлы антизапрета (пользовательские данные)
 zapret-discord-youtube*

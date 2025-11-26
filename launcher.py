@@ -5,6 +5,7 @@ import requests
 import zipfile
 import shutil
 import ctypes
+import datetime
 
 # --- КОНФИГУРАЦИЯ ---
 if getattr(sys, 'frozen', False):
@@ -19,6 +20,7 @@ GITHUB_BRANCH = "main"
 PYTHON_DIR = os.path.join(BASE_DIR, "python_runtime")
 APP_DIR = os.path.join(BASE_DIR, "app_src")
 VERSION_FILE = os.path.join(APP_DIR, ".version_hash")
+VERSION_DATE_FILE = os.path.join(APP_DIR, ".version_date")
 # --------------------
 
 def show_critical_error(message):
@@ -122,20 +124,25 @@ def setup_python():
     print_status("Портативный Python успешно установлен.")
     return True
 
-def get_latest_commit_hash():
+def get_latest_commit_info():
+    """Возвращает кортеж (hash, date)"""
     api_url = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/commits/{GITHUB_BRANCH}"
     try:
         response = requests.get(api_url, timeout=10)
         response.raise_for_status()
-        return response.json()['sha']
-    except Exception: return None
+        data = response.json()
+        sha = data['sha']
+        # Дата коммита (обычно в ISO 8601: 2023-11-25T12:00:00Z)
+        date = data['commit']['committer']['date']
+        return sha, date
+    except Exception: return None, None
 
 def get_local_commit_hash():
     if os.path.exists(VERSION_FILE):
         with open(VERSION_FILE, 'r') as f: return f.read().strip()
     return None
 
-def update_app_scripts(commit_hash):
+def update_app_scripts(commit_hash, commit_date):
     print_status("Обновляю скрипты приложения...")
     zip_url = f"https://github.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/archive/{commit_hash}.zip"
     temp_zip_path = os.path.join(BASE_DIR, 'app_update.zip')
@@ -163,7 +170,13 @@ def update_app_scripts(commit_hash):
     shutil.move(source_dir, APP_DIR)
     shutil.rmtree(temp_extract_dir)
 
+    # Сохраняем хеш
     with open(VERSION_FILE, 'w') as f: f.write(commit_hash)
+    
+    # Сохраняем дату, если она есть
+    if commit_date:
+        with open(VERSION_DATE_FILE, 'w') as f: f.write(commit_date)
+        
     print_status("Скрипты успешно обновлены.")
     return True
 
@@ -183,19 +196,19 @@ def main():
     if not setup_python(): return
 
     print_status("Проверка обновлений скриптов...")
-    latest_hash = get_latest_commit_hash()
+    latest_hash, latest_date = get_latest_commit_info()
     local_hash = get_local_commit_hash()
 
     if not os.path.exists(APP_DIR):
         print_status("Папка с приложением не найдена, скачиваю последнюю версию...")
-        if not update_app_scripts(latest_hash):
+        if not update_app_scripts(latest_hash, latest_date):
              show_critical_error("Не удалось скачать скрипты приложения в первый раз. Выход.")
              return
     elif latest_hash is None:
         print_status("Не удалось проверить обновления. Запускаю локальную версию.")
     elif local_hash != latest_hash:
         print_status(f"Найдена новая версия (коммит: {latest_hash[:7]}).")
-        if not update_app_scripts(latest_hash):
+        if not update_app_scripts(latest_hash, latest_date):
             print_status("ОБНОВЛЕНИЕ НЕ УДАЛОСЬ. Запускаю старую версию.")
     else:
         print_status("У вас последняя версия скриптов.")

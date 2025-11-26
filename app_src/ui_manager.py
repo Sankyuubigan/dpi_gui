@@ -20,6 +20,7 @@ class UIManager:
         
     def setup_window(self):
         """Настраивает главное окно"""
+        # Читаем хеш
         version_hash = "unknown"
         version_file_path = os.path.join(self.app.app_dir, ".version_hash")
         if os.path.exists(version_file_path):
@@ -27,7 +28,26 @@ class UIManager:
                 full_hash = f.read().strip()
                 if full_hash:
                     version_hash = full_hash[:7]
-        self.app.root.title(f"DPI_GUI Launcher (Commit: {version_hash})")
+        
+        # Читаем дату
+        version_date = ""
+        date_file_path = os.path.join(self.app.app_dir, ".version_date")
+        if os.path.exists(date_file_path):
+            with open(date_file_path, 'r') as f:
+                raw_date = f.read().strip()
+                # Пытаемся отформатировать дату из ISO (2023-11-25T12:00:00Z) в читаемый вид
+                try:
+                    # Простой парсинг строки
+                    if 'T' in raw_date:
+                        date_part = raw_date.split('T')[0]
+                        time_part = raw_date.split('T')[1].replace('Z', '')[:5] # Берем только часы:минуты
+                        version_date = f" - {date_part} {time_part}"
+                    else:
+                        version_date = f" - {raw_date}"
+                except:
+                    version_date = f" - {raw_date}"
+
+        self.app.root.title(f"DPI_GUI Launcher (Commit: {version_hash}{version_date})")
         self.app.root.geometry("850x750")
         try:
             icon_path = os.path.join(self.app.app_dir, 'icon.ico')
