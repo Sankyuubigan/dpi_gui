@@ -41,11 +41,11 @@ class UIManager:
                     if 'T' in raw_date:
                         date_part = raw_date.split('T')[0]
                         time_part = raw_date.split('T')[1].replace('Z', '')[:5] # Берем только часы:минуты
-                        version_date = f" - {date_part} {time_part}"
+                        version_date = f" | {date_part} {time_part}"
                     else:
-                        version_date = f" - {raw_date}"
+                        version_date = f" | {raw_date}"
                 except:
-                    version_date = f" - {raw_date}"
+                    version_date = f" | {raw_date}"
 
         self.app.root.title(f"DPI_GUI Launcher (Commit: {version_hash}{version_date})")
         self.app.root.geometry("850x750")

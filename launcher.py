@@ -257,6 +257,11 @@ def main():
             print_status("ОБНОВЛЕНИЕ НЕ УДАЛОСЬ. Запускаю старую версию.")
     else:
         print_status("У вас последняя версия скриптов.")
+        # Если версия последняя, но файла с датой нет (например, обновились до добавления этой фичи), создаем его
+        if latest_date and not os.path.exists(VERSION_DATE_FILE):
+             try:
+                with open(VERSION_DATE_FILE, 'w') as f: f.write(latest_date)
+             except: pass
 
     pip_python_exe = os.path.join(PYTHON_DIR, 'python.exe')
     requirements_path = os.path.join(APP_DIR, 'requirements.txt')

@@ -42,10 +42,9 @@ def is_media_url(url):
         if 'rate=' in query and 'hash=' in query:
             return True
             
-        media_domains = ['phncdn.com', 'cdn', 'media', 'video', 'stream']
-        for domain in media_domains:
-            if domain in parsed.netloc.lower():
-                return True
+        # Убрана проверка по ключевым словам в домене (video, media и т.д.),
+        # так как она ложно срабатывала на сайты в зонах .video, .media и т.д.
+        
         return False
     except:
         return False
