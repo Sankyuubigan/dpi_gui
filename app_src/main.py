@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import os
 import sys
 import threading
@@ -356,17 +356,20 @@ class App:
             self.custom_list_path_label.config(text="(не выбран)", fg="gray")
 
     def select_custom_list_file(self):
-        file_path = filedialog.askopenfilename(
-            title="Выберите файл со списком доменов",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
-        )
-        if file_path:
-            self.list_manager.set_custom_list_path(file_path)
-            self.custom_list_path_label.config(text=os.path.basename(file_path), fg="black")
-            self.use_custom_list_var.set(True)
-        else:
-            if not self.list_manager.get_custom_list_path():
-                self.use_custom_list_var.set(False)
+        try:
+            file_path = filedialog.askopenfilename(
+                title="Выберите файл со списком доменов",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+            )
+            if file_path:
+                self.list_manager.set_custom_list_path(file_path)
+                self.custom_list_path_label.config(text=os.path.basename(file_path), fg="black")
+                self.use_custom_list_var.set(True)
+            else:
+                if not self.list_manager.get_custom_list_path():
+                    self.use_custom_list_var.set(False)
+        except Exception as e:
+            self._handle_ui_error(e)
 
     def install_service(self):
         try:
