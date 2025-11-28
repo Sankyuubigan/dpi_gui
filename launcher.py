@@ -26,34 +26,62 @@ VERSION_DATE_FILE = os.path.join(APP_DIR, ".version_date")
 # --------------------
 
 def show_critical_error(message):
-    ctypes.windll.user32.MessageBoxW(0, message, "Критическая ошибка лаунчера", 0x10)
+    try:
+        ctypes.windll.user32.MessageBoxW(0, message, "Критическая ошибка лаунчера", 0x10)
+    except:
+        print(f"CRITICAL ERROR: {message}")
 
 def print_status(message):
     if sys.stdout:
         print(f"[Launcher] >> {message}")
 
-def remove_readonly(func, path, excinfo):
-    """Обработчик ошибок для shutil.rmtree, снимающий атрибут Read-Only (WinError 5)"""
-    try:
-        os.chmod(path, stat.S_IWRITE)
-        func(path)
-    except Exception:
-        pass
-
 def force_stop_processes():
     """Принудительно останавливает процессы winws.exe и службу перед обновлением"""
-    print_status("Остановка процессов перед обновлением...")
+    print_status("Попытка остановки процессов...")
     try:
         # Остановка службы
         subprocess.run(['sc', 'stop', "ZapretDPIBypass"], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
         # Убийство процесса
         subprocess.run(['taskkill', '/F', '/IM', 'winws.exe'], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-        time.sleep(1) # Даем системе время освободить файлы
-    except Exception as e:
-        print_status(f"Ошибка при остановке процессов: {e}")
+        time.sleep(0.5) 
+    except Exception:
+        pass
+
+def safe_copy_overwrite(src_dir, dst_dir):
+    """
+    Копирует файлы из src_dir в dst_dir с перезаписью.
+    Если файл занят (PermissionError), он пропускается (актуально для драйверов).
+    """
+    if not os.path.exists(dst_dir):
+        os.makedirs(dst_dir)
+        
+    for item in os.listdir(src_dir):
+        s = os.path.join(src_dir, item)
+        d = os.path.join(dst_dir, item)
+        
+        if os.path.isdir(s):
+            safe_copy_overwrite(s, d)
+        else:
+            try:
+                # Пытаемся снять атрибут "Только чтение" если файл существует
+                if os.path.exists(d):
+                    try:
+                        os.chmod(d, stat.S_IWRITE)
+                    except: pass
+                
+                shutil.copy2(s, d)
+            except PermissionError:
+                # САМОЕ ВАЖНОЕ: Если файл занят (драйвер или exe), мы его ПРОПУСКАЕМ,
+                # но не крашимся. Скрипты (.py) обновятся, а бинарники останутся старыми (они редко меняются).
+                if item.endswith('.sys') or item.endswith('.exe') or item.endswith('.dll'):
+                    print_status(f"⚠ Файл занят, пропускаю обновление: {item}")
+                else:
+                    print_status(f"⚠ Ошибка доступа к файлу: {item}")
+            except Exception as e:
+                print_status(f"⚠ Ошибка при копировании {item}: {e}")
 
 def get_latest_winpython_url():
-    print_status("Поиск последней портативной версии WinPython на GitHub...")
+    print_status("Поиск Python...")
     api_url = "https://api.github.com/repos/winpython/winpython/releases"
     try:
         response = requests.get(api_url, timeout=15)
@@ -64,110 +92,80 @@ def get_latest_winpython_url():
                 continue
             for asset in release.get('assets', []):
                 if "Winpython64" in asset['name'] and asset['name'].endswith("dot.zip"):
-                    print_status(f"Найдена подходящая версия: {release['tag_name']}")
-                    print_status(f"Файл: {asset['name']}")
                     return asset['browser_download_url']
         return None
-    except requests.exceptions.RequestException as e:
-        show_critical_error(f"Не удалось получить список версий Python с GitHub.\n\nОшибка: {e}")
+    except:
         return None
 
 def download_file(url, dest_path):
     try:
-        print_status(f"Скачиваю {url.split('/')[-1]}...")
+        print_status(f"Скачиваю компонент...")
         response = requests.get(url, stream=True, timeout=30)
         response.raise_for_status()
-        total_size = int(response.headers.get('content-length', 0))
         with open(dest_path, 'wb') as f:
-            downloaded = 0
             for chunk in response.iter_content(chunk_size=8192):
                 if not chunk: continue
                 f.write(chunk)
-                downloaded += len(chunk)
-                if sys.stdout:
-                    if total_size > 0:
-                        done = int(50 * downloaded / total_size)
-                        sys.stdout.write(f"\r    -> [{'=' * done}{' ' * (50 - done)}] {downloaded / (1024 * 1024):.2f} / {total_size / (1024 * 1024):.2f} MB")
-                    else:
-                        sys.stdout.write(f"\r    -> Скачано: {downloaded / (1024 * 1024):.2f} MB")
-                    sys.stdout.flush()
-        if sys.stdout:
-            sys.stdout.write('\n')
         return True
-    except requests.exceptions.RequestException as e:
-        show_critical_error(f"Не удалось скачать файл: {url}\n\nПроверьте подключение к интернету.\n\nОшибка: {e}")
+    except Exception as e:
+        show_critical_error(f"Ошибка загрузки: {e}")
         return False
 
 def setup_python():
     python_exe_path = os.path.join(PYTHON_DIR, 'python.exe')
     if os.path.exists(python_exe_path):
-        print_status("Портативный Python уже установлен.")
         return True
 
     python_url = get_latest_winpython_url()
     if not python_url:
-        show_critical_error("Не удалось найти подходящую для скачивания версию WinPython на GitHub.")
+        show_critical_error("Не удалось найти ссылку на Python.")
         return False
 
-    print_status(f"Портативный Python не найден. Скачиваю...")
     temp_zip_path = os.path.join(BASE_DIR, 'python.zip')
     if not download_file(python_url, temp_zip_path):
         return False
 
-    print_status("Распаковываю Python...")
+    print_status("Распаковка Python...")
     temp_unpack_dir = os.path.join(BASE_DIR, "temp_python_unpack")
-    if os.path.exists(temp_unpack_dir):
-        shutil.rmtree(temp_unpack_dir, onerror=remove_readonly)
     
     try:
-        with zipfile.ZipFile(temp_zip_path, 'r') as zf:
-            zf.extractall(temp_unpack_dir)
+        if os.path.exists(temp_unpack_dir): shutil.rmtree(temp_unpack_dir, ignore_errors=True)
+        with zipfile.ZipFile(temp_zip_path, 'r') as zf: zf.extractall(temp_unpack_dir)
         os.remove(temp_zip_path)
 
         unpacked_root_name = next(os.scandir(temp_unpack_dir)).name
         unpacked_root_path = os.path.join(temp_unpack_dir, unpacked_root_name)
         source_python_dir = os.path.join(unpacked_root_path, 'python')
 
-        if not os.path.exists(source_python_dir):
-            raise RuntimeError("Не удалось найти папку 'python' в распакованном архиве.")
-
-        if os.path.exists(PYTHON_DIR):
-            shutil.rmtree(PYTHON_DIR, onerror=remove_readonly)
-        
+        if os.path.exists(PYTHON_DIR): shutil.rmtree(PYTHON_DIR, ignore_errors=True)
         shutil.move(source_python_dir, PYTHON_DIR)
-
+        shutil.rmtree(temp_unpack_dir, ignore_errors=True)
     except Exception as e:
-        show_critical_error(f"Не удалось распаковать или переместить архив с Python.\n\nОшибка: {e}")
+        show_critical_error(f"Ошибка установки Python: {e}")
         return False
-    finally:
-        if os.path.exists(temp_unpack_dir):
-            shutil.rmtree(temp_unpack_dir, onerror=remove_readonly)
         
-    print_status("Портативный Python успешно установлен.")
     return True
 
 def get_latest_commit_info():
-    """Возвращает кортеж (hash, date)"""
     api_url = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/commits/{GITHUB_BRANCH}"
     try:
         response = requests.get(api_url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        sha = data['sha']
-        # Дата коммита (обычно в ISO 8601: 2023-11-25T12:00:00Z)
-        date = data['commit']['committer']['date']
-        return sha, date
-    except Exception: return None, None
+        if response.status_code == 200:
+            data = response.json()
+            return data['sha'], data['commit']['committer']['date']
+    except: pass
+    return None, None
 
 def get_local_commit_hash():
     if os.path.exists(VERSION_FILE):
-        with open(VERSION_FILE, 'r') as f: return f.read().strip()
+        try:
+            with open(VERSION_FILE, 'r') as f: return f.read().strip()
+        except: pass
     return None
 
 def update_app_scripts(commit_hash, commit_date):
-    print_status("Обновляю скрипты приложения...")
+    print_status("Загрузка обновления...")
     
-    # 1. Сначала останавливаем процессы, которые могут держать файлы
     force_stop_processes()
 
     zip_url = f"https://github.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/archive/{commit_hash}.zip"
@@ -175,54 +173,33 @@ def update_app_scripts(commit_hash, commit_date):
     if not download_file(zip_url, temp_zip_path): return False
 
     temp_extract_dir = os.path.join(BASE_DIR, "temp_extract")
-    if os.path.exists(temp_extract_dir): 
-        shutil.rmtree(temp_extract_dir, onerror=remove_readonly)
     
-    print_status("Распаковываю скрипты во временную папку...")
     try:
+        if os.path.exists(temp_extract_dir): shutil.rmtree(temp_extract_dir, ignore_errors=True)
         with zipfile.ZipFile(temp_zip_path, 'r') as zf: zf.extractall(temp_extract_dir)
         os.remove(temp_zip_path)
     except Exception as e:
-        show_critical_error(f"Не удалось распаковать архив со скриптами.\n\nОшибка: {e}")
+        show_critical_error(f"Ошибка распаковки: {e}")
         return False
 
     source_dir = os.path.join(temp_extract_dir, f"{GITHUB_REPO_NAME}-{commit_hash}", "app_src")
-    if not os.path.exists(source_dir) or not os.path.exists(os.path.join(source_dir, "main.py")):
-        show_critical_error(f"Папка 'app_src' с файлом 'main.py' не найдена в скачанном архиве.")
-        shutil.rmtree(temp_extract_dir, onerror=remove_readonly)
+    if not os.path.exists(source_dir):
+        show_critical_error("Неверная структура архива обновления.")
         return False
 
-    print_status("Проверка пройдена. Заменяю старые файлы...")
+    print_status("Установка обновления (безопасный режим)...")
     
-    # 2. Удаляем старую папку с обработкой ошибок доступа (WinError 5)
-    if os.path.exists(APP_DIR): 
-        try:
-            shutil.rmtree(APP_DIR, onerror=remove_readonly)
-        except Exception as e:
-            show_critical_error(f"Не удалось удалить старую версию приложения.\nУбедитесь, что winws.exe закрыт.\n\nОшибка: {e}")
-            return False
-
-    # Небольшая пауза, чтобы файловая система "отпустила" папку
-    time.sleep(0.5)
+    # ВМЕСТО УДАЛЕНИЯ ПАПКИ - КОПИРУЕМ С ПЕРЕЗАПИСЬЮ И ПРОПУСКОМ ОШИБОК
+    safe_copy_overwrite(source_dir, APP_DIR)
 
     try:
-        shutil.move(source_dir, APP_DIR)
-    except Exception as e:
-        show_critical_error(f"Не удалось переместить новые файлы.\n\nОшибка: {e}")
-        return False
-
-    shutil.rmtree(temp_extract_dir, onerror=remove_readonly)
-
-    # Сохраняем хеш
-    try:
+        shutil.rmtree(temp_extract_dir, ignore_errors=True)
         with open(VERSION_FILE, 'w') as f: f.write(commit_hash)
-        # Сохраняем дату, если она есть
         if commit_date:
             with open(VERSION_DATE_FILE, 'w') as f: f.write(commit_date)
-    except Exception:
-        pass
+    except: pass
         
-    print_status("Скрипты успешно обновлены.")
+    print_status("Обновление завершено.")
     return True
 
 def main():
@@ -234,66 +211,48 @@ def main():
         sys.stdout = open(os.path.join(log_dir, 'launcher.log'), 'w', encoding='utf-8')
         sys.stderr = sys.stdout
 
-    print_status("="*40)
-    print_status(f"Запуск DPI-GUI Launcher из {BASE_DIR}")
-    print_status("="*40)
-
     if not setup_python(): return
 
-    print_status("Проверка обновлений скриптов...")
     latest_hash, latest_date = get_latest_commit_info()
     local_hash = get_local_commit_hash()
 
     if not os.path.exists(APP_DIR):
-        print_status("Папка с приложением не найдена, скачиваю последнюю версию...")
-        if not update_app_scripts(latest_hash, latest_date):
-             show_critical_error("Не удалось скачать скрипты приложения в первый раз. Выход.")
+        print_status("Первичная установка...")
+        if latest_hash and not update_app_scripts(latest_hash, latest_date):
+             show_critical_error("Не удалось установить приложение.")
              return
-    elif latest_hash is None:
-        print_status("Не удалось проверить обновления. Запускаю локальную версию.")
-    elif local_hash != latest_hash:
-        print_status(f"Найдена новая версия (коммит: {latest_hash[:7]}).")
-        if not update_app_scripts(latest_hash, latest_date):
-            print_status("ОБНОВЛЕНИЕ НЕ УДАЛОСЬ. Запускаю старую версию.")
+    elif latest_hash and local_hash != latest_hash:
+        print_status(f"Обновление: {latest_hash[:7]}")
+        update_app_scripts(latest_hash, latest_date)
     else:
-        print_status("У вас последняя версия скриптов.")
-        # Если версия последняя, но файла с датой нет (например, обновились до добавления этой фичи), создаем его
+        print_status("Версия актуальна.")
+        # Создаем файл даты, если его нет
         if latest_date and not os.path.exists(VERSION_DATE_FILE):
              try:
                 with open(VERSION_DATE_FILE, 'w') as f: f.write(latest_date)
              except: pass
 
+    # Установка зависимостей
     pip_python_exe = os.path.join(PYTHON_DIR, 'python.exe')
     requirements_path = os.path.join(APP_DIR, 'requirements.txt')
     if os.path.exists(requirements_path):
-        pip_command = [pip_python_exe, '-m', 'pip', 'install', '-r', requirements_path]
-        print_status("Проверка и установка зависимостей...")
-        
+        print_status("Проверка библиотек...")
         creation_flags = subprocess.CREATE_NO_WINDOW if is_windowed else 0
-        subprocess.run(pip_command, check=True, capture_output=True, text=True, creationflags=creation_flags)
-        print_status("Зависимости успешно установлены.")
+        subprocess.run([pip_python_exe, '-m', 'pip', 'install', '-r', requirements_path], 
+                      capture_output=True, creationflags=creation_flags)
 
     main_script_path = os.path.join(APP_DIR, 'main.py')
     if not os.path.exists(main_script_path):
-        show_critical_error(f"Основной скрипт 'main.py' не найден по пути:\n{main_script_path}")
+        show_critical_error(f"Файл main.py не найден!")
         return
         
     python_gui_exe = os.path.join(PYTHON_DIR, 'pythonw.exe')
-    command = [python_gui_exe, main_script_path]
     
-    print_status("Запускаю основное приложение...")
-    print_status(f"Команда: {command}")
-    print_status("-" * 40)
-    
+    print_status("Запуск...")
     try:
-        subprocess.Popen(command, cwd=APP_DIR)
-    except FileNotFoundError:
-        show_critical_error(f"Не удалось запустить Python. Исполняемый файл не найден по пути:\n{python_gui_exe}")
+        subprocess.Popen([python_gui_exe, main_script_path], cwd=APP_DIR)
     except Exception as e:
-        show_critical_error(f"Неизвестная ошибка при запуске приложения.\n\n{e}")
-    
-    if not is_windowed:
-        print_status("Приложение запущено. Лаунчер завершает работу.")
+        show_critical_error(f"Ошибка запуска: {e}")
 
 if __name__ == "__main__":
     main()

@@ -4,6 +4,9 @@ import os
 import sys
 import datetime
 import glob
+import threading
+import requests
+import json
 from text_utils import setup_text_widget_bindings
 
 class UIManager:
@@ -32,20 +35,15 @@ class UIManager:
         # Читаем дату
         version_date = ""
         date_file_path = os.path.join(self.app.app_dir, ".version_date")
+        
+        # Если файла даты нет, но есть хеш — пробуем получить дату асинхронно
+        if not os.path.exists(date_file_path) and version_hash != "unknown":
+            threading.Thread(target=self._fetch_and_save_date, args=(full_hash,), daemon=True).start()
+        
         if os.path.exists(date_file_path):
             with open(date_file_path, 'r') as f:
                 raw_date = f.read().strip()
-                # Пытаемся отформатировать дату из ISO (2023-11-25T12:00:00Z) в читаемый вид
-                try:
-                    # Простой парсинг строки
-                    if 'T' in raw_date:
-                        date_part = raw_date.split('T')[0]
-                        time_part = raw_date.split('T')[1].replace('Z', '')[:5] # Берем только часы:минуты
-                        version_date = f" | {date_part} {time_part}"
-                    else:
-                        version_date = f" | {raw_date}"
-                except:
-                    version_date = f" | {raw_date}"
+                version_date = self._format_date(raw_date)
 
         self.app.root.title(f"DPI_GUI Launcher (Commit: {version_hash}{version_date})")
         self.app.root.geometry("850x750")
@@ -53,6 +51,38 @@ class UIManager:
             icon_path = os.path.join(self.app.app_dir, 'icon.ico')
             if os.path.exists(icon_path):
                 self.app.root.iconbitmap(icon_path)
+        except Exception:
+            pass
+
+    def _format_date(self, raw_date):
+        """Форматирует дату из ISO в читаемый вид"""
+        try:
+            if 'T' in raw_date:
+                date_part = raw_date.split('T')[0]
+                time_part = raw_date.split('T')[1].replace('Z', '')[:5]
+                return f" | {date_part} {time_part}"
+            return f" | {raw_date}"
+        except:
+            return f" | {raw_date}"
+
+    def _fetch_and_save_date(self, commit_hash):
+        """Запрашивает дату коммита через API GitHub и сохраняет её"""
+        try:
+            url = f"https://api.github.com/repos/Sankyuubigan/dpi_gui/commits/{commit_hash}"
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                date_str = data['commit']['committer']['date']
+                
+                # Сохраняем файл
+                date_file_path = os.path.join(self.app.app_dir, ".version_date")
+                with open(date_file_path, 'w') as f:
+                    f.write(date_str)
+                
+                # Обновляем заголовок окна в главном потоке
+                formatted_date = self._format_date(date_str)
+                short_hash = commit_hash[:7]
+                self.app.root.after(0, lambda: self.app.root.title(f"DPI_GUI Launcher (Commit: {short_hash}{formatted_date})"))
         except Exception:
             pass
 
