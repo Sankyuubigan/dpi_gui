@@ -1,10 +1,5 @@
-ctypes
-executor
-glob
-process_manager
 requests
 selenium
-shlex
-time
-urllib
-zipfile
+pyinstaller
+psutil
+pywin32
