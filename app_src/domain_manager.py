@@ -152,8 +152,8 @@ class DomainManager:
             self.domain_log(f"ОШИБКА при сохранении: {e}")
 
     def _propose_restart_after_domain_update(self):
-        import process_manager
-        if process_manager.is_process_running():
-            if messagebox.askyesno("Перезапуск", "Домены добавлены. Перезапустить профиль?"):
+        # Поскольку теперь поддерживается несколько процессов, 
+        # простой перезапуск не всегда очевиден. Спросим пользователя об остановке.
+        if self.app.active_processes:
+            if messagebox.askyesno("Обновление", "Домены добавлены. Чтобы изменения вступили в силу, нужно перезапустить процессы.\n\nОстановить все текущие процессы?"):
                 self.app.stop_process()
-                self.app.root.after(1500, self.app.run_selected_profile)

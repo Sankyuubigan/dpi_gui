@@ -3,6 +3,7 @@ import subprocess
 import shutil
 import time
 import json
+import shlex
 
 from process_manager import is_process_running, is_service_running, ZAPRET_SERVICE_NAME, WINWS_EXE
 
@@ -30,42 +31,57 @@ def check_status(base_dir, log_callback, log_header=True):
         log_callback("--- ПРОВЕРКА СТАТУСА ---")
     
     if is_process_running():
-        log_callback("[+] Разовый запуск (winws.exe): АКТИВЕН")
+        log_callback("[+] Процессы winws.exe: ОБНАРУЖЕНЫ")
     else:
-        log_callback("[-] Разовый запуск (winws.exe): НЕ АКТИВЕН")
+        log_callback("[-] Процессы winws.exe: НЕ ОБНАРУЖЕНЫ")
     
     if is_service_running():
-        log_callback(f"[+] Автозапуск (служба {ZAPRET_SERVICE_NAME}): АКТИВЕН")
+        log_callback(f"[+] Служба {ZAPRET_SERVICE_NAME}: АКТИВНА")
     else:
-        log_callback(f"[-] Автозапуск (служба {ZAPRET_SERVICE_NAME}): НЕ АКТИВЕН")
-        
-    app_settings = load_app_settings(base_dir)
-    if app_settings.get("game_filter", False):
-         log_callback("[+] Игровой фильтр: ВКЛЮЧЕН")
-    else:
-         log_callback("[-] Игровой фильтр: ВЫКЛЮЧЕН")
-
-    ipset_sel = app_settings.get("ipset_selection", "OFF")
-    if ipset_sel != "OFF":
-        log_callback(f"[+] IPSet: ВКЛЮЧЕН (Файл: {ipset_sel})")
-    else:
-        log_callback("[-] IPSet: ВЫКЛЮЧЕН")
+        log_callback(f"[-] Служба {ZAPRET_SERVICE_NAME}: НЕ АКТИВНА")
 
     if log_header:
         log_callback("="*40 + "\n")
 
-def install_service(base_dir, log_callback, profile):
+def install_service(base_dir, log_callback, profile, specific_list_path=None):
+    """
+    Установка службы с поддержкой конкретного списка.
+    Если specific_list_path не передан, будет использоваться дефолтный list-general (как в профиле).
+    """
     log_callback(f"\n--- Установка службы для профиля: {profile['name']} ---")
     
     bin_dir = os.path.join(base_dir, 'bin')
     lists_dir = os.path.join(base_dir, 'lists')
     executable_path = os.path.join(bin_dir, WINWS_EXE)
     
-    args_str = profile["args"].format(
+    raw_args = profile["args"].format(
         LISTS_DIR=lists_dir,
         BIN_DIR=bin_dir,
         GAME_FILTER="1024-65535"
     )
+
+    # Логика подмены списка для службы (аналогично process_manager)
+    final_args_list = []
+    if specific_list_path:
+         try:
+            args_list = shlex.split(raw_args)
+         except:
+            args_list = raw_args.split()
+            
+         for arg in args_list:
+             if arg.startswith('--hostlist=') and 'list-general.txt' in arg:
+                  prefix = arg.split('=')[0]
+                  final_args_list.append(f'{prefix}={specific_list_path}')
+             elif arg.startswith('--ipset='):
+                 pass # Для службы пока игнорируем или берем дефолт, т.к. UI сложнее
+             else:
+                 final_args_list.append(arg)
+    else:
+         # Если список не передан, берем raw как есть
+         final_args_list = shlex.split(raw_args)
+
+    # Собираем строку аргументов обратно
+    args_str = " ".join(final_args_list)
     
     bin_path = f'"{executable_path}" {args_str}'
 
@@ -108,6 +124,5 @@ def clear_discord_cache(base_dir, log_callback):
                 try:
                     shutil.rmtree(dir_to_delete)
                     log_callback(f"[+] Удалено: {cache_dir}")
-                except:
-                    log_callback(f"[!] Не удалось удалить: {cache_dir}")
+                except: pass
     log_callback("--- Очистка кэша завершена ---\n")
