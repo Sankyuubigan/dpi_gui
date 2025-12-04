@@ -36,10 +36,11 @@ def _clean_profile_args(args_str):
     cleaned = re.sub(r'--wf-udp=[^ ]+', '', cleaned)
     return cleaned.strip()
 
-def start_combined_process(configs, base_dir, game_filter_enabled, log_callback, ipset_path=None):
+def start_combined_process(configs, base_dir, game_filter_enabled, log_callback):
     """
     Запускает ОДИН процесс для нескольких конфигураций.
-    configs: список кортежей [(list_path, profile_obj), ...]
+    configs: список кортежей [(list_path, profile_obj, ipset_path), ...]
+    ipset_path может быть None, если выключен.
     """
     bin_dir = os.path.join(base_dir, 'bin')
     executable_path = os.path.join(bin_dir, WINWS_EXE)
@@ -61,7 +62,7 @@ def start_combined_process(configs, base_dir, game_filter_enabled, log_callback,
     final_args = list(global_args)
 
     # 2. Сборка аргументов для каждого списка
-    for i, (list_path, profile) in enumerate(configs):
+    for i, (list_path, profile, ipset_path) in enumerate(configs):
         if i > 0:
             final_args.append("--new")
             
@@ -90,16 +91,17 @@ def start_combined_process(configs, base_dir, game_filter_enabled, log_callback,
                  else:
                      processed_args.append(arg)
             elif arg.startswith('--ipset='):
+                # Если передан конкретный ipset для этого списка - используем его
                 if ipset_path:
                     processed_args.append(f'--ipset={ipset_path}')
                 else:
+                    # Если ipset выключен (None), мы пропускаем этот аргумент,
+                    # тем самым убирая ipset из профиля (если он там был)
                     pass 
             else:
                 processed_args.append(arg)
         
         final_args.extend(processed_args)
-
-    # УДАЛЕНО: --uid. Он вызывал ошибку.
 
     final_command = [executable_path] + final_args
 

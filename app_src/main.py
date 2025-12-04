@@ -35,7 +35,6 @@ class App:
         self.root = root
         
         # Словарь активных процессов теперь будет содержать только один элемент при общем запуске
-        # {pid: {'proc': subprocess, 'lists': [list_names], 'single_mode': True}}
         self.active_processes = {}
         self.log_queue = queue.Queue()
         
@@ -100,14 +99,15 @@ class App:
 
         self.log_message("=== ЗАПУСК ЕДИНОГО ПРОЦЕССА ===", "status")
         
-        mapping = self.list_manager.get_mapping()
+        prof_mapping = self.list_manager.get_mapping()
+        ipset_mapping = self.list_manager.get_ipset_mapping()
         available_lists = self.list_manager.get_available_files()
         
-        configs_to_run = [] # Список кортежей (путь, профиль)
+        configs_to_run = [] # Список кортежей (путь, профиль, путь_к_ipset)
         active_list_names = []
         
         for list_filename in available_lists:
-            profile_name = mapping.get(list_filename, "ОТКЛЮЧЕНО")
+            profile_name = prof_mapping.get(list_filename, "ОТКЛЮЧЕНО")
             
             if profile_name == "ОТКЛЮЧЕНО" or not profile_name:
                 continue
@@ -121,8 +121,18 @@ class App:
             if not os.path.exists(full_list_path):
                 self.log_message(f"Файл не найден: {list_filename}", "error")
                 continue
-                
-            configs_to_run.append((full_list_path, profile_obj))
+            
+            # Получаем IPSet для конкретного списка
+            ipset_setting = ipset_mapping.get(list_filename, "OFF")
+            ipset_path = None
+            if ipset_setting and ipset_setting != "OFF":
+                potential_path = os.path.join(self.app_dir, 'ipsets', ipset_setting)
+                if os.path.exists(potential_path):
+                    ipset_path = potential_path
+                else:
+                    self.log_message(f"Предупреждение: IPSet файл '{ipset_setting}' не найден для списка {list_filename}", "error")
+
+            configs_to_run.append((full_list_path, profile_obj, ipset_path))
             active_list_names.append(list_filename)
 
         if not configs_to_run:
@@ -131,18 +141,11 @@ class App:
 
         # Запуск
         try:
-            ipset_selection = self.ipset_selection_var.get()
-            ipset_path = None
-            if ipset_selection and ipset_selection != "OFF":
-                potential_path = os.path.join(self.app_dir, 'ipsets', ipset_selection)
-                if os.path.exists(potential_path):
-                    ipset_path = potential_path
-
             game_filter_enabled = self.game_filter_var.get()
             
             process = process_manager.start_combined_process(
                 configs_to_run, self.app_dir, game_filter_enabled, 
-                self.log_message, ipset_path
+                self.log_message
             )
             
             if process:
@@ -237,8 +240,8 @@ class App:
     def save_app_settings(self):
         settings_data = {
             "game_filter": self.game_filter_var.get(),
-            "ipset_selection": self.ipset_selection_var.get(),
-            "list_profile_map": self.list_manager.get_mapping()
+            "list_profile_map": self.list_manager.get_mapping(),
+            "list_ipset_map": self.list_manager.get_ipset_mapping()
         }
         settings_manager.save_app_settings(settings_data, self.app_dir)
         self.log_message("Настройки сохранены.", "success")
@@ -248,13 +251,10 @@ class App:
         
         self.game_filter_var.set(settings.get("game_filter", False))
         
-        ipset_val = settings.get("ipset_selection")
-        if ipset_val:
-            self.ipset_selection_var.set(ipset_val)
-        else:
-            self.ipset_selection_var.set("OFF")
-        
-        self.list_manager.set_mapping(settings.get("list_profile_map", {}))
+        self.list_manager.set_mappings(
+            settings.get("list_profile_map", {}),
+            settings.get("list_ipset_map", {})
+        )
         
         self.ui_manager.refresh_lists_table()
         self.log_message("Настройки загружены.", "success")
