@@ -7,7 +7,10 @@ import glob
 import threading
 import requests
 import json
+import webbrowser
 from text_utils import setup_text_widget_bindings
+# Импорт нашего нового граббера
+import ip_grabber
 
 class UIManager:
     """Класс для управления пользовательским интерфейсом"""
@@ -22,6 +25,8 @@ class UIManager:
         self.scroll_frame_inner = None
         
         self.all_logs = []
+        self.btn_start_all = None
+        self.btn_stop_all = None
         
     def setup_window(self):
         """Настраивает главное окно"""
@@ -68,16 +73,13 @@ class UIManager:
         top_panel = ttk.Frame(parent)
         top_panel.pack(fill=tk.X, pady=(0, 10))
         
-        self.btn_start_all = ttk.Button(top_panel, text="▶ ЗАПУСТИТЬ ВСЕ АКТИВНЫЕ", command=self.app.run_all_configured)
+        self.btn_start_all = ttk.Button(top_panel, text="▶ ЗАПУСТИТЬ", command=self.app.run_all_configured)
         self.btn_start_all.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         
-        self.btn_stop_all = ttk.Button(top_panel, text="⬛ ОСТАНОВИТЬ ВСЁ", command=self.app.stop_process)
+        self.btn_stop_all = ttk.Button(top_panel, text="⬛ ОСТАНОВИТЬ", command=self.app.stop_process, state=tk.DISABLED)
         self.btn_stop_all.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
         # === СРЕДНЯЯ ЧАСТЬ: ТАБЛИЦА СПИСКОВ ===
-        # Используем PanedWindow для разделения таблицы и логов, или просто Frame с весом
-        # Сделаем Frame для таблицы с фиксированной высотой или весом
-        
         table_container = ttk.Frame(parent)
         table_container.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
@@ -243,6 +245,15 @@ class UIManager:
                 widgets["status_lbl"].config(text="Остановлен", fg="#999999")
                 widgets["pid_lbl"].config(text="-")
 
+    def update_buttons_state(self, is_running):
+        """Обновляет состояние кнопок запуска/остановки"""
+        if is_running:
+            self.btn_start_all.config(state=tk.DISABLED)
+            self.btn_stop_all.config(state=tk.NORMAL)
+        else:
+            self.btn_start_all.config(state=tk.NORMAL)
+            self.btn_stop_all.config(state=tk.DISABLED)
+
     def create_settings_tab(self, parent):
         """Вкладка настроек, объединяющая Tools, Testing и Domains"""
         
@@ -262,7 +273,6 @@ class UIManager:
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         
-        # Привязка колесика мыши
         def _on_settings_mousewheel(event):
             canvas.yview_scroll(int(-1*(event.delta/120)), "units")
         canvas.bind_all("<MouseWheel>", _on_settings_mousewheel)
@@ -275,8 +285,15 @@ class UIManager:
         self.app.game_filter_check = ttk.Checkbutton(settings_frame, text="Игровой фильтр (применять ко всем новым запускам)", variable=self.app.game_filter_var)
         self.app.game_filter_check.pack(anchor=tk.W, padx=5, pady=5)
         
-        ttk.Button(settings_frame, text="Проверить системный статус", command=self.app.check_status).pack(side=tk.LEFT, padx=5, pady=5)
-        ttk.Button(settings_frame, text="Открыть файл кастомного списка", command=self.app.open_custom_list).pack(side=tk.LEFT, padx=5, pady=5)
+        btn_frame = ttk.Frame(settings_frame)
+        btn_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(btn_frame, text="Проверить системный статус", command=self.app.check_status).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Открыть файл кастомного списка", command=self.app.open_custom_list).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="♻ Обновить программу", command=self.app.trigger_update).pack(side=tk.LEFT, padx=5)
+
+        # ДОБАВЛЕННАЯ КНОПКА IP GRABBER
+        ttk.Button(btn_frame, text="🔍 Создать IPSet из процесса", command=self.open_ip_grabber).pack(side=tk.LEFT, padx=5)
 
         # --- Раздел Тестирования ---
         testing_frame = ttk.LabelFrame(scrollable_frame, text="Тестирование")
@@ -307,6 +324,26 @@ class UIManager:
         domains_frame.pack(fill=tk.X, pady=10, padx=10)
         # Передаем этот фрейм менеджеру доменов для заполнения
         self.app.domain_manager.create_domains_tab(domains_frame)
+
+        # --- Ссылка на донат ---
+        support_frame = ttk.Frame(scrollable_frame)
+        support_frame.pack(fill=tk.X, pady=(20, 10), padx=10)
+
+        ttk.Label(support_frame, text="Отблагодарить автора (помощь и донаты):", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W)
+
+        link_url = "https://interesting-knowledges.vercel.app/docs/otblagodarit-avtora.-pomosch-proektam"
+        link_lbl = tk.Label(support_frame, text=link_url, fg="blue", cursor="hand2", font=("Segoe UI", 9, "underline"))
+        link_lbl.pack(anchor=tk.W, pady=2)
+        link_lbl.bind("<Button-1>", lambda e: webbrowser.open_new(link_url))
+
+    def open_ip_grabber(self):
+        """Открывает окно граббера IP"""
+        ip_grabber.show_ip_grabber(
+            self.app.root, 
+            self.app.app_dir, 
+            self.app.log_message,
+            self.refresh_lists_table # Коллбек для обновления списка файлов в таблице
+        )
 
     def update_log_display(self):
         if not self.log_window: return

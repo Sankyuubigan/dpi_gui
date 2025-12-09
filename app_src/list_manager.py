@@ -72,4 +72,3 @@ class ListManager:
     
     # Методы ниже оставлены для совместимости
     def set_custom_list_path(self, path): pass
-    def set_required_lists(self, req): pass

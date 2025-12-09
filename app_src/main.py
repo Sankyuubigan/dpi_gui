@@ -11,18 +11,36 @@ import time
 import datetime
 import ctypes
 
+# Глобальный обработчик ошибок
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    print(error_msg, file=sys.stderr) # Пишем в stderr, который ловит лаунчер
+    with open("crash_report.txt", "a", encoding="utf-8") as f:
+        f.write(f"\n--- CRASH {datetime.datetime.now()} ---\n")
+        f.write(error_msg)
+    try:
+        messagebox.showerror("Critical Error", f"Application crashed:\n{exc_value}")
+    except: pass
+
+sys.excepthook = global_exception_handler
+
 APP_SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP_SOURCE_DIR)
 
-from executor import is_custom_list_valid
-from list_manager import ListManager
-from profiles import PROFILES
-import process_manager
-import settings_manager
-import testing_utils
-import power_handler
-from ui_manager import UIManager
-from domain_manager import DomainManager
+try:
+    from executor import is_custom_list_valid
+    from list_manager import ListManager
+    from profiles import PROFILES
+    import process_manager
+    import settings_manager
+    import testing_utils
+    import power_handler
+    from ui_manager import UIManager
+    from domain_manager import DomainManager
+except Exception as e:
+    # Ошибка импорта
+    print(traceback.format_exc(), file=sys.stderr)
+    sys.exit(1)
 
 def run_as_admin():
     try:
@@ -157,6 +175,9 @@ class App:
                 
                 self.log_message(f"Процесс запущен (PID: {pid}). Активные списки: {len(active_list_names)}", "success")
                 
+                # ОБНОВЛЯЕМ СОСТОЯНИЕ КНОПОК
+                self.ui_manager.update_buttons_state(True)
+                
                 threading.Thread(target=self.read_process_output, args=(process, "winws"), daemon=True).start()
                 threading.Thread(target=self.wait_for_process_exit, args=(pid,), daemon=True).start()
                 
@@ -191,6 +212,10 @@ class App:
                 self.ui_manager.update_process_status_in_table(lname, False, None)
             
             self.log_message(f"Процесс остановлен (PID: {pid})", "status")
+            
+            # Если процессов больше нет (а он у нас всего один), обновляем кнопки
+            if not self.active_processes:
+                self.ui_manager.update_buttons_state(False)
 
     def log_queue_monitor(self):
         while True:
@@ -215,12 +240,45 @@ class App:
         
         # Сброс статусов в таблице
         self.ui_manager.refresh_lists_table()
+        
+        # Обновляем кнопки
+        self.ui_manager.update_buttons_state(False)
 
     def check_status(self, log_header=True):
         try:
             settings_manager.check_status(self.app_dir, self.log_message, log_header)
         except Exception as e:
             self._handle_ui_error(e)
+
+    def trigger_update(self):
+        """Перезапускает лаунчер с флагом обновления"""
+        if messagebox.askyesno("Обновление", "Приложение будет закрыто для проверки и установки обновлений.\nПродолжить?"):
+            try:
+                self.save_app_settings()
+                self.stop_process()
+                
+                launcher_path = os.environ.get("LAUNCHER_PATH")
+                if not launcher_path or not os.path.exists(launcher_path):
+                    # Пытаемся угадать, если запускаем из IDE
+                    potential_path = os.path.join(os.path.dirname(self.app_dir), "launcher.py")
+                    if os.path.exists(potential_path):
+                        # Запуск python скрипта
+                        subprocess.Popen([sys.executable, potential_path, "--update"], cwd=os.path.dirname(self.app_dir))
+                    else:
+                        # Пытаемся найти exe рядом
+                        potential_exe = os.path.join(os.path.dirname(self.app_dir), "dpi_gui_launcher.exe")
+                        if os.path.exists(potential_exe):
+                            subprocess.Popen([potential_exe, "--update"], cwd=os.path.dirname(self.app_dir))
+                        else:
+                            messagebox.showerror("Ошибка", "Не удалось найти файл лаунчера для перезапуска.")
+                            return
+                else:
+                    # Запуск exe
+                    subprocess.Popen([launcher_path, "--update"], cwd=os.path.dirname(launcher_path))
+                
+                self.root.quit()
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось запустить обновление:\n{e}")
 
     def on_closing(self):
         try:

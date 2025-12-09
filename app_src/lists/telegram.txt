@@ -1,0 +1,5 @@
+telegram.org
+t.me
+telegram.me
+web.telegram.org
+cdn-telegram.org
