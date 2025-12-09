@@ -21,17 +21,10 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 def is_admin():
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
-        return False
+    try: return ctypes.windll.shell32.IsUserAnAdmin()
+    except: return False
 
 def _clean_profile_args(args_str):
-    """
-    Удаляет глобальные аргументы захвата (--wf-...), 
-    чтобы они не конфликтовали при склейке через --new.
-    """
-    # Удаляем --wf-tcp=... и --wf-udp=...
     cleaned = re.sub(r'--wf-tcp=[^ ]+', '', args_str)
     cleaned = re.sub(r'--wf-udp=[^ ]+', '', cleaned)
     return cleaned.strip()
@@ -40,7 +33,8 @@ def start_combined_process(configs, base_dir, game_filter_enabled, log_callback)
     """
     Запускает ОДИН процесс для нескольких конфигураций.
     configs: список кортежей [(list_path, profile_obj, ipset_path), ...]
-    ipset_path может быть None, если выключен.
+    ВАЖНО: list_path может быть None (если это чисто ipset правило),
+           ipset_path может быть None (если это чисто domain правило).
     """
     bin_dir = os.path.join(base_dir, 'bin')
     executable_path = os.path.join(bin_dir, WINWS_EXE)
@@ -50,10 +44,8 @@ def start_combined_process(configs, base_dir, game_filter_enabled, log_callback)
         log_callback(f"КРИТИЧЕСКАЯ ОШИБКА: Файл не найден: {executable_path}")
         return None
 
-    # 1. Глобальные настройки захвата (фильтр WinDivert)
+    # Глобальные настройки (фильтр WinDivert)
     game_ports = ",1024-65535" if game_filter_enabled else ""
-    
-    # Захватываем весь нужный трафик глобально
     global_args = [
         f"--wf-tcp=80,443{game_ports}",
         f"--wf-udp=443,50000-65535{game_ports}"
@@ -61,46 +53,57 @@ def start_combined_process(configs, base_dir, game_filter_enabled, log_callback)
     
     final_args = list(global_args)
 
-    # 2. Сборка аргументов для каждого списка
     for i, (list_path, profile, ipset_path) in enumerate(configs):
         if i > 0:
             final_args.append("--new")
             
-        # Форматируем аргументы профиля
         raw_args = profile["args"].format(
             LISTS_DIR=lists_dir,
             BIN_DIR=bin_dir,
             GAME_FILTER="1024-65535" if game_filter_enabled else "0"
         )
         
-        # Очищаем от глобальных wf-фильтров (они уже заданы в начале)
         cleaned_args = _clean_profile_args(raw_args)
-        
-        try:
-            args_list = shlex.split(cleaned_args)
-        except:
-            args_list = cleaned_args.split()
+        try: args_list = shlex.split(cleaned_args)
+        except: args_list = cleaned_args.split()
             
-        # Подмена списка и IPSet
+        # Подмена
         processed_args = []
         for arg in args_list:
             if arg.startswith('--hostlist=') or arg.startswith('--hostlist-auto='):
-                 if 'list-general.txt' in arg or 'custom_list.txt' in arg:
+                 # Если у нас есть list_path, подставляем его.
+                 # Если list_path is None (это правило для ipset), то мы ПРОПУСКАЕМ этот аргумент,
+                 # так как --hostlist без файла не нужен, а ipset мы добавим ниже.
+                 if list_path:
                      prefix = arg.split('=')[0]
                      processed_args.append(f'{prefix}={list_path}')
                  else:
-                     processed_args.append(arg)
+                     pass # Удаляем hostlist из аргументов профиля, так как это правило только для IP
             elif arg.startswith('--ipset='):
-                # Если передан конкретный ipset для этого списка - используем его
                 if ipset_path:
                     processed_args.append(f'--ipset={ipset_path}')
                 else:
-                    # Если ipset выключен (None), мы пропускаем этот аргумент,
-                    # тем самым убирая ipset из профиля (если он там был)
-                    pass 
+                    pass # Удаляем ipset, если он не задан для этого правила
             else:
                 processed_args.append(arg)
         
+        # Если это правило IPSet и мы удалили hostlist, но ipset еще не добавлен (потому что в профиле его не было)
+        # нужно проверить, добавился ли он.
+        # Но логика выше: если arg startswith ipset -> заменяем.
+        # А если в профиле НЕ БЫЛО --ipset? (например профиль только для доменов).
+        # Тогда мы должны добавить его вручную, если ipset_path передан.
+        
+        # Простая проверка: если ipset_path есть, но в processed_args нет --ipset...
+        has_ipset_arg = any(a.startswith('--ipset=') for a in processed_args)
+        if ipset_path and not has_ipset_arg:
+             processed_args.append(f'--ipset={ipset_path}')
+             
+        # То же самое для hostlist, хотя вряд ли профиль будет без него
+        has_hostlist_arg = any(a.startswith('--hostlist') for a in processed_args)
+        if list_path and not has_hostlist_arg:
+            # Добавляем дефолтный hostlist аргумент, если профиль странный
+             processed_args.append(f'--hostlist={list_path}')
+
         final_args.extend(processed_args)
 
     final_command = [executable_path] + final_args
@@ -109,7 +112,7 @@ def start_combined_process(configs, base_dir, game_filter_enabled, log_callback)
         log_callback("ОШИБКА: Требуются права администратора")
         return None
 
-    log_callback(f"Запуск единого процесса для {len(configs)} списков...")
+    log_callback(f"Запуск единого процесса для {len(configs)} правил...")
     
     try:
         process = subprocess.Popen(
@@ -122,23 +125,21 @@ def start_combined_process(configs, base_dir, game_filter_enabled, log_callback)
             encoding='utf-8',
             errors='ignore'
         )
-        
         threading.Thread(target=monitor_memory_usage, args=(process, log_callback), daemon=True).start()
         return process
     except Exception as e:
         log_callback(f"КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА: {e}")
         return None
 
+# ... (остальные функции monitor, kill, stop без изменений) ...
 def monitor_memory_usage(process, log_callback):
     try:
         max_memory_mb = 1024
         while process and process.poll() is None:
             try:
                 p = psutil.Process(process.pid)
-                memory_mb = p.memory_info().rss / 1024 / 1024
-                if memory_mb > max_memory_mb:
-                    kill_process(process)
-                    break
+                if p.memory_info().rss / 1024 / 1024 > max_memory_mb:
+                    kill_process(process); break
             except: break
             time.sleep(5)
     except: pass
@@ -155,21 +156,18 @@ def kill_process(process):
 def stop_all_processes(log_callback=None):
     for proc in psutil.process_iter(['pid', 'name']):
         try:
-            if proc.info['name'] and proc.info['name'].lower() == WINWS_EXE.lower():
-                proc.terminate()
+            if proc.info['name'] and proc.info['name'].lower() == WINWS_EXE.lower(): proc.terminate()
         except: continue
     time.sleep(1)
     for proc in psutil.process_iter(['pid', 'name']):
         try:
-            if proc.info['name'] and proc.info['name'].lower() == WINWS_EXE.lower():
-                proc.kill()
+            if proc.info['name'] and proc.info['name'].lower() == WINWS_EXE.lower(): proc.kill()
         except: continue
 
 def is_process_running():
     for proc in psutil.process_iter(['pid', 'name']):
         try:
-            if proc.info['name'] and proc.info['name'].lower() == WINWS_EXE.lower():
-                return True
+            if proc.info['name'] and proc.info['name'].lower() == WINWS_EXE.lower(): return True
         except: pass
     return False
 
@@ -178,3 +176,9 @@ def is_service_running():
         result = subprocess.run(['sc', 'query', ZAPRET_SERVICE_NAME], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
         return "RUNNING" in result.stdout
     except: return False
+    
+# Обновляем start_process для тестов (совместимость)
+def start_process(profile, base_dir, game_filter_enabled, log_callback, list_path=None, wait=False):
+    # Обертка для одиночного запуска (используется в тестах)
+    config = (list_path, profile, None)
+    return start_combined_process([config], base_dir, game_filter_enabled, log_callback)

@@ -2,94 +2,95 @@ import os
 import tkinter as tk
 
 class ListManager:
-    """Класс для управления списками доменов."""
+    """Класс для управления списками доменов и IP-сетами."""
     
     def __init__(self, app_dir):
         self.app_dir = app_dir
         self.lists_dir = os.path.join(app_dir, 'lists')
-        
-        # Путь к кастомному списку (теперь задается пользователем)
+        self.ipsets_dir = os.path.join(app_dir, 'ipsets')
         self.custom_list_path = ""
         
-        # Словарь: { "имя_файла_списка": "имя_профиля" }
-        self.list_profile_map = {}
-        # Словарь: { "имя_файла_списка": "имя_файла_ipset" или "OFF" }
-        self.list_ipset_map = {}
+        # Новая структура хранения правил: список словарей
+        # [ { "file": "list-general.txt", "type": "list", "profile": "General" }, ... ]
+        self.rules = []
+
+    def get_all_resources(self):
+        """
+        Возвращает единый список всех доступных файлов (списки и ipset).
+        Формат возврата: [ ("отображаемое_имя", "реальный_путь", "тип") ]
+        Типы: 'list', 'ipset'
+        """
+        resources = []
         
-    def get_available_files(self):
-        """Возвращает список имен файлов (включая кастомный список)."""
-        files = []
-        
-        # 1. Ищем стандартные txt в папке lists
+        # 1. Списки доменов (lists/)
         if os.path.exists(self.lists_dir):
-            for filename in os.listdir(self.lists_dir):
-                if filename.endswith('.txt') and filename != 'ipset-all.txt':
-                    files.append(filename)
+            for f in os.listdir(self.lists_dir):
+                if f.endswith('.txt') and f != 'ipset-all.txt': # ipset-all служебный
+                    resources.append({
+                        "display": f"[DOMAINS] {f}",
+                        "filename": f,
+                        "type": "list",
+                        "path": os.path.join(self.lists_dir, f)
+                    })
         
-        files.sort()
+        # 2. IP-сеты (ipsets/)
+        if os.path.exists(self.ipsets_dir):
+            for f in os.listdir(self.ipsets_dir):
+                if f.endswith('.txt'):
+                    resources.append({
+                        "display": f"[IPSET] {f}",
+                        "filename": f,
+                        "type": "ipset",
+                        "path": os.path.join(self.ipsets_dir, f)
+                    })
         
-        # 2. Добавляем кастомный список, если он задан и существует
+        # 3. Кастомный список
         if self.custom_list_path and os.path.exists(self.custom_list_path):
-            custom_name = os.path.basename(self.custom_list_path)
-            # Добавляем префикс, чтобы UI и логика понимали, что это особый файл
-            files.append(f"[CUSTOM] {custom_name}")
+            resources.append({
+                "display": f"[CUSTOM] {os.path.basename(self.custom_list_path)}",
+                "filename": self.custom_list_path, # Используем полный путь как ID
+                "type": "list",
+                "path": self.custom_list_path
+            })
             
-        return files
+        # Сортировка по имени
+        resources.sort(key=lambda x: x["display"])
+        return resources
 
-    def get_full_path(self, list_identifier):
-        """
-        Возвращает полный путь к файлу списка по его идентификатору из таблицы.
-        """
-        if list_identifier.startswith("[CUSTOM] "):
-            # Это кастомный список
-            return self.custom_list_path
-        else:
-            # Это обычный список из папки lists
-            return os.path.join(self.lists_dir, list_identifier)
+    def set_rules(self, rules_data):
+        """Загружает правила из конфига."""
+        self.rules = rules_data
 
-    def get_available_ipsets(self):
-        """Возвращает список доступных файлов ipset."""
-        ipsets_dir = os.path.join(self.app_dir, 'ipsets')
-        files = ["OFF"]
-        if os.path.exists(ipsets_dir):
-            for filename in os.listdir(ipsets_dir):
-                if filename.endswith('.txt'):
-                    files.append(filename)
-        return files
-
-    def get_mapping(self):
-        """Возвращает текущую карту профилей."""
-        return self.list_profile_map
+    def get_rules(self):
+        """Возвращает текущие правила."""
+        return self.rules
     
-    def get_ipset_mapping(self):
-        """Возвращает текущую карту айписетов."""
-        return self.list_ipset_map
+    def add_rule(self, file_identifier, file_type, profile_name):
+        """Добавляет новое правило."""
+        self.rules.append({
+            "file": file_identifier,
+            "type": file_type,
+            "profile": profile_name
+        })
 
-    def set_mappings(self, profile_map, ipset_map):
-        """Загружает карты настроек (из конфига)."""
-        if isinstance(profile_map, dict):
-            self.list_profile_map = profile_map
-        if isinstance(ipset_map, dict):
-            self.list_ipset_map = ipset_map
+    def remove_rule(self, index):
+        """Удаляет правило по индексу."""
+        if 0 <= index < len(self.rules):
+            self.rules.pop(index)
 
-    def set_profile_for_list(self, list_name, profile_name):
-        """Устанавливает профиль для конкретного списка."""
-        self.list_profile_map[list_name] = profile_name
+    def update_rule(self, index, key, value):
+        """Обновляет поле правила."""
+        if 0 <= index < len(self.rules):
+            self.rules[index][key] = value
 
-    def set_ipset_for_list(self, list_name, ipset_name):
-        """Устанавливает ipset для конкретного списка."""
-        self.list_ipset_map[list_name] = ipset_name
-
-    def get_profile_for_list(self, list_name):
-        return self.list_profile_map.get(list_name, "ОТКЛЮЧЕНО")
-    
-    def get_ipset_for_list(self, list_name):
-        return self.list_ipset_map.get(list_name, "OFF")
-
+    # Методы для кастомного списка
     def set_custom_list_path(self, path):
-        """Устанавливает путь к кастомному списку."""
         self.custom_list_path = path
 
     def get_custom_list_path(self):
-        """Возвращает путь к кастомному списку или пустую строку, если не задан."""
         return self.custom_list_path
+
+    # Старые методы оставлены для совместимости, если где-то вызываются, но лучше не использовать
+    def get_mapping(self): return {}
+    def get_ipset_mapping(self): return {}
+    def set_mappings(self, p, i): pass
