@@ -49,13 +49,33 @@ class DomainManager:
         # Кнопка анализа
         self.domain_start_btn = tk.ttk.Button(
             parent, 
-            text="🔍 Начать анализ и добавить домены", 
+            text="🔍 Начать анализ", 
             command=self.start_domain_analysis, 
             state=tk.NORMAL if self.method_available else tk.DISABLED
         )
         self.domain_start_btn.pack(pady=10)
         
+        # Отображение текущего списка
+        current_list = self.app.list_manager.get_custom_list_path()
+        if current_list:
+            list_status = f"Домены будут добавлены в: {os.path.basename(current_list)}"
+        else:
+            list_status = "ВНИМАНИЕ: Кастомный список не выбран. Домены НЕ будут сохранены."
+            
+        self.lbl_list_status = tk.Label(parent, text=list_status, fg="gray", font=("Segoe UI", 8))
+        self.lbl_list_status.pack(pady=2)
+        
         tk.Label(parent, text="Все логи анализа отображаются на вкладке 'Логи'", fg="gray").pack(pady=5)
+
+    def update_list_status_label(self):
+        """Обновляет надпись о том, куда сохраняются домены"""
+        try:
+            current_list = self.app.list_manager.get_custom_list_path()
+            if current_list:
+                self.lbl_list_status.config(text=f"Домены будут добавлены в: {os.path.basename(current_list)}", fg="blue")
+            else:
+                self.lbl_list_status.config(text="ВНИМАНИЕ: Кастомный список не выбран. Домены НЕ будут сохранены.", fg="red")
+        except: pass
 
     def show_domain_url_menu(self, event):
         try:
@@ -104,7 +124,7 @@ class DomainManager:
         except Exception as e:
             self.domain_log(f"Критическая ошибка: {e}")
 
-        self.app.root.after(0, lambda: self.domain_start_btn.config(state=tk.NORMAL, text="🔍 Начать анализ и добавить домены"))
+        self.app.root.after(0, lambda: self.domain_start_btn.config(state=tk.NORMAL, text="🔍 Начать анализ"))
 
     def add_domains_to_list(self, new_domains):
         """Добавляет найденные домены в список"""
@@ -112,17 +132,27 @@ class DomainManager:
             log_callback = self.domain_log
             custom_list_path = self.app.list_manager.get_custom_list_path()
             
+            # ПРОВЕРКА: Если список не задан, просто выходим
             if not custom_list_path:
-                custom_list_path = os.path.join(self.app.app_dir, 'lists', 'custom_list.txt')
-                log_callback(f"Использую стандартный путь: {custom_list_path}")
+                log_callback("⚠ Кастомный список не указан в настройках.")
+                log_callback("⚠ Домены найдены, но НЕ сохранены.")
+                return
+
+            if not os.path.exists(custom_list_path):
+                log_callback(f"⚠ Файл списка не найден по пути: {custom_list_path}")
+                log_callback("⚠ Укажите существующий файл в настройках.")
+                return
             
             existing_domains = set()
-            if os.path.exists(custom_list_path):
+            try:
                 with open(custom_list_path, 'r', encoding='utf-8') as f:
                     for line in f:
                         line = line.strip()
                         if line and not line.startswith('#'):
                             existing_domains.add(line)
+            except Exception as e:
+                log_callback(f"Ошибка чтения файла списка: {e}")
+                return
             
             added_domains = []
             for domain in new_domains:
@@ -134,26 +164,22 @@ class DomainManager:
                     log_callback(f"  + {clean_domain}")
             
             if not added_domains:
-                log_callback("Новых доменов не найдено (все уже в списке).")
+                log_callback("Новых доменов не найдено (все уже есть в выбранном списке).")
                 return
             
-            all_domains = sorted(list(existing_domains.union(set(added_domains))))
-            
-            with open(custom_list_path, 'w', encoding='utf-8') as f:
-                f.write("# Список доменов\n")
-                f.write(f"# Обновлено: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                for domain in all_domains:
+            # Добавляем новые домены в конец файла
+            with open(custom_list_path, 'a', encoding='utf-8') as f:
+                f.write("\n") # Гарантируем новую строку
+                for domain in added_domains:
                     f.write(domain + '\n')
             
-            log_callback(f"✓ Добавлено {len(added_domains)} новых доменов. Всего: {len(all_domains)}")
+            log_callback(f"✓ Добавлено {len(added_domains)} новых доменов в {os.path.basename(custom_list_path)}")
             self.app.root.after(0, self._propose_restart_after_domain_update)
 
         except Exception as e:
             self.domain_log(f"ОШИБКА при сохранении: {e}")
 
     def _propose_restart_after_domain_update(self):
-        # Поскольку теперь поддерживается несколько процессов, 
-        # простой перезапуск не всегда очевиден. Спросим пользователя об остановке.
         if self.app.active_processes:
             if messagebox.askyesno("Обновление", "Домены добавлены. Чтобы изменения вступили в силу, нужно перезапустить процессы.\n\nОстановить все текущие процессы?"):
                 self.app.stop_process()

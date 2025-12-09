@@ -9,7 +9,6 @@ import requests
 import json
 import webbrowser
 from text_utils import setup_text_widget_bindings
-# Импорт нашего нового граббера
 import ip_grabber
 
 class UIManager:
@@ -27,6 +26,7 @@ class UIManager:
         self.all_logs = []
         self.btn_start_all = None
         self.btn_stop_all = None
+        self.lbl_custom_list_path = None
         
     def setup_window(self):
         """Настраивает главное окно"""
@@ -179,7 +179,14 @@ class UIManager:
 
         for idx, list_filename in enumerate(available_lists):
             # 1. Имя файла
-            lbl_name = ttk.Label(self.scroll_frame_inner, text=list_filename, anchor="w")
+            display_name = list_filename
+            fg_color = "black"
+            
+            # Если это кастомный список, выделим его цветом
+            if list_filename.startswith("[CUSTOM]"):
+                fg_color = "blue"
+            
+            lbl_name = ttk.Label(self.scroll_frame_inner, text=display_name, anchor="w", foreground=fg_color)
             lbl_name.grid(row=idx, column=0, sticky="ew", padx=5, pady=8)
             
             # 2. Выбор профиля
@@ -285,14 +292,22 @@ class UIManager:
         self.app.game_filter_check = ttk.Checkbutton(settings_frame, text="Игровой фильтр (применять ко всем новым запускам)", variable=self.app.game_filter_var)
         self.app.game_filter_check.pack(anchor=tk.W, padx=5, pady=5)
         
+        # Управление кастомным списком
+        list_frame = ttk.LabelFrame(settings_frame, text="Кастомный список доменов")
+        list_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.lbl_custom_list_path = ttk.Label(list_frame, text="Файл не выбран", foreground="gray")
+        self.lbl_custom_list_path.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        self.update_custom_list_label()
+        
+        ttk.Button(list_frame, text="📂 Указать кастомный список", command=self.select_custom_list).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(list_frame, text="✏ Открыть/Редактировать", command=self.app.open_custom_list).pack(side=tk.RIGHT, padx=5)
+
         btn_frame = ttk.Frame(settings_frame)
         btn_frame.pack(fill=tk.X, pady=5)
         
         ttk.Button(btn_frame, text="Проверить системный статус", command=self.app.check_status).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Открыть файл кастомного списка", command=self.app.open_custom_list).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="♻ Обновить программу", command=self.app.trigger_update).pack(side=tk.LEFT, padx=5)
-
-        # ДОБАВЛЕННАЯ КНОПКА IP GRABBER
         ttk.Button(btn_frame, text="🔍 Создать IPSet из процесса", command=self.open_ip_grabber).pack(side=tk.LEFT, padx=5)
 
         # --- Раздел Тестирования ---
@@ -335,6 +350,30 @@ class UIManager:
         link_lbl = tk.Label(support_frame, text=link_url, fg="blue", cursor="hand2", font=("Segoe UI", 9, "underline"))
         link_lbl.pack(anchor=tk.W, pady=2)
         link_lbl.bind("<Button-1>", lambda e: webbrowser.open_new(link_url))
+
+    def select_custom_list(self):
+        """Открывает диалог выбора файла для кастомного списка"""
+        filename = filedialog.askopenfilename(
+            title="Выберите файл списка доменов",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if filename:
+            self.app.list_manager.set_custom_list_path(filename)
+            self.app.save_app_settings()
+            self.update_custom_list_label()
+            self.app.domain_manager.update_list_status_label()
+            # Обновляем таблицу, чтобы новый файл появился там
+            self.refresh_lists_table()
+
+    def update_custom_list_label(self):
+        """Обновляет текст пути к кастомному списку"""
+        if not self.lbl_custom_list_path: return
+        
+        path = self.app.list_manager.get_custom_list_path()
+        if path:
+            self.lbl_custom_list_path.config(text=path, foreground="black")
+        else:
+            self.lbl_custom_list_path.config(text="Файл не выбран (поиск доменов не будет сохранять результаты)", foreground="#aa0000")
 
     def open_ip_grabber(self):
         """Открывает окно граббера IP"""

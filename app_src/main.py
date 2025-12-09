@@ -124,34 +124,38 @@ class App:
         configs_to_run = [] # Список кортежей (путь, профиль, путь_к_ipset)
         active_list_names = []
         
-        for list_filename in available_lists:
-            profile_name = prof_mapping.get(list_filename, "ОТКЛЮЧЕНО")
+        for list_identifier in available_lists:
+            # list_identifier может быть "youtube.txt" или "[CUSTOM] mylist.txt"
+            
+            profile_name = prof_mapping.get(list_identifier, "ОТКЛЮЧЕНО")
             
             if profile_name == "ОТКЛЮЧЕНО" or not profile_name:
                 continue
                 
             profile_obj = next((p for p in self.profiles if p['name'] == profile_name), None)
             if not profile_obj:
-                self.log_message(f"Ошибка: Профиль '{profile_name}' не найден!", "error")
+                self.log_message(f"Ошибка: Профиль '{profile_name}' не найден для {list_identifier}!", "error")
                 continue
             
-            full_list_path = os.path.join(self.app_dir, 'lists', list_filename)
-            if not os.path.exists(full_list_path):
-                self.log_message(f"Файл не найден: {list_filename}", "error")
+            # Получаем реальный путь к файлу (через менеджер, т.к. это может быть кастомный путь)
+            full_list_path = self.list_manager.get_full_path(list_identifier)
+            
+            if not full_list_path or not os.path.exists(full_list_path):
+                self.log_message(f"Файл не найден: {full_list_path}", "error")
                 continue
             
             # Получаем IPSet для конкретного списка
-            ipset_setting = ipset_mapping.get(list_filename, "OFF")
+            ipset_setting = ipset_mapping.get(list_identifier, "OFF")
             ipset_path = None
             if ipset_setting and ipset_setting != "OFF":
                 potential_path = os.path.join(self.app_dir, 'ipsets', ipset_setting)
                 if os.path.exists(potential_path):
                     ipset_path = potential_path
                 else:
-                    self.log_message(f"Предупреждение: IPSet файл '{ipset_setting}' не найден для списка {list_filename}", "error")
+                    self.log_message(f"Предупреждение: IPSet файл '{ipset_setting}' не найден для списка {list_identifier}", "error")
 
             configs_to_run.append((full_list_path, profile_obj, ipset_path))
-            active_list_names.append(list_filename)
+            active_list_names.append(list_identifier)
 
         if not configs_to_run:
             self.log_message("Нет активных конфигураций для запуска.", "status")
@@ -299,7 +303,8 @@ class App:
         settings_data = {
             "game_filter": self.game_filter_var.get(),
             "list_profile_map": self.list_manager.get_mapping(),
-            "list_ipset_map": self.list_manager.get_ipset_mapping()
+            "list_ipset_map": self.list_manager.get_ipset_mapping(),
+            "custom_list_path": self.list_manager.get_custom_list_path()
         }
         settings_manager.save_app_settings(settings_data, self.app_dir)
         self.log_message("Настройки сохранены.", "success")
@@ -314,14 +319,29 @@ class App:
             settings.get("list_ipset_map", {})
         )
         
+        # Загрузка пути к кастомному списку
+        custom_path = settings.get("custom_list_path", "")
+        self.list_manager.set_custom_list_path(custom_path)
+        
         self.ui_manager.refresh_lists_table()
+        self.ui_manager.update_custom_list_label() # Обновляем лейбл в UI
         self.log_message("Настройки загружены.", "success")
         
     def open_custom_list(self):
         try:
             path = self.list_manager.get_custom_list_path()
+            if not path:
+                messagebox.showwarning("Внимание", "Файл кастомного списка не выбран.\nУкажите его в настройках.")
+                return
             if not os.path.exists(path):
-                with open(path, 'w', encoding='utf-8') as f: f.write("# Custom list\n")
+                if messagebox.askyesno("Файл не найден", f"Файл не найден:\n{path}\n\nСоздать его?"):
+                    try:
+                        with open(path, 'w', encoding='utf-8') as f: f.write("# Custom list\n")
+                    except Exception as e:
+                        messagebox.showerror("Ошибка", f"Не удалось создать файл: {e}")
+                        return
+                else:
+                    return
             os.startfile(path)
         except Exception as e:
             self._handle_ui_error(e)
@@ -338,11 +358,13 @@ class App:
 
     def run_site_test(self):
         domain = self.site_test_url.get()
-        self.run_in_thread(testing_utils.run_site_test, domain, self.profiles, self.app_dir, self.game_filter_var.get(), self.log_message)
+        custom_list = self.list_manager.get_custom_list_path()
+        self.run_in_thread(testing_utils.run_site_test, domain, self.profiles, self.app_dir, self.game_filter_var.get(), self.log_message, custom_list)
 
     def run_discord_test(self):
         def ask(name): return messagebox.askyesno("Тест", f"Работает ли Discord с профилем {name}?")
-        self.run_in_thread(testing_utils.run_discord_test, self.profiles, self.app_dir, self.game_filter_var.get(), self.log_message, ask)
+        custom_list = self.list_manager.get_custom_list_path()
+        self.run_in_thread(testing_utils.run_discord_test, self.profiles, self.app_dir, self.game_filter_var.get(), self.log_message, ask, custom_list)
 
 if __name__ == "__main__":
     if not process_manager.is_admin():

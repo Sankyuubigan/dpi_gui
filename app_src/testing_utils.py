@@ -3,6 +3,8 @@ import time
 import subprocess
 import process_manager
 from executor import is_custom_list_valid
+import os
+
 def check_connection(url, log_callback):
     """Проверяет доступность URL."""
     if not url.startswith('http'):
@@ -15,7 +17,8 @@ def check_connection(url, log_callback):
     except Exception as e:
         log_callback(f"  -> Соединение не удалось: {e}")
         return False
-def run_site_test(domain, profiles, base_dir, game_filter_enabled, log_callback):
+
+def run_site_test(domain, profiles, base_dir, game_filter_enabled, log_callback, custom_list_path=None):
     """Запускает автоматический тест доступности сайта по всем профилям."""
     log_callback("\n" + "="*40)
     log_callback(f"--- Автоматический тест по сайту: {domain} ---")
@@ -30,8 +33,11 @@ def run_site_test(domain, profiles, base_dir, game_filter_enabled, log_callback)
     log_callback("[+] Отлично, сайт заблокирован. Начинаем тестирование профилей.\n")
     
     results = {}
-    custom_list_path = f"{base_dir}\\lists\\custom_list.txt"
-    list_to_use = custom_list_path if is_custom_list_valid(custom_list_path) else None
+    
+    # Используем переданный путь, если он валиден, иначе None
+    list_to_use = None
+    if custom_list_path and is_custom_list_valid(custom_list_path):
+        list_to_use = custom_list_path
     
     for i, profile in enumerate(profiles):
         log_callback(f"--- Тест {i+1}/{len(profiles)}: \"{profile['name']}\" ---")
@@ -53,7 +59,8 @@ def run_site_test(domain, profiles, base_dir, game_filter_enabled, log_callback)
     for name, status in results.items():
         log_callback(f"  {name:<30} : {status}")
     log_callback("="*40 + "\n")
-def run_discord_test(profiles, base_dir, game_filter_enabled, log_callback, ask_user_callback):
+
+def run_discord_test(profiles, base_dir, game_filter_enabled, log_callback, ask_user_callback, custom_list_path=None):
     """Запускает интерактивный тест для Discord."""
     log_callback("\n" + "="*40)
     log_callback("--- Интерактивный тест для Discord ---")
@@ -65,8 +72,10 @@ def run_discord_test(profiles, base_dir, game_filter_enabled, log_callback, ask_
     process_manager.stop_all_processes(log_callback)
     
     results = {}
-    custom_list_path = f"{base_dir}\\lists\\custom_list.txt"
-    list_to_use = custom_list_path if is_custom_list_valid(custom_list_path) else None
+    
+    list_to_use = None
+    if custom_list_path and is_custom_list_valid(custom_list_path):
+        list_to_use = custom_list_path
     
     for i, profile in enumerate(profiles):
         log_callback(f"--- Тест {i+1}/{len(profiles)}: \"{profile['name']}\" ---")
