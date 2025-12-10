@@ -1,36 +1,18 @@
 {
     "game_filter": false,
-    "rules": [
-        {
-            "file": "youtube.txt",
-            "type": "list",
-            "profile": "1.8.5 - General (ALT7)"
-        },
-        {
-            "file": "list-general.txt",
-            "type": "list",
-            "profile": "1.8.5 - General (ALT7)"
-        },
-        {
-            "file": "C:/Users/user/Desktop/list-custom.txt",
-            "type": "list",
-            "profile": "1.8.5 - General (ALT7)"
-        },
-        {
-            "file": "telegram.txt",
-            "type": "list",
-            "profile": "\u041e\u0442\u043a\u043b\u044e\u0447\u0435\u043d\u043e"
-        },
-        {
-            "file": "ipset-Telegram.txt",
-            "type": "ipset",
-            "profile": "\u041e\u0442\u043a\u043b\u044e\u0447\u0435\u043d\u043e"
-        },
-        {
-            "file": "discord.txt",
-            "type": "list",
-            "profile": "1.8.5 - General (ALT8)"
-        }
-    ],
+    "list_profile_map": {
+        "discord.txt": "1.8.5 - General (ALT8)",
+        "list-general.txt": "1.8.5 - General (ALT7)",
+        "youtube.txt": "1.8.5 - General (ALT7)",
+        "telegram.txt": "1.8.5 - General (ALT7)",
+        "[CUSTOM] list-custom.txt": "1.8.5 - General (ALT7)"
+    },
+    "list_ipset_map": {
+        "discord.txt": "ipset-one.txt",
+        "list-general.txt": "ipset-one.txt",
+        "youtube.txt": "ipset-one.txt",
+        "telegram.txt": "ipset-Telegram.txt",
+        "[CUSTOM] list-custom.txt": "ipset-one.txt"
+    },
     "custom_list_path": "C:/Users/user/Desktop/list-custom.txt"
 }
