@@ -41,9 +41,6 @@ def is_media_url(url):
         query = parsed.query.lower()
         if 'rate=' in query and 'hash=' in query:
             return True
-            
-        # Убрана проверка по ключевым словам в домене (video, media и т.д.),
-        # так как она ложно срабатывала на сайты в зонах .video, .media и т.д.
         
         return False
     except:
@@ -81,18 +78,14 @@ def extract_domain_from_url(url):
             domain = domain[4:]
 
         # Фильтрация IP-адресов (нам нужны только доменные имена)
-        # Проверка на IPv4
         if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', domain):
             return None
 
         # Базовая валидация
-        # 1. Должна быть точка
-        # 2. Длина более 3 символов (x.ru = 4, но com - 3, но com не домен для списка)
         if '.' not in domain or len(domain) < 4:
             return None
             
-        # 3. Проверка на допустимые символы (буквы, цифры, дефис, точка)
-        # Это отсеивает всякий мусор из JS кода
+        # Проверка на допустимые символы
         if not re.match(r'^[a-z0-9\-\.]+$', domain):
             return None
             
@@ -117,7 +110,6 @@ def cleanup_browser_resources():
 def extract_domains_from_js(js_content):
     """Извлекает домены из JavaScript кода"""
     domains = set()
-    # Паттерны для поиска ссылок
     patterns = [
         r'["\']https?://([^"\']+)["\']',
         r'["\']//([^"\']+)["\']',
@@ -181,7 +173,6 @@ def analyze_site_domains_performance(url: str, log_callback):
         chrome_options.add_argument("--disable-extensions")
         chrome_options.add_argument("--ignore-certificate-errors")
         
-        # Включаем логирование
         chrome_options.set_capability('goog:loggingPrefs', {
             'performance': 'ALL',
             'browser': 'ALL',
@@ -238,14 +229,31 @@ def analyze_site_domains_performance(url: str, log_callback):
             for i in range(1, 4):
                 time.sleep(2)
                 batch = collect_domains_from_logs()
+                
+                # Вычисляем новые домены для детального лога
+                new_in_batch = batch - all_domains
+                
+                if new_in_batch:
+                    log_callback(f"✓ Этап {i}: найдено {len(new_in_batch)} новых записей:")
+                    for d in sorted(list(new_in_batch)):
+                        log_callback(f"    • {d}")
+                else:
+                    log_callback(f"✓ Этап {i}: новых записей не найдено")
+                
                 all_domains.update(batch)
-                log_callback(f"✓ Этап {i}: найдено {len(batch)} новых записей")
 
             # Прокрутка для ленивой загрузки
             try:
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(2)
                 batch = collect_domains_from_logs()
+                
+                new_in_scroll = batch - all_domains
+                if new_in_scroll:
+                    log_callback(f"✓ Скроллинг: найдено {len(new_in_scroll)} новых:")
+                    for d in sorted(list(new_in_scroll)):
+                        log_callback(f"    • {d}")
+                
                 all_domains.update(batch)
             except:
                 pass
@@ -255,6 +263,11 @@ def analyze_site_domains_performance(url: str, log_callback):
                 html_content = driver.page_source
                 if html_content:
                     html_domains = extract_domains_from_html(html_content)
+                    new_html = html_domains - all_domains
+                    if new_html:
+                        log_callback(f"✓ Анализ HTML: найдено {len(new_html)} новых:")
+                        for d in sorted(list(new_html)):
+                            log_callback(f"    • {d}")
                     all_domains.update(html_domains)
             except:
                 pass
@@ -263,12 +276,14 @@ def analyze_site_domains_performance(url: str, log_callback):
             try:
                 script_elements = driver.find_elements("tag name", "script")
                 js_content = ""
+                js_domains_found = set()
+                
                 for script in script_elements:
                     try:
                         src = script.get_attribute("src")
                         if src and not src.startswith('data:'):
                             domain = extract_domain_from_url(src)
-                            if domain: all_domains.add(domain)
+                            if domain: js_domains_found.add(domain)
                         else:
                             content = script.get_attribute("innerHTML")
                             if content: js_content += content + "\n"
@@ -276,15 +291,22 @@ def analyze_site_domains_performance(url: str, log_callback):
                         continue
                 
                 if js_content:
-                    js_domains = extract_domains_from_js(js_content)
-                    all_domains.update(js_domains)
+                    extracted = extract_domains_from_js(js_content)
+                    js_domains_found.update(extracted)
+                
+                new_js = js_domains_found - all_domains
+                if new_js:
+                    log_callback(f"✓ Анализ JS: найдено {len(new_js)} новых:")
+                    for d in sorted(list(new_js)):
+                        log_callback(f"    • {d}")
+                
+                all_domains.update(js_domains_found)
             except:
                 pass
 
             if all_domains:
                 # Финальная очистка списка
                 unique_domains = sorted(list(all_domains))
-                # Дополнительная проверка перед возвратом
                 clean_unique_domains = []
                 for d in unique_domains:
                     clean = extract_domain_from_url(d) # Повторная проверка
@@ -292,6 +314,11 @@ def analyze_site_domains_performance(url: str, log_callback):
                         clean_unique_domains.append(clean)
                 
                 log_callback(f"Всего найдено уникальных доменов: {len(clean_unique_domains)}")
+                log_callback("--- ИТОГОВЫЙ СПИСОК НАЙДЕННОГО ---")
+                for d in clean_unique_domains:
+                    log_callback(f"  {d}")
+                log_callback("-----------------------------------")
+                
                 return clean_unique_domains
             else:
                 if main_domain:
