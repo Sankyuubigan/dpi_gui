@@ -80,6 +80,22 @@ class App:
         
         power_handler.setup_power_handler(self)
         self.run_in_thread(self.log_queue_monitor)
+        
+        # Создаем/обновляем батник обновления при старте
+        self.create_update_script()
+
+        # --- ПРОВЕРКА АДМИНА ПРИ СТАРТЕ ---
+        self.check_admin_status_log()
+
+    def check_admin_status_log(self):
+        """Явно пишет в лог статус прав администратора"""
+        is_admin = process_manager.is_admin()
+        status_msg = "ЕСТЬ (АКТИВЕН)" if is_admin else "НЕТ (ОГРАНИЧЕН)"
+        log_type = "success" if is_admin else "error"
+        
+        self.root.after(500, lambda: self.log_message(f"=== ПРАВА АДМИНИСТРАТОРА: {status_msg} ===", log_type))
+        if not is_admin:
+            self.root.after(600, lambda: self.log_message("ВНИМАНИЕ: Без прав админа сканирование процессов (Telegram/Игры) работать НЕ БУДЕТ!", "error"))
 
     def setup_window(self):
         self.ui_manager.setup_window()
@@ -254,33 +270,92 @@ class App:
         except Exception as e:
             self._handle_ui_error(e)
 
+    def create_update_script(self):
+        """Создает файл update.bat в корневой папке"""
+        try:
+            base_dir = os.path.dirname(self.app_dir)
+            bat_path = os.path.join(base_dir, "update.bat")
+            
+            # АВТОМАТИЧЕСКОЕ ОПРЕДЕЛЕНИЕ ИМЕНИ ЗАПУЩЕННОГО EXE
+            if getattr(sys, 'frozen', False):
+                # Если запущено как EXE (PyInstaller)
+                current_exe_name = os.path.basename(sys.executable)
+            else:
+                # Если запущено из Python (для тестов)
+                current_exe_name = "dpi_gui_launcher.exe"
+
+            # Определяем имена файлов
+            launcher_script = "launcher.py"
+            python_runtime = "python_runtime\\python.exe"
+            
+            bat_content = f"""@echo off
+chcp 65001 >nul
+title DPI GUI Updater
+setlocal
+
+:: ОЧИСТКА ПЕРЕМЕННЫХ СРЕДЫ ОТ PYINSTALLER
+set PYTHONHOME=
+set PYTHONPATH=
+
+echo ==========================================
+echo       DPI GUI - ЗАПУСК ОБНОВЛЕНИЯ
+echo ==========================================
+echo.
+echo [1/3] Ожидание закрытия программы...
+timeout /t 3 /nobreak >nul
+
+echo [2/3] Принудительная остановка процессов...
+taskkill /F /IM "winws.exe" >nul 2>&1
+taskkill /F /IM "ZapretDPIBypass" >nul 2>&1
+taskkill /F /IM "{current_exe_name}" >nul 2>&1
+taskkill /F /IM "pythonw.exe" /FI "WINDOWTITLE eq DPI_GUI*" >nul 2>&1
+
+echo [3/3] Запуск лаунчера в режиме обновления...
+if exist "{current_exe_name}" (
+    start "" "{current_exe_name}" --update
+) else (
+    if exist "{launcher_script}" (
+        if exist "{python_runtime}" (
+            start "" "{python_runtime}" "{launcher_script}" --update
+        ) else (
+            start "" python "{launcher_script}" --update
+        )
+    ) else (
+        echo.
+        echo [ОШИБКА] Файл {current_exe_name} не найден!
+        echo Пожалуйста, переустановите программу.
+        pause
+    )
+)
+exit
+"""
+            with open(bat_path, "w", encoding="utf-8") as f:
+                f.write(bat_content)
+        except Exception as e:
+            print(f"Failed to create update.bat: {e}")
+
     def trigger_update(self):
-        """Перезапускает лаунчер с флагом обновления"""
+        """Запускает update.bat через os.startfile (полная изоляция)"""
         if messagebox.askyesno("Обновление", "Приложение будет закрыто для проверки и установки обновлений.\nПродолжить?"):
             try:
                 self.save_app_settings()
                 self.stop_process()
                 
-                launcher_path = os.environ.get("LAUNCHER_PATH")
-                if not launcher_path or not os.path.exists(launcher_path):
-                    # Пытаемся угадать, если запускаем из IDE
-                    potential_path = os.path.join(os.path.dirname(self.app_dir), "launcher.py")
-                    if os.path.exists(potential_path):
-                        # Запуск python скрипта
-                        subprocess.Popen([sys.executable, potential_path, "--update"], cwd=os.path.dirname(self.app_dir))
-                    else:
-                        # Пытаемся найти exe рядом
-                        potential_exe = os.path.join(os.path.dirname(self.app_dir), "dpi_gui_launcher.exe")
-                        if os.path.exists(potential_exe):
-                            subprocess.Popen([potential_exe, "--update"], cwd=os.path.dirname(self.app_dir))
-                        else:
-                            messagebox.showerror("Ошибка", "Не удалось найти файл лаунчера для перезапуска.")
-                            return
-                else:
-                    # Запуск exe
-                    subprocess.Popen([launcher_path, "--update"], cwd=os.path.dirname(launcher_path))
+                # Обновляем скрипт перед запуском (чтобы подхватить правильное имя exe)
+                self.create_update_script()
                 
-                self.root.quit()
+                base_dir = os.path.dirname(self.app_dir)
+                bat_path = os.path.join(base_dir, "update.bat")
+                
+                if os.path.exists(bat_path):
+                    # ВАЖНО: Используем os.startfile для запуска батника Проводником
+                    # Это решает проблему с ошибкой LoadLibrary / python312.dll
+                    os.startfile(bat_path)
+                    
+                    # Закрываем текущее приложение
+                    self.root.quit()
+                else:
+                    messagebox.showerror("Ошибка", "Файл update.bat не найден.")
             except Exception as e:
                 messagebox.showerror("Ошибка", f"Не удалось запустить обновление:\n{e}")
 
