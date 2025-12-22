@@ -11,21 +11,51 @@ import time
 import datetime
 import ctypes
 
-# Глобальный обработчик ошибок
-def global_exception_handler(exc_type, exc_value, exc_traceback):
-    error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
-    print(error_msg, file=sys.stderr) # Пишем в stderr, который ловит лаунчер
-    with open("crash_report.txt", "a", encoding="utf-8") as f:
-        f.write(f"\n--- CRASH {datetime.datetime.now()} ---\n")
-        f.write(error_msg)
-    try:
-        messagebox.showerror("Critical Error", f"Application crashed:\n{exc_value}")
-    except: pass
-
-sys.excepthook = global_exception_handler
-
 APP_SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP_SOURCE_DIR)
+
+# Глобальная переменная для доступа к приложению из обработчиков ошибок
+app_instance = None
+
+# --- ГЛОБАЛЬНАЯ ОБРАБОТКА ОШИБОК ---
+def log_crash_to_file(error_msg):
+    """Пишет ошибку в файл crash_report.txt"""
+    try:
+        with open("crash_report.txt", "a", encoding="utf-8") as f:
+            f.write(f"\n--- CRASH {datetime.datetime.now()} ---\n")
+            f.write(error_msg + "\n")
+    except: pass
+
+def handle_exception(exc_type, exc_value, exc_traceback):
+    """Обработчик для основного потока"""
+    error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    print(error_msg, file=sys.stderr) # В консоль
+    log_crash_to_file(error_msg)      # В файл
+    
+    # Пытаемся вывести в GUI лог
+    if app_instance:
+        app_instance.root.after(0, lambda: app_instance.log_message(f"КРИТИЧЕСКАЯ ОШИБКА:\n{exc_value}", "error"))
+    
+    # Показываем окно
+    try:
+        messagebox.showerror("Critical Error", f"Application crashed:\n{exc_value}\n\nSee crash_report.txt")
+    except: pass
+
+def handle_thread_exception(args):
+    """Обработчик для фоновых потоков (threading)"""
+    error_msg = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+    print(error_msg, file=sys.stderr) # В консоль
+    log_crash_to_file(error_msg)      # В файл
+    
+    # Пытаемся вывести в GUI лог
+    if app_instance:
+        # Используем after, так как мы в другом потоке
+        app_instance.root.after(0, lambda: app_instance.log_message(f"ОШИБКА В ПОТОКЕ:\n{args.exc_value}", "error"))
+        app_instance.root.after(0, lambda: messagebox.showerror("Thread Error", f"Error in background thread:\n{args.exc_value}"))
+
+# Назначаем хуки
+sys.excepthook = handle_exception
+threading.excepthook = handle_thread_exception
 
 try:
     from executor import is_custom_list_valid
@@ -38,7 +68,6 @@ try:
     from ui_manager import UIManager
     from domain_manager import DomainManager
 except Exception as e:
-    # Ошибка импорта
     print(traceback.format_exc(), file=sys.stderr)
     sys.exit(1)
 
@@ -50,9 +79,10 @@ def run_as_admin():
 
 class App:
     def __init__(self, root):
-        self.root = root
+        global app_instance
+        app_instance = self # Сохраняем ссылку для глобальных обработчиков
         
-        # Словарь активных процессов теперь будет содержать только один элемент при общем запуске
+        self.root = root
         self.active_processes = {}
         self.log_queue = queue.Queue()
         
@@ -80,19 +110,13 @@ class App:
         
         power_handler.setup_power_handler(self)
         self.run_in_thread(self.log_queue_monitor)
-        
-        # Создаем/обновляем батник обновления при старте
         self.create_update_script()
-
-        # --- ПРОВЕРКА АДМИНА ПРИ СТАРТЕ ---
         self.check_admin_status_log()
 
     def check_admin_status_log(self):
-        """Явно пишет в лог статус прав администратора"""
         is_admin = process_manager.is_admin()
         status_msg = "ЕСТЬ (АКТИВЕН)" if is_admin else "НЕТ (ОГРАНИЧЕН)"
         log_type = "success" if is_admin else "error"
-        
         self.root.after(500, lambda: self.log_message(f"=== ПРАВА АДМИНИСТРАТОРА: {status_msg} ===", log_type))
         if not is_admin:
             self.root.after(600, lambda: self.log_message("ВНИМАНИЕ: Без прав админа сканирование процессов (Telegram/Игры) работать НЕ БУДЕТ!", "error"))
@@ -124,7 +148,6 @@ class App:
         thread.start()
 
     def run_all_configured(self):
-        """Запускает ОДИН процесс для всех списков."""
         if self.active_processes:
             if not messagebox.askyesno("Перезапуск", "Процесс уже запущен. Перезапустить?"):
                 return
@@ -137,12 +160,10 @@ class App:
         ipset_mapping = self.list_manager.get_ipset_mapping()
         available_lists = self.list_manager.get_available_files()
         
-        configs_to_run = [] # Список кортежей (путь, профиль, путь_к_ipset)
+        configs_to_run = []
         active_list_names = []
         
         for list_identifier in available_lists:
-            # list_identifier может быть "youtube.txt" или "[CUSTOM] mylist.txt"
-            
             profile_name = prof_mapping.get(list_identifier, "ОТКЛЮЧЕНО")
             
             if profile_name == "ОТКЛЮЧЕНО" or not profile_name:
@@ -153,14 +174,11 @@ class App:
                 self.log_message(f"Ошибка: Профиль '{profile_name}' не найден для {list_identifier}!", "error")
                 continue
             
-            # Получаем реальный путь к файлу (через менеджер, т.к. это может быть кастомный путь)
             full_list_path = self.list_manager.get_full_path(list_identifier)
-            
             if not full_list_path or not os.path.exists(full_list_path):
                 self.log_message(f"Файл не найден: {full_list_path}", "error")
                 continue
             
-            # Получаем IPSet для конкретного списка
             ipset_setting = ipset_mapping.get(list_identifier, "OFF")
             ipset_path = None
             if ipset_setting and ipset_setting != "OFF":
@@ -177,10 +195,8 @@ class App:
             self.log_message("Нет активных конфигураций для запуска.", "status")
             return
 
-        # Запуск
         try:
             game_filter_enabled = self.game_filter_var.get()
-            
             process = process_manager.start_combined_process(
                 configs_to_run, self.app_dir, game_filter_enabled, 
                 self.log_message
@@ -194,14 +210,11 @@ class App:
                 }
                 
                 self.log_message(f"Процесс запущен (PID: {pid}). Активные списки: {len(active_list_names)}", "success")
-                
-                # ОБНОВЛЯЕМ СОСТОЯНИЕ КНОПОК
                 self.ui_manager.update_buttons_state(True)
                 
                 threading.Thread(target=self.read_process_output, args=(process, "winws"), daemon=True).start()
                 threading.Thread(target=self.wait_for_process_exit, args=(pid,), daemon=True).start()
                 
-                # Обновляем UI для всех активных списков
                 for lname in active_list_names:
                     self.ui_manager.update_process_status_in_table(lname, True, pid)
                     
@@ -227,13 +240,9 @@ class App:
             data = self.active_processes[pid]
             active_lists = data['lists']
             del self.active_processes[pid]
-            
             for lname in active_lists:
                 self.ui_manager.update_process_status_in_table(lname, False, None)
-            
             self.log_message(f"Процесс остановлен (PID: {pid})", "status")
-            
-            # Если процессов больше нет (а он у нас всего один), обновляем кнопки
             if not self.active_processes:
                 self.ui_manager.update_buttons_state(False)
 
@@ -246,22 +255,15 @@ class App:
                 time.sleep(0.1)
 
     def stop_process(self):
-        """Останавливает все процессы"""
         self.log_message("Остановка...", "status")
-        
         pids = list(self.active_processes.keys())
         for pid in pids:
             if pid in self.active_processes:
                 proc = self.active_processes[pid]['proc']
                 process_manager.kill_process(proc)
-        
         process_manager.stop_all_processes(self.log_message)
         self.active_processes.clear()
-        
-        # Сброс статусов в таблице
         self.ui_manager.refresh_lists_table()
-        
-        # Обновляем кнопки
         self.ui_manager.update_buttons_state(False)
 
     def check_status(self, log_header=True):
@@ -271,20 +273,14 @@ class App:
             self._handle_ui_error(e)
 
     def create_update_script(self):
-        """Создает файл update.bat в корневой папке"""
         try:
             base_dir = os.path.dirname(self.app_dir)
             bat_path = os.path.join(base_dir, "update.bat")
-            
-            # АВТОМАТИЧЕСКОЕ ОПРЕДЕЛЕНИЕ ИМЕНИ ЗАПУЩЕННОГО EXE
             if getattr(sys, 'frozen', False):
-                # Если запущено как EXE (PyInstaller)
                 current_exe_name = os.path.basename(sys.executable)
             else:
-                # Если запущено из Python (для тестов)
                 current_exe_name = "dpi_gui_launcher.exe"
 
-            # Определяем имена файлов
             launcher_script = "launcher.py"
             python_runtime = "python_runtime\\python.exe"
             
@@ -292,24 +288,19 @@ class App:
 chcp 65001 >nul
 title DPI GUI Updater
 setlocal
-
-:: ОЧИСТКА ПЕРЕМЕННЫХ СРЕДЫ ОТ PYINSTALLER
 set PYTHONHOME=
 set PYTHONPATH=
-
 echo ==========================================
 echo       DPI GUI - ЗАПУСК ОБНОВЛЕНИЯ
 echo ==========================================
 echo.
 echo [1/3] Ожидание закрытия программы...
 timeout /t 3 /nobreak >nul
-
 echo [2/3] Принудительная остановка процессов...
 taskkill /F /IM "winws.exe" >nul 2>&1
 taskkill /F /IM "ZapretDPIBypass" >nul 2>&1
 taskkill /F /IM "{current_exe_name}" >nul 2>&1
 taskkill /F /IM "pythonw.exe" /FI "WINDOWTITLE eq DPI_GUI*" >nul 2>&1
-
 echo [3/3] Запуск лаунчера в режиме обновления...
 if exist "{current_exe_name}" (
     start "" "{current_exe_name}" --update
@@ -335,24 +326,15 @@ exit
             print(f"Failed to create update.bat: {e}")
 
     def trigger_update(self):
-        """Запускает update.bat через os.startfile (полная изоляция)"""
         if messagebox.askyesno("Обновление", "Приложение будет закрыто для проверки и установки обновлений.\nПродолжить?"):
             try:
                 self.save_app_settings()
                 self.stop_process()
-                
-                # Обновляем скрипт перед запуском (чтобы подхватить правильное имя exe)
                 self.create_update_script()
-                
                 base_dir = os.path.dirname(self.app_dir)
                 bat_path = os.path.join(base_dir, "update.bat")
-                
                 if os.path.exists(bat_path):
-                    # ВАЖНО: Используем os.startfile для запуска батника Проводником
-                    # Это решает проблему с ошибкой LoadLibrary / python312.dll
                     os.startfile(bat_path)
-                    
-                    # Закрываем текущее приложение
                     self.root.quit()
                 else:
                     messagebox.showerror("Ошибка", "Файл update.bat не найден.")
@@ -386,20 +368,15 @@ exit
 
     def load_app_settings(self):
         settings = settings_manager.load_app_settings(self.app_dir)
-        
         self.game_filter_var.set(settings.get("game_filter", False))
-        
         self.list_manager.set_mappings(
             settings.get("list_profile_map", {}),
             settings.get("list_ipset_map", {})
         )
-        
-        # Загрузка пути к кастомному списку
         custom_path = settings.get("custom_list_path", "")
         self.list_manager.set_custom_list_path(custom_path)
-        
         self.ui_manager.refresh_lists_table()
-        self.ui_manager.update_custom_list_label() # Обновляем лейбл в UI
+        self.ui_manager.update_custom_list_label()
         self.log_message("Настройки загружены.", "success")
         
     def open_custom_list(self):

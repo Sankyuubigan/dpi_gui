@@ -36,6 +36,68 @@ def _clean_profile_args(args_str):
     cleaned = re.sub(r'--wf-udp=[^ ]+', '', cleaned)
     return cleaned.strip()
 
+def start_process(profile, base_dir, game_filter_enabled, log_callback, custom_list_path=None, is_service=False):
+    """
+    Запускает одиночный процесс (используется для тестов и старой логики).
+    Возвращает объект subprocess.Popen.
+    """
+    bin_dir = os.path.join(base_dir, 'bin')
+    executable_path = os.path.join(bin_dir, WINWS_EXE)
+    lists_dir = os.path.join(base_dir, 'lists')
+    
+    if not os.path.exists(executable_path):
+        log_callback(f"Ошибка: Файл не найден: {executable_path}")
+        return None
+
+    # Формируем аргументы
+    raw_args = profile["args"].format(
+        LISTS_DIR=lists_dir,
+        BIN_DIR=bin_dir,
+        GAME_FILTER="1024-65535" if game_filter_enabled else "0"
+    )
+
+    # Для одиночного запуска не обязательно чистить wf-аргументы, 
+    # но если профиль рассчитан на --new, лучше оставить как есть в raw_args.
+    # Но так как мы используем те же профили, что и для combined, 
+    # в них могут быть wf-фильтры. Оставим их, так как это одиночный процесс.
+    
+    try:
+        args_list = shlex.split(raw_args)
+    except:
+        args_list = raw_args.split()
+
+    final_args = []
+    for arg in args_list:
+        # Подмена списка, если передан custom_list_path
+        if arg.startswith('--hostlist=') or arg.startswith('--hostlist-auto='):
+             if custom_list_path and ('list-general.txt' in arg or 'custom_list.txt' in arg):
+                 prefix = arg.split('=')[0]
+                 final_args.append(f'{prefix}={custom_list_path}')
+             else:
+                 final_args.append(arg)
+        else:
+            final_args.append(arg)
+
+    command = [executable_path] + final_args
+
+    try:
+        # Скрываем окно консоли
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        
+        process = subprocess.Popen(
+            command,
+            cwd=base_dir,
+            stdout=subprocess.DEVNULL, # Для тестов нам не нужен вывод в лог
+            stderr=subprocess.DEVNULL,
+            startupinfo=startupinfo,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        return process
+    except Exception as e:
+        log_callback(f"Ошибка запуска процесса тестирования: {e}")
+        return None
+
 def start_combined_process(configs, base_dir, game_filter_enabled, log_callback):
     """
     Запускает ОДИН процесс для нескольких конфигураций.

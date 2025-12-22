@@ -76,7 +76,8 @@ class UIManager:
         self.btn_start_all = ttk.Button(top_panel, text="▶ ЗАПУСТИТЬ", command=self.app.run_all_configured)
         self.btn_start_all.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         
-        self.btn_stop_all = ttk.Button(top_panel, text="⬛ ОСТАНОВИТЬ", command=self.app.stop_process, state=tk.DISABLED)
+        # ИЗМЕНЕНИЕ: Кнопка стоп теперь всегда активна по умолчанию
+        self.btn_stop_all = ttk.Button(top_panel, text="⬛ ОСТАНОВИТЬ", command=self.app.stop_process, state=tk.NORMAL)
         self.btn_stop_all.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
         # === СРЕДНЯЯ ЧАСТЬ: ТАБЛИЦА СПИСКОВ ===
@@ -254,12 +255,13 @@ class UIManager:
 
     def update_buttons_state(self, is_running):
         """Обновляет состояние кнопок запуска/остановки"""
+        # ИЗМЕНЕНИЕ: Кнопка СТОП теперь всегда доступна, чтобы можно было принудительно убить процессы
+        self.btn_stop_all.config(state=tk.NORMAL)
+
         if is_running:
             self.btn_start_all.config(state=tk.DISABLED)
-            self.btn_stop_all.config(state=tk.NORMAL)
         else:
             self.btn_start_all.config(state=tk.NORMAL)
-            self.btn_stop_all.config(state=tk.DISABLED)
 
     def create_settings_tab(self, parent):
         """Вкладка настроек, объединяющая Tools, Testing и Domains"""
