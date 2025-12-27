@@ -1,12 +1,12 @@
 {
     "game_filter": false,
     "list_profile_map": {
-        "discord.txt": "1.8.5 - General (ALT8)",
-        "list-general.txt": "1.8.5 - General (ALT7)",
-        "youtube.txt": "1.8.5 - General (ALT7)",
-        "telegram.txt": "1.8.5 - General (ALT7)",
-        "[CUSTOM] list-custom.txt": "1.8.5 - General (ALT7)",
-        "twitter.txt": "1.8.5 - General (ALT7)"
+        "discord.txt": "1.9.1 - General (ALT8)",
+        "list-general.txt": "1.9.1 - General (ALT10)",
+        "youtube.txt": "1.9.1 - General (ALT10)",
+        "telegram.txt": "\u041e\u0422\u041a\u041b\u042e\u0427\u0415\u041d\u041e",
+        "[CUSTOM] list-custom.txt": "1.9.1 - General (ALT10)",
+        "twitter.txt": "\u041e\u0422\u041a\u041b\u042e\u0427\u0415\u041d\u041e"
     },
     "list_ipset_map": {
         "discord.txt": "ipset-one.txt",
