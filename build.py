@@ -3,6 +3,9 @@ import subprocess
 import sys
 import argparse
 
+# Импортируем генератор батника из исходников
+from app_src.batch_gen import get_update_bat_content
+
 # --- Конфигурация ---
 LAUNCHER_SCRIPT = "launcher.py"
 PROJECT_NAME = "dpi_gui_launcher"
@@ -13,39 +16,9 @@ def create_update_bat(dist_dir):
     """Создает файл update.bat в папке сборки."""
     bat_path = os.path.join(dist_dir, "update.bat")
     
-    # Содержимое батника
-    bat_content = f"""@echo off
-chcp 65001 >nul
-title DPI GUI Updater
-setlocal
+    # Получаем контент из единого источника
+    bat_content = get_update_bat_content(exe_name=f"{PROJECT_NAME}.exe")
 
-:: ОЧИСТКА ПЕРЕМЕННЫХ СРЕДЫ ОТ PYINSTALLER
-set PYTHONHOME=
-set PYTHONPATH=
-
-echo ==========================================
-echo       DPI GUI - ЗАПУСК ОБНОВЛЕНИЯ
-echo ==========================================
-echo.
-echo [1/3] Ожидание закрытия программы...
-timeout /t 3 /nobreak >nul
-
-echo [2/3] Принудительная остановка процессов...
-taskkill /F /IM "winws.exe" >nul 2>&1
-taskkill /F /IM "ZapretDPIBypass" >nul 2>&1
-taskkill /F /IM "{PROJECT_NAME}.exe" >nul 2>&1
-taskkill /F /IM "pythonw.exe" /FI "WINDOWTITLE eq DPI_GUI*" >nul 2>&1
-
-echo [3/3] Запуск лаунчера в режиме обновления...
-if exist "{PROJECT_NAME}.exe" (
-    start "" "{PROJECT_NAME}.exe" --update
-) else (
-    echo.
-    echo [ОШИБКА] Файл {PROJECT_NAME}.exe не найден!
-    pause
-)
-exit
-"""
     try:
         with open(bat_path, "w", encoding="utf-8") as f:
             f.write(bat_content)

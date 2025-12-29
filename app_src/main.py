@@ -67,6 +67,7 @@ try:
     import power_handler
     from ui_manager import UIManager
     from domain_manager import DomainManager
+    from batch_gen import get_update_bat_content
 except Exception as e:
     print(traceback.format_exc(), file=sys.stderr)
     sys.exit(1)
@@ -281,45 +282,8 @@ class App:
             else:
                 current_exe_name = "dpi_gui_launcher.exe"
 
-            launcher_script = "launcher.py"
-            python_runtime = "python_runtime\\python.exe"
+            bat_content = get_update_bat_content(exe_name=current_exe_name)
             
-            bat_content = f"""@echo off
-chcp 65001 >nul
-title DPI GUI Updater
-setlocal
-set PYTHONHOME=
-set PYTHONPATH=
-echo ==========================================
-echo       DPI GUI - ЗАПУСК ОБНОВЛЕНИЯ
-echo ==========================================
-echo.
-echo [1/3] Ожидание закрытия программы...
-timeout /t 3 /nobreak >nul
-echo [2/3] Принудительная остановка процессов...
-taskkill /F /IM "winws.exe" >nul 2>&1
-taskkill /F /IM "ZapretDPIBypass" >nul 2>&1
-taskkill /F /IM "{current_exe_name}" >nul 2>&1
-taskkill /F /IM "pythonw.exe" /FI "WINDOWTITLE eq DPI_GUI*" >nul 2>&1
-echo [3/3] Запуск лаунчера в режиме обновления...
-if exist "{current_exe_name}" (
-    start "" "{current_exe_name}" --update
-) else (
-    if exist "{launcher_script}" (
-        if exist "{python_runtime}" (
-            start "" "{python_runtime}" "{launcher_script}" --update
-        ) else (
-            start "" python "{launcher_script}" --update
-        )
-    ) else (
-        echo.
-        echo [ОШИБКА] Файл {current_exe_name} не найден!
-        echo Пожалуйста, переустановите программу.
-        pause
-    )
-)
-exit
-"""
             with open(bat_path, "w", encoding="utf-8") as f:
                 f.write(bat_content)
         except Exception as e:
@@ -331,10 +295,16 @@ exit
                 self.save_app_settings()
                 self.stop_process()
                 self.create_update_script()
+                
                 base_dir = os.path.dirname(self.app_dir)
                 bat_path = os.path.join(base_dir, "update.bat")
+                
                 if os.path.exists(bat_path):
-                    os.startfile(bat_path)
+                    # ИСПРАВЛЕНИЕ: Запускаем батник через EXPLORER.EXE.
+                    # Это полностью разрывает связь с текущим процессом (и его переменными среды).
+                    # Эффект точно такой же, как если бы пользователь кликнул дважды мышкой.
+                    subprocess.Popen(['explorer.exe', bat_path])
+                    
                     self.root.quit()
                 else:
                     messagebox.showerror("Ошибка", "Файл update.bat не найден.")
