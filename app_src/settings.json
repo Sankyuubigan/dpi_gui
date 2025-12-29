@@ -1,12 +1,13 @@
 {
     "game_filter": false,
     "list_profile_map": {
-        "discord.txt": "1.9.1 - General (ALT8)",
+        "discord.txt": "1.9.1 - General (ALT10)",
         "list-general.txt": "1.9.1 - General (ALT10)",
-        "youtube.txt": "1.9.1 - General (ALT10)",
+        "youtube.txt": "1.9.1 - YouTube (Special)",
         "telegram.txt": "\u041e\u0422\u041a\u041b\u042e\u0427\u0415\u041d\u041e",
         "[CUSTOM] list-custom.txt": "1.9.1 - General (ALT10)",
-        "twitter.txt": "\u041e\u0422\u041a\u041b\u042e\u0427\u0415\u041d\u041e"
+        "twitter.txt": "\u041e\u0422\u041a\u041b\u042e\u0427\u0415\u041d\u041e",
+        "list-google.txt": "1.9.1 - YouTube (Special)"
     },
     "list_ipset_map": {
         "discord.txt": "ipset-one.txt",
@@ -14,7 +15,8 @@
         "youtube.txt": "ipset-one.txt",
         "telegram.txt": "ipset-Telegram.txt",
         "[CUSTOM] list-custom.txt": "ipset-one.txt",
-        "twitter.txt": "ipset-one.txt"
+        "twitter.txt": "ipset-one.txt",
+        "list-google.txt": "ipset-one.txt"
     },
     "custom_list_path": "C:/Users/user/Desktop/list-custom.txt"
 }

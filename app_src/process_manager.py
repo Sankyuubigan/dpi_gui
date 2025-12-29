@@ -31,36 +31,26 @@ def _clean_profile_args(args_str):
     Удаляет глобальные аргументы захвата (--wf-...), 
     чтобы они не конфликтовали при склейке через --new.
     """
-    # Удаляем --wf-tcp=... и --wf-udp=...
     cleaned = re.sub(r'--wf-tcp=[^ ]+', '', args_str)
     cleaned = re.sub(r'--wf-udp=[^ ]+', '', cleaned)
     return cleaned.strip()
 
 def start_process(profile, base_dir, game_filter_enabled, log_callback, custom_list_path=None, is_service=False):
-    """
-    Запускает одиночный процесс (используется для тестов и старой логики).
-    Возвращает объект subprocess.Popen.
-    """
-    bin_dir = os.path.join(base_dir, 'bin')
-    executable_path = os.path.join(bin_dir, WINWS_EXE)
-    lists_dir = os.path.join(base_dir, 'lists')
+    # Используем прямые слеши для надежности
+    bin_dir = os.path.join(base_dir, 'bin').replace('\\', '/')
+    executable_path = os.path.join(bin_dir, WINWS_EXE).replace('\\', '/')
+    lists_dir = os.path.join(base_dir, 'lists').replace('\\', '/')
     
     if not os.path.exists(executable_path):
         log_callback(f"Ошибка: Файл не найден: {executable_path}")
         return None
 
-    # Формируем аргументы
     raw_args = profile["args"].format(
         LISTS_DIR=lists_dir,
         BIN_DIR=bin_dir,
         GAME_FILTER="1024-65535" if game_filter_enabled else "0"
     )
 
-    # Для одиночного запуска не обязательно чистить wf-аргументы, 
-    # но если профиль рассчитан на --new, лучше оставить как есть в raw_args.
-    # Но так как мы используем те же профили, что и для combined, 
-    # в них могут быть wf-фильтры. Оставим их, так как это одиночный процесс.
-    
     try:
         args_list = shlex.split(raw_args)
     except:
@@ -68,11 +58,11 @@ def start_process(profile, base_dir, game_filter_enabled, log_callback, custom_l
 
     final_args = []
     for arg in args_list:
-        # Подмена списка, если передан custom_list_path
         if arg.startswith('--hostlist=') or arg.startswith('--hostlist-auto='):
              if custom_list_path and ('list-general.txt' in arg or 'custom_list.txt' in arg):
                  prefix = arg.split('=')[0]
-                 final_args.append(f'{prefix}={custom_list_path}')
+                 clean_custom_path = custom_list_path.replace('\\', '/')
+                 final_args.append(f'{prefix}={clean_custom_path}')
              else:
                  final_args.append(arg)
         else:
@@ -81,14 +71,13 @@ def start_process(profile, base_dir, game_filter_enabled, log_callback, custom_l
     command = [executable_path] + final_args
 
     try:
-        # Скрываем окно консоли
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         
         process = subprocess.Popen(
             command,
             cwd=base_dir,
-            stdout=subprocess.DEVNULL, # Для тестов нам не нужен вывод в лог
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             startupinfo=startupinfo,
             creationflags=subprocess.CREATE_NO_WINDOW
@@ -99,23 +88,17 @@ def start_process(profile, base_dir, game_filter_enabled, log_callback, custom_l
         return None
 
 def start_combined_process(configs, base_dir, game_filter_enabled, log_callback):
-    """
-    Запускает ОДИН процесс для нескольких конфигураций.
-    configs: список кортежей [(list_path, profile_obj, ipset_path), ...]
-    ipset_path может быть None, если выключен.
-    """
-    bin_dir = os.path.join(base_dir, 'bin')
-    executable_path = os.path.join(bin_dir, WINWS_EXE)
-    lists_dir = os.path.join(base_dir, 'lists')
+    # Используем прямые слеши для надежности
+    bin_dir = os.path.join(base_dir, 'bin').replace('\\', '/')
+    executable_path = os.path.join(bin_dir, WINWS_EXE).replace('\\', '/')
+    lists_dir = os.path.join(base_dir, 'lists').replace('\\', '/')
     
     if not os.path.exists(executable_path):
         log_callback(f"КРИТИЧЕСКАЯ ОШИБКА: Файл не найден: {executable_path}")
         return None
 
-    # 1. Глобальные настройки захвата (фильтр WinDivert)
     game_ports = ",1024-65535" if game_filter_enabled else ""
     
-    # Захватываем весь нужный трафик глобально
     global_args = [
         f"--wf-tcp=80,443{game_ports}",
         f"--wf-udp=443,50000-65535{game_ports}"
@@ -123,42 +106,38 @@ def start_combined_process(configs, base_dir, game_filter_enabled, log_callback)
     
     final_args = list(global_args)
 
-    # 2. Сборка аргументов для каждого списка
     for i, (list_path, profile, ipset_path) in enumerate(configs):
         if i > 0:
             final_args.append("--new")
             
-        # Форматируем аргументы профиля
         raw_args = profile["args"].format(
             LISTS_DIR=lists_dir,
             BIN_DIR=bin_dir,
             GAME_FILTER="1024-65535" if game_filter_enabled else "0"
         )
         
-        # Очищаем от глобальных wf-фильтров (они уже заданы в начале)
         cleaned_args = _clean_profile_args(raw_args)
         
         try:
+            # posix=True корректно обрабатывает кавычки
             args_list = shlex.split(cleaned_args)
         except:
             args_list = cleaned_args.split()
             
-        # Подмена списка и IPSet
         processed_args = []
         for arg in args_list:
             if arg.startswith('--hostlist=') or arg.startswith('--hostlist-auto='):
                  if 'list-general.txt' in arg or 'custom_list.txt' in arg:
                      prefix = arg.split('=')[0]
-                     processed_args.append(f'{prefix}={list_path}')
+                     clean_list_path = list_path.replace('\\', '/')
+                     processed_args.append(f'{prefix}={clean_list_path}')
                  else:
                      processed_args.append(arg)
             elif arg.startswith('--ipset='):
-                # Если передан конкретный ipset для этого списка - используем его
                 if ipset_path:
-                    processed_args.append(f'--ipset={ipset_path}')
+                    clean_ipset_path = ipset_path.replace('\\', '/')
+                    processed_args.append(f'--ipset={clean_ipset_path}')
                 else:
-                    # Если ipset выключен (None), мы пропускаем этот аргумент,
-                    # тем самым убирая ipset из профиля (если он там был)
                     pass 
             else:
                 processed_args.append(arg)
@@ -166,7 +145,7 @@ def start_combined_process(configs, base_dir, game_filter_enabled, log_callback)
         final_args.extend(processed_args)
 
     final_command = [executable_path] + final_args
-
+    
     if not is_admin():
         log_callback("ОШИБКА: Требуются права администратора")
         return None
