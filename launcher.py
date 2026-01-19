@@ -386,10 +386,14 @@ def work_thread():
                 
                 error_msg = "Процесс завершился сразу после запуска."
                 if os.path.exists(APP_DEBUG_LOG):
-                    with open(APP_DEBUG_LOG, "r", encoding="utf-8", errors="ignore") as f:
-                        content = f.read().strip()
-                        if content:
-                            error_msg = f"Ошибка запуска:\n{content[-800:]}"
+                    try:
+                        with open(APP_DEBUG_LOG, "r", encoding="utf-8", errors="ignore") as f:
+                            content = f.read().strip()
+                            if content:
+                                # Читаем последние 1500 символов, чтобы влез Traceback
+                                error_msg = f"Ошибка запуска:\n...\n{content[-1500:]}" if len(content) > 1500 else f"Ошибка запуска:\n{content}"
+                    except Exception as e:
+                        error_msg += f"\n(Не удалось прочитать лог: {e})"
                 
                 if gui: gui.show_error_and_wait(error_msg)
             else:

@@ -314,12 +314,20 @@ class App:
     def on_closing(self):
         try:
             self.save_app_settings()
+            # ПРИНУДИТЕЛЬНАЯ ОСТАНОВКА БЕЗ ВОПРОСОВ, чтобы не висел процесс
             if self.active_processes:
-                if messagebox.askyesno("Выход", "Остановить процесс обхода перед выходом?"):
-                    self.stop_process()
-            self.root.destroy()
+                self.stop_process()
         except Exception as e:
+            pass
+            
+        try:
             self.root.destroy()
+        except:
+            pass
+            
+        # ГАРАНТИРОВАННОЕ УБИЙСТВО ПРОЦЕССА PYTHON
+        # Это решает проблему "Папка уже используется"
+        os._exit(0)
 
     def _handle_ui_error(self, e):
         error_details = traceback.format_exc()

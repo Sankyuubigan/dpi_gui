@@ -334,7 +334,7 @@ class UIManager:
         discord_test_sub = ttk.Frame(testing_frame)
         discord_test_sub.pack(fill=tk.X, pady=5)
         ttk.Button(discord_test_sub, text="Очистить кэш Discord", command=lambda: self.app.run_in_thread(self.app.settings_manager.clear_discord_cache, self.app.app_dir, self.app.log_message)).pack(side=tk.LEFT, padx=5)
-        ttk.Button(discord_test_sub, text="Интерактивный тест Discord", command=self.app.run_discord_test).pack(side=tk.LEFT, padx=5)
+        # КНОПКА ИНТЕРАКТИВНОГО ТЕСТА УДАЛЕНА ПО ЗАПРОСУ
 
         # --- Раздел Доменов ---
         domains_frame = ttk.LabelFrame(scrollable_frame, text="Поиск доменов (Performance API)")
