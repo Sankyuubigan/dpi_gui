@@ -36,18 +36,21 @@ def _clean_profile_args(args_str):
     return cleaned.strip()
 
 def start_process(profile, base_dir, game_filter_enabled, log_callback, custom_list_path=None, is_service=False):
-    # Используем прямые слеши для надежности
+    # Используем прямые слеши для надежности и абсолютные пути
     bin_dir = os.path.join(base_dir, 'bin').replace('\\', '/')
     executable_path = os.path.join(bin_dir, WINWS_EXE).replace('\\', '/')
     lists_dir = os.path.join(base_dir, 'lists').replace('\\', '/')
+    exclude_dir = os.path.join(base_dir, 'exclude').replace('\\', '/')
     
     if not os.path.exists(executable_path):
         log_callback(f"Ошибка: Файл не найден: {executable_path}")
         return None
 
+    # Форматируем аргументы с абсолютными путями
     raw_args = profile["args"].format(
         LISTS_DIR=lists_dir,
         BIN_DIR=bin_dir,
+        EXCLUDE_DIR=exclude_dir,
         GAME_FILTER="1024-65535" if game_filter_enabled else "0"
     )
 
@@ -88,10 +91,11 @@ def start_process(profile, base_dir, game_filter_enabled, log_callback, custom_l
         return None
 
 def start_combined_process(configs, base_dir, game_filter_enabled, log_callback):
-    # Используем прямые слеши для надежности
+    # Используем прямые слеши для надежности и абсолютные пути
     bin_dir = os.path.join(base_dir, 'bin').replace('\\', '/')
     executable_path = os.path.join(bin_dir, WINWS_EXE).replace('\\', '/')
     lists_dir = os.path.join(base_dir, 'lists').replace('\\', '/')
+    exclude_dir = os.path.join(base_dir, 'exclude').replace('\\', '/')
     
     if not os.path.exists(executable_path):
         log_callback(f"КРИТИЧЕСКАЯ ОШИБКА: Файл не найден: {executable_path}")
@@ -113,6 +117,7 @@ def start_combined_process(configs, base_dir, game_filter_enabled, log_callback)
         raw_args = profile["args"].format(
             LISTS_DIR=lists_dir,
             BIN_DIR=bin_dir,
+            EXCLUDE_DIR=exclude_dir,
             GAME_FILTER="1024-65535" if game_filter_enabled else "0"
         )
         

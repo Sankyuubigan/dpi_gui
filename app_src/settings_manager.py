@@ -50,13 +50,15 @@ def install_service(base_dir, log_callback, profile, specific_list_path=None):
     """
     log_callback(f"\n--- Установка службы для профиля: {profile['name']} ---")
     
-    bin_dir = os.path.join(base_dir, 'bin')
-    lists_dir = os.path.join(base_dir, 'lists')
-    executable_path = os.path.join(bin_dir, WINWS_EXE)
+    bin_dir = os.path.join(base_dir, 'bin').replace('\\', '/')
+    lists_dir = os.path.join(base_dir, 'lists').replace('\\', '/')
+    exclude_dir = os.path.join(base_dir, 'exclude').replace('\\', '/')
+    executable_path = os.path.join(bin_dir, WINWS_EXE).replace('\\', '/')
     
     raw_args = profile["args"].format(
         LISTS_DIR=lists_dir,
         BIN_DIR=bin_dir,
+        EXCLUDE_DIR=exclude_dir,
         GAME_FILTER="1024-65535"
     )
 
