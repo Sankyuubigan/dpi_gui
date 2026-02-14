@@ -10,13 +10,13 @@
         "list-google.txt": "1.9.1 - YouTube (Special)"
     },
     "list_ipset_map": {
-        "discord.txt": "ipset-one.txt",
-        "list-general.txt": "ipset-one.txt",
-        "youtube.txt": "ipset-one.txt",
-        "telegram.txt": "ipset-Telegram.txt",
-        "[CUSTOM] list-custom.txt": "ipset-one.txt",
-        "twitter.txt": "ipset-one.txt",
-        "list-google.txt": "ipset-one.txt"
+        "discord.txt": "OFF",
+        "list-general.txt": "OFF",
+        "youtube.txt": "OFF",
+        "telegram.txt": "OFF",
+        "[CUSTOM] list-custom.txt": "OFF",
+        "twitter.txt": "OFF",
+        "list-google.txt": "OFF"
     },
     "custom_list_path": "C:/Users/user/Desktop/list-custom.txt"
 }

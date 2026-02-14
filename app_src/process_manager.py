@@ -139,13 +139,13 @@ def start_combined_process(configs, base_dir, game_filter_enabled, log_callback)
                  else:
                      processed_args.append(arg)
             elif arg.startswith('--ipset='):
-                if ipset_path:
-                    clean_ipset_path = ipset_path.replace('\\', '/')
-                    processed_args.append(f'--ipset={clean_ipset_path}')
-                else:
-                    pass 
+                pass
             else:
                 processed_args.append(arg)
+        
+        if ipset_path and ipset_path != "OFF":
+            clean_ipset_path = ipset_path.replace('\\', '/')
+            processed_args.append(f'--ipset={clean_ipset_path}')
         
         final_args.extend(processed_args)
 
