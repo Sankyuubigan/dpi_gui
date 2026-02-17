@@ -79,7 +79,7 @@ def start_process(profile, base_dir, game_filter_enabled, log_callback, custom_l
         
         process = subprocess.Popen(
             command,
-            cwd=base_dir,
+            cwd=bin_dir,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             startupinfo=startupinfo,
@@ -160,7 +160,7 @@ def start_combined_process(configs, base_dir, game_filter_enabled, log_callback)
     try:
         process = subprocess.Popen(
             final_command,
-            cwd=base_dir,
+            cwd=bin_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
