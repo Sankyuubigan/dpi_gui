@@ -23,3 +23,4 @@ app_src/.version_date
 zapret-discord-youtube*
 /env
 /roo_tests
+/app_src/hosts_downloaded.txt

@@ -10,6 +10,8 @@ import logging
 import time
 import datetime
 import ctypes
+import requests
+import webbrowser
 
 APP_SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP_SOURCE_DIR)
@@ -310,6 +312,82 @@ class App:
                     messagebox.showerror("Ошибка", "Файл update.bat не найден.")
             except Exception as e:
                 messagebox.showerror("Ошибка", f"Не удалось запустить обновление:\n{e}")
+
+    def update_ipset_list(self):
+        """Скачивает актуальный список ipset с GitHub"""
+        if not messagebox.askyesno("Обновление IPSet", "Будет загружен актуальный список IP-адресов с GitHub.\nПродолжить?"):
+            return
+        
+        self.run_in_thread(self._do_update_ipset)
+
+    def _do_update_ipset(self):
+        try:
+            url = "https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/refs/heads/main/.service/ipset-service.txt"
+            ipset_path = os.path.join(self.app_dir, 'ipsets', 'ipset-all.txt')
+            
+            self.log_message("Скачиваю ipset с GitHub...", "status")
+            
+            response = requests.get(url, timeout=30)
+            if response.status_code == 200:
+                with open(ipset_path, 'w', encoding='utf-8') as f:
+                    f.write(response.text)
+                self.log_message(f"IPSet обновлен: {ipset_path}", "success")
+                messagebox.showinfo("Успех", "IPSet список успешно обновлен!")
+            else:
+                self.log_message(f"Ошибка скачивания: {response.status_code}", "error")
+                messagebox.showerror("Ошибка", f"Не удалось скачать ipset: {response.status_code}")
+        except Exception as e:
+            self.log_message(f"Ошибка: {e}", "error")
+            messagebox.showerror("Ошибка", f"Не удалось обновить ipset:\n{e}")
+
+    def update_hosts_file(self):
+        """Скачивает hosts файл и открывает его для ознакомления"""
+        if not messagebox.askyesno("Обновление Hosts", "Будет загружен файл hosts с GitHub и открыт для просмотра.\nВы можете вручную добавить нужные записи в системный hosts файл.\n\nПродолжить?"):
+            return
+        
+        self.run_in_thread(self._do_update_hosts)
+
+    def _do_update_hosts(self):
+        try:
+            url = "https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/refs/heads/main/.service/hosts"
+            temp_path = os.path.join(self.app_dir, 'hosts_downloaded.txt')
+            
+            self.log_message("Скачиваю hosts с GitHub...", "status")
+            
+            response = requests.get(url, timeout=30)
+            if response.status_code == 200:
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    f.write(response.text)
+                self.log_message(f"Hosts скачан: {temp_path}", "success")
+                
+                webbrowser.open_new(temp_path)
+                
+                messagebox.showinfo("Информация", "Файл hosts скачан и открыт в браузере.\n\nЧтобы применить изменения, нужно вручную добавить содержимое в системный файл:\nC:\\Windows\\System32\\drivers\\etc\\hosts")
+            else:
+                self.log_message(f"Ошибка скачивания: {response.status_code}", "error")
+                messagebox.showerror("Ошибка", f"Не удалось скачать hosts: {response.status_code}")
+        except Exception as e:
+            self.log_message(f"Ошибка: {e}", "error")
+            messagebox.showerror("Ошибка", f"Не удалось обновить hosts:\n{e}")
+
+    def open_ipset_folder(self):
+        """Открывает папку ipsets в проводнике"""
+        try:
+            ipsets_path = os.path.join(self.app_dir, 'ipsets')
+            if os.path.exists(ipsets_path):
+                subprocess.Popen(['explorer.exe', ipsets_path])
+            else:
+                messagebox.showerror("Ошибка", f"Папка не найдена: {ipsets_path}")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось открыть проводник:\n{e}")
+
+    def open_hosts_folder(self):
+        """Открывает папку с hosts файлом в проводнике"""
+        try:
+            hosts_dir = r"C:\Windows\System32\drivers\etc"
+            subprocess.Popen(['explorer.exe', hosts_dir])
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось открыть проводник:\n{e}")
 
     def on_closing(self):
         try:

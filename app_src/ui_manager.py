@@ -312,6 +312,21 @@ class UIManager:
         ttk.Button(btn_frame, text="♻ Обновить программу", command=self.app.trigger_update).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="🔍 Создать IPSet из процесса", command=self.open_ip_grabber).pack(side=tk.LEFT, padx=5)
 
+        # --- Обновления ---
+        updates_frame = ttk.LabelFrame(scrollable_frame, text="Обновления (Zapret)")
+        updates_frame.pack(fill=tk.X, pady=10, padx=10)
+        
+        update_btns = ttk.Frame(updates_frame)
+        update_btns.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(update_btns, text="📥 Обновить IPSet (GitHub)", command=self.app.update_ipset_list).pack(side=tk.LEFT, padx=5)
+        ttk.Button(update_btns, text="📄 Скачать Hosts файл", command=self.app.update_hosts_file).pack(side=tk.LEFT, padx=5)
+        ttk.Button(update_btns, text="📂 Папка IPSet", command=self.app.open_ipset_folder).pack(side=tk.LEFT, padx=5)
+        ttk.Button(update_btns, text="📂 Папка Hosts", command=self.app.open_hosts_folder).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(updates_frame, text="IPSet: фильтрует трафик по IP-адресам. Hosts: дополнительная защита через системный файл.", 
+                  foreground="gray", font=("Segoe UI", 8)).pack(anchor=tk.W, padx=5, pady=(0, 5))
+
         # --- Раздел Тестирования ---
         testing_frame = ttk.LabelFrame(scrollable_frame, text="Тестирование")
         testing_frame.pack(fill=tk.X, pady=10, padx=10)
