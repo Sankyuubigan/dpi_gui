@@ -35,8 +35,52 @@ def _clean_profile_args(args_str):
     cleaned = re.sub(r'--wf-udp=[^ ]+', '', cleaned)
     return cleaned.strip()
 
+def _ensure_file_exists(filepath, default_content="# Auto-generated list\n"):
+    """Создает файл с дефолтным содержимым, если он не существует."""
+    if not os.path.exists(filepath):
+        try:
+            dirname = os.path.dirname(filepath)
+            if not os.path.exists(dirname):
+                os.makedirs(dirname)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(default_content)
+            logger.info(f"Created missing file: {filepath}")
+        except Exception as e:
+            logger.error(f"Failed to create file {filepath}: {e}")
+
+def _resolve_ipset_path(requested_path, base_dir):
+    """
+    Находит реальный путь к ipset файлу.
+    Профили ссылаются на lists/ipset-all.txt, но файл может быть в ipsets/.
+    Если файл не найден - создаем заглушку.
+    Возвращает ИСПРАВЛЕННЫЙ ПУТЬ.
+    """
+    # Если файл существует по запрошенному пути
+    if os.path.exists(requested_path):
+        return requested_path
+    
+    filename = os.path.basename(requested_path)
+    
+    # Ищем в папке ipsets
+    ipsets_dir = os.path.join(base_dir, 'ipsets')
+    alt_path = os.path.join(ipsets_dir, filename)
+    if os.path.exists(alt_path):
+        logger.info(f"IPSet found in alternative dir: {alt_path}")
+        return alt_path
+        
+    # Если не нашли - создаем заглушку в папке ipsets (или там, где просят)
+    logger.info(f"IPSet {filename} not found. Creating dummy...")
+    
+    # Предпочитаем создавать в ipsets, чтобы не мусорить в lists
+    target_dir = ipsets_dir
+    if not os.path.exists(target_dir):
+        os.makedirs(target_dir)
+    
+    final_path = os.path.join(target_dir, filename)
+    _ensure_file_exists(final_path, "# Placeholder IPSet\n0.0.0.0/32\n")
+    return final_path
+
 def start_process(profile, base_dir, game_filter_enabled, log_callback, custom_list_path=None, is_service=False):
-    # Используем прямые слеши для надежности и абсолютные пути
     bin_dir = os.path.join(base_dir, 'bin').replace('\\', '/')
     executable_path = os.path.join(bin_dir, WINWS_EXE).replace('\\', '/')
     lists_dir = os.path.join(base_dir, 'lists').replace('\\', '/')
@@ -46,12 +90,11 @@ def start_process(profile, base_dir, game_filter_enabled, log_callback, custom_l
         log_callback(f"Ошибка: Файл не найден: {executable_path}")
         return None
 
-    # Форматируем аргументы с абсолютными путями
     raw_args = profile["args"].format(
         LISTS_DIR=lists_dir,
         BIN_DIR=bin_dir,
         EXCLUDE_DIR=exclude_dir,
-        GAME_FILTER="1024-65535" if game_filter_enabled else "0"
+        GAME_FILTER="1024-65535" if game_filter_enabled else "12"
     )
 
     try:
@@ -91,7 +134,6 @@ def start_process(profile, base_dir, game_filter_enabled, log_callback, custom_l
         return None
 
 def start_combined_process(configs, base_dir, game_filter_enabled, log_callback):
-    # Используем прямые слеши для надежности и абсолютные пути
     bin_dir = os.path.join(base_dir, 'bin').replace('\\', '/')
     executable_path = os.path.join(bin_dir, WINWS_EXE).replace('\\', '/')
     lists_dir = os.path.join(base_dir, 'lists').replace('\\', '/')
@@ -104,11 +146,19 @@ def start_combined_process(configs, base_dir, game_filter_enabled, log_callback)
     game_ports = ",1024-65535" if game_filter_enabled else ""
     
     global_args = [
-        f"--wf-tcp=80,443{game_ports}",
-        f"--wf-udp=443,50000-65535{game_ports}"
+        f"--wf-tcp=80,443,2053,2083,2087,2096,8443{game_ports}",
+        f"--wf-udp=443,19294-19344,50000-50100{game_ports}"
     ]
     
     final_args = list(global_args)
+    
+    # Пути к пользовательским спискам (как в BAT файле)
+    user_hostlist_exclude = os.path.join(base_dir, 'exclude', 'list-exclude-user.txt').replace('\\', '/')
+    user_ipset_exclude = os.path.join(base_dir, 'exclude', 'ipset-exclude-user.txt').replace('\\', '/')
+    
+    # Создаем файлы, если их нет, чтобы winws не ругался
+    _ensure_file_exists(user_hostlist_exclude, "# User exclude domains\ndomain.example.abc\n")
+    _ensure_file_exists(user_ipset_exclude, "# User exclude IPs\n203.0.113.113/32\n")
 
     for i, (list_path, profile, ipset_path) in enumerate(configs):
         if i > 0:
@@ -118,19 +168,20 @@ def start_combined_process(configs, base_dir, game_filter_enabled, log_callback)
             LISTS_DIR=lists_dir,
             BIN_DIR=bin_dir,
             EXCLUDE_DIR=exclude_dir,
-            GAME_FILTER="1024-65535" if game_filter_enabled else "0"
+            GAME_FILTER="1024-65535" if game_filter_enabled else "12"
         )
         
         cleaned_args = _clean_profile_args(raw_args)
         
         try:
-            # posix=True корректно обрабатывает кавычки
             args_list = shlex.split(cleaned_args)
         except:
             args_list = cleaned_args.split()
             
         processed_args = []
+        
         for arg in args_list:
+            # 1. Обработка hostlist (замена путей)
             if arg.startswith('--hostlist=') or arg.startswith('--hostlist-auto='):
                  if 'list-general.txt' in arg or 'custom_list.txt' in arg:
                      prefix = arg.split('=')[0]
@@ -138,18 +189,46 @@ def start_combined_process(configs, base_dir, game_filter_enabled, log_callback)
                      processed_args.append(f'{prefix}={clean_list_path}')
                  else:
                      processed_args.append(arg)
+            
+            # 2. Инъекция пользовательских исключений доменов (HOSTLIST EXCLUDE)
+            # В BAT: --hostlist-exclude="list-exclude.txt" --hostlist-exclude="list-exclude-user.txt"
+            elif arg.startswith('--hostlist-exclude='):
+                processed_args.append(arg) # Основной
+                processed_args.append(f'--hostlist-exclude={user_hostlist_exclude}') # Пользовательский
+
+            # 3. Инъекция пользовательских исключений IP (IPSET EXCLUDE)
+            # В BAT: --ipset-exclude="ipset-exclude.txt" --ipset-exclude="ipset-exclude-user.txt"
+            elif arg.startswith('--ipset-exclude='):
+                processed_args.append(arg) # Основной
+                processed_args.append(f'--ipset-exclude={user_ipset_exclude}') # Пользовательский
+            
+            # 4. Обработка IPSet (ГЛАВНОЕ ИСПРАВЛЕНИЕ БАГА)
             elif arg.startswith('--ipset='):
-                pass
+                if ipset_path and ipset_path != "OFF":
+                    # Если выбран в UI
+                    clean_ipset_path = ipset_path.replace('\\', '/')
+                    processed_args.append(f'--ipset={clean_ipset_path}')
+                else:
+                    # Берем из профиля и ИСПРАВЛЯЕМ ПУТЬ
+                    raw_path = arg.split('=', 1)[1].strip('"')
+                    # Находим реальный путь (или создаем заглушку)
+                    valid_path = _resolve_ipset_path(raw_path, base_dir).replace('\\', '/')
+                    # ПЕРЕДАЕМ ИСПРАВЛЕННЫЙ ПУТЬ
+                    processed_args.append(f'--ipset={valid_path}')
+            
             else:
                 processed_args.append(arg)
-        
-        if ipset_path and ipset_path != "OFF":
-            clean_ipset_path = ipset_path.replace('\\', '/')
-            processed_args.append(f'--ipset={clean_ipset_path}')
         
         final_args.extend(processed_args)
 
     final_command = [executable_path] + final_args
+    
+    # Логируем команду для отладки
+    log_file_path = os.path.join(base_dir, "..", "roo_tests", "last_launch_cmd.txt")
+    try:
+        with open(log_file_path, "w", encoding="utf-8") as f:
+            f.write(" ".join(final_command))
+    except: pass
     
     if not is_admin():
         log_callback("ОШИБКА: Требуются права администратора")

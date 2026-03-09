@@ -15,3 +15,17 @@ youtu.be
 yt-video-upload.l.google.com
 ytimg.com
 ytimg.l.google.com
+
+
+studio.youtube.com;
+accounts.youtube.com;
+googleusercontent.com;
+yt.com;
+youtube.googleapis.com
+
+youtube.ru
+nhacmp3youtube.com
+1e100.net
+l.google.com
+ggpht.com
+googleads.g.doubleclick.net

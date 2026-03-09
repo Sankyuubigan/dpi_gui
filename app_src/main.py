@@ -115,6 +115,20 @@ class App:
         self.run_in_thread(self.log_queue_monitor)
         self.create_update_script()
         self.check_admin_status_log()
+        
+        # Автоматическая проверка и скачивание ipset-all.txt при старте
+        self.check_ipset_on_startup()
+
+    def check_ipset_on_startup(self):
+        """Проверяет наличие ipset-all.txt и качает, если нет"""
+        ipset_path = os.path.join(self.app_dir, 'ipsets', 'ipset-all.txt')
+        # Также проверяем старый путь в lists на всякий случай
+        if not os.path.exists(ipset_path):
+             ipset_path = os.path.join(self.app_dir, 'lists', 'ipset-all.txt')
+        
+        if not os.path.exists(ipset_path):
+             self.log_message("IPSet список не найден. Загружаю...", "status")
+             self.run_in_thread(self._do_update_ipset)
 
     def check_admin_status_log(self):
         is_admin = process_manager.is_admin()
@@ -323,7 +337,9 @@ class App:
     def _do_update_ipset(self):
         try:
             url = "https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/refs/heads/main/.service/ipset-service.txt"
-            ipset_path = os.path.join(self.app_dir, 'ipsets', 'ipset-all.txt')
+            ipsets_dir = os.path.join(self.app_dir, 'ipsets')
+            os.makedirs(ipsets_dir, exist_ok=True)
+            ipset_path = os.path.join(ipsets_dir, 'ipset-all.txt')
             
             self.log_message("Скачиваю ipset с GitHub...", "status")
             
@@ -349,7 +365,7 @@ class App:
 
     def _do_update_hosts(self):
         try:
-            url = "https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/refs/heads/main/.service/hosts"
+            url = "https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/.service/hosts"
             temp_path = os.path.join(self.app_dir, 'hosts_downloaded.txt')
             
             self.log_message("Скачиваю hosts с GitHub...", "status")
