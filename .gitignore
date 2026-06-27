@@ -22,5 +22,6 @@ app_src/.version_date
 # Файлы антизапрета (пользовательские данные)
 zapret-discord-youtube*
 /env
-/roo_tests
+/test
 /app_src/hosts_downloaded.txt
+/roo_tests

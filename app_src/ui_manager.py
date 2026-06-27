@@ -19,7 +19,6 @@ class UIManager:
         self.notebook = None
         self.log_window = None
         
-        # Хранилище виджетов строк таблицы: { "filename": { "combo_prof": widget, "combo_ipset": widget, "status": widget, "pid": widget } }
         self.list_widgets = {} 
         self.scroll_frame_inner = None
         
@@ -67,28 +66,21 @@ class UIManager:
         self.create_settings_tab(tab_settings)
 
     def create_control_tab(self, parent):
-        """Создает главную вкладку управления (Таблица + Логи)"""
-        
-        # === ВЕРХНЯЯ ЧАСТЬ: КНОПКИ ===
         top_panel = ttk.Frame(parent)
         top_panel.pack(fill=tk.X, pady=(0, 10))
         
         self.btn_start_all = ttk.Button(top_panel, text="▶ ЗАПУСТИТЬ", command=self.app.run_all_configured)
         self.btn_start_all.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         
-        # ИЗМЕНЕНИЕ: Кнопка стоп теперь всегда активна по умолчанию
         self.btn_stop_all = ttk.Button(top_panel, text="⬛ ОСТАНОВИТЬ", command=self.app.stop_process, state=tk.NORMAL)
         self.btn_stop_all.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
-        # === СРЕДНЯЯ ЧАСТЬ: ТАБЛИЦА СПИСКОВ ===
         table_container = ttk.Frame(parent)
         table_container.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
-        # Заголовки таблицы
         header_frame = ttk.Frame(table_container)
         header_frame.pack(fill=tk.X, padx=5, pady=(5,0))
         
-        # Grid weight configuration
         header_frame.columnconfigure(0, weight=3, uniform="col_name")
         header_frame.columnconfigure(1, weight=5, uniform="col_prof")
         header_frame.columnconfigure(2, weight=3, uniform="col_ipset")
@@ -103,7 +95,6 @@ class UIManager:
         
         ttk.Separator(table_container, orient='horizontal').pack(fill='x', pady=5)
 
-        # Скроллируемая область для строк
         canvas_frame = ttk.Frame(table_container)
         canvas_frame.pack(fill=tk.BOTH, expand=True)
         
@@ -129,11 +120,9 @@ class UIManager:
         scrollbar.pack(side="right", fill="y")
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
 
-        # === НИЖНЯЯ ЧАСТЬ: ЛОГИ ===
         logs_container = ttk.LabelFrame(parent, text="Логи событий")
         logs_container.pack(fill=tk.BOTH, expand=True, pady=5)
         
-        # Панель инструментов логов
         log_tools = ttk.Frame(logs_container)
         log_tools.pack(fill=tk.X, padx=5, pady=2)
         
@@ -148,7 +137,6 @@ class UIManager:
         ttk.Button(log_tools, text="Сохранить", command=self.save_logs_to_file).pack(side=tk.RIGHT, padx=5)
         ttk.Button(log_tools, text="Очистить", command=self.clear_all_logs).pack(side=tk.RIGHT, padx=5)
         
-        # Окно логов
         self.log_window = scrolledtext.ScrolledText(logs_container, state='disabled', bg='black', fg='white', relief=tk.SUNKEN, borderwidth=1, height=10)
         self.log_window.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         setup_text_widget_bindings(self.log_window)
@@ -159,7 +147,6 @@ class UIManager:
         except: pass
 
     def refresh_lists_table(self):
-        """Перерисовывает строки таблицы"""
         for widget in self.scroll_frame_inner.winfo_children():
             widget.destroy()
         self.list_widgets.clear()
@@ -179,32 +166,27 @@ class UIManager:
         self.scroll_frame_inner.columnconfigure(4, weight=1, uniform="col_pid")
 
         for idx, list_filename in enumerate(available_lists):
-            # 1. Имя файла
             display_name = list_filename
             fg_color = "black"
             
-            # Если это кастомный список, выделим его цветом
             if list_filename.startswith("[CUSTOM]"):
                 fg_color = "blue"
             
             lbl_name = ttk.Label(self.scroll_frame_inner, text=display_name, anchor="w", foreground=fg_color)
             lbl_name.grid(row=idx, column=0, sticky="ew", padx=5, pady=8)
             
-            # 2. Выбор профиля
             current_profile = prof_mapping.get(list_filename, "ОТКЛЮЧЕНО")
             combo_prof = ttk.Combobox(self.scroll_frame_inner, values=profile_names, state="readonly")
             combo_prof.set(current_profile)
             combo_prof.grid(row=idx, column=1, sticky="ew", padx=5, pady=8)
             combo_prof.bind("<<ComboboxSelected>>", lambda e, f=list_filename, c=combo_prof: self._on_profile_change(f, c))
             
-            # 3. Выбор IPSet
             current_ipset = ipset_mapping.get(list_filename, "OFF")
             combo_ipset = ttk.Combobox(self.scroll_frame_inner, values=available_ipsets, state="readonly")
             combo_ipset.set(current_ipset)
             combo_ipset.grid(row=idx, column=2, sticky="ew", padx=5, pady=8)
             combo_ipset.bind("<<ComboboxSelected>>", lambda e, f=list_filename, c=combo_ipset: self._on_ipset_change(f, c))
 
-            # 4. Статус
             status_text = "Остановлен"
             status_color = "#999999"
             pid_text = "-"
@@ -219,7 +201,6 @@ class UIManager:
             lbl_status = tk.Label(self.scroll_frame_inner, text=status_text, fg=status_color, font=("Segoe UI", 9), anchor="center")
             lbl_status.grid(row=idx, column=3, sticky="ew", padx=5, pady=8)
             
-            # 5. PID
             lbl_pid = ttk.Label(self.scroll_frame_inner, text=pid_text, anchor="center")
             lbl_pid.grid(row=idx, column=4, sticky="ew", padx=5, pady=8)
             
@@ -254,19 +235,13 @@ class UIManager:
                 widgets["pid_lbl"].config(text="-")
 
     def update_buttons_state(self, is_running):
-        """Обновляет состояние кнопок запуска/остановки"""
-        # ИЗМЕНЕНИЕ: Кнопка СТОП теперь всегда доступна, чтобы можно было принудительно убить процессы
         self.btn_stop_all.config(state=tk.NORMAL)
-
         if is_running:
             self.btn_start_all.config(state=tk.DISABLED)
         else:
             self.btn_start_all.config(state=tk.NORMAL)
 
     def create_settings_tab(self, parent):
-        """Вкладка настроек, объединяющая Tools, Testing и Domains"""
-        
-        # Контейнер с прокруткой для настроек (на случай если не влезут)
         canvas = tk.Canvas(parent)
         scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
@@ -286,7 +261,6 @@ class UIManager:
             canvas.yview_scroll(int(-1*(event.delta/120)), "units")
         canvas.bind_all("<MouseWheel>", _on_settings_mousewheel)
 
-        # --- Глобальные настройки ---
         settings_frame = ttk.LabelFrame(scrollable_frame, text="Глобальные настройки")
         settings_frame.pack(fill=tk.X, pady=10, padx=10)
         
@@ -294,7 +268,6 @@ class UIManager:
         self.app.game_filter_check = ttk.Checkbutton(settings_frame, text="Игровой фильтр (применять ко всем новым запускам)", variable=self.app.game_filter_var)
         self.app.game_filter_check.pack(anchor=tk.W, padx=5, pady=5)
         
-        # Управление кастомным списком
         list_frame = ttk.LabelFrame(settings_frame, text="Кастомный список доменов")
         list_frame.pack(fill=tk.X, padx=5, pady=5)
         
@@ -312,7 +285,6 @@ class UIManager:
         ttk.Button(btn_frame, text="♻ Обновить программу", command=self.app.trigger_update).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="🔍 Создать IPSet из процесса", command=self.open_ip_grabber).pack(side=tk.LEFT, padx=5)
 
-        # --- Обновления ---
         updates_frame = ttk.LabelFrame(scrollable_frame, text="Обновления (Zapret)")
         updates_frame.pack(fill=tk.X, pady=10, padx=10)
         
@@ -327,37 +299,33 @@ class UIManager:
         ttk.Label(updates_frame, text="IPSet: фильтрует трафик по IP-адресам. Hosts: дополнительная защита через системный файл.", 
                   foreground="gray", font=("Segoe UI", 8)).pack(anchor=tk.W, padx=5, pady=(0, 5))
 
-        # --- Раздел Тестирования ---
         testing_frame = ttk.LabelFrame(scrollable_frame, text="Тестирование")
         testing_frame.pack(fill=tk.X, pady=10, padx=10)
         
-        # Сайт тест
         site_test_sub = ttk.Frame(testing_frame)
         site_test_sub.pack(fill=tk.X, pady=5)
         ttk.Label(site_test_sub, text="Тест доступности сайта:").pack(side=tk.LEFT, padx=5)
-        self.app.site_test_url = tk.StringVar(value="rutracker.org")
+        self.app.site_test_url = tk.StringVar(value="mixamo.com")
         self.app.site_test_url_entry = ttk.Entry(site_test_sub, textvariable=self.app.site_test_url, width=30)
         self.app.site_test_url_entry.pack(side=tk.LEFT, padx=5)
-        ttk.Button(site_test_sub, text="Начать тест", command=self.app.run_site_test).pack(side=tk.LEFT, padx=5)
+        ttk.Button(site_test_sub, text="Обычный пинг (Все профили)", command=self.app.run_site_test).pack(side=tk.LEFT, padx=5)
+        
+        # НОВАЯ КНОПКА ГЛУБОКОГО АНАЛИЗА
+        ttk.Button(site_test_sub, text="Глубокий анализ (Playwright)", command=self.app.run_deep_site_analysis).pack(side=tk.LEFT, padx=5)
         
         self.app.site_test_url_menu = tk.Menu(self.app.root, tearoff=0)
         self.app.site_test_url_menu.add_command(label="Вставить", command=self.app.paste_site_test_url)
         self.app.site_test_url_entry.bind("<Button-3>", self.app.show_site_test_url_menu)
         self.app.site_test_url_entry.bind("<Control-v>", lambda e: self.app.paste_site_test_url())
 
-        # Discord тест
         discord_test_sub = ttk.Frame(testing_frame)
         discord_test_sub.pack(fill=tk.X, pady=5)
         ttk.Button(discord_test_sub, text="Очистить кэш Discord", command=lambda: self.app.run_in_thread(self.app.settings_manager.clear_discord_cache, self.app.app_dir, self.app.log_message)).pack(side=tk.LEFT, padx=5)
-        # КНОПКА ИНТЕРАКТИВНОГО ТЕСТА УДАЛЕНА ПО ЗАПРОСУ
 
-        # --- Раздел Доменов ---
         domains_frame = ttk.LabelFrame(scrollable_frame, text="Поиск доменов (Performance API)")
         domains_frame.pack(fill=tk.X, pady=10, padx=10)
-        # Передаем этот фрейм менеджеру доменов для заполнения
         self.app.domain_manager.create_domains_tab(domains_frame)
 
-        # --- Ссылка на донат ---
         support_frame = ttk.Frame(scrollable_frame)
         support_frame.pack(fill=tk.X, pady=(20, 10), padx=10)
 
@@ -369,7 +337,6 @@ class UIManager:
         link_lbl.bind("<Button-1>", lambda e: webbrowser.open_new(link_url))
 
     def select_custom_list(self):
-        """Открывает диалог выбора файла для кастомного списка"""
         filename = filedialog.askopenfilename(
             title="Выберите файл списка доменов",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
@@ -379,11 +346,9 @@ class UIManager:
             self.app.save_app_settings()
             self.update_custom_list_label()
             self.app.domain_manager.update_list_status_label()
-            # Обновляем таблицу, чтобы новый файл появился там
             self.refresh_lists_table()
 
     def update_custom_list_label(self):
-        """Обновляет текст пути к кастомному списку"""
         if not self.lbl_custom_list_path: return
         
         path = self.app.list_manager.get_custom_list_path()
@@ -393,12 +358,11 @@ class UIManager:
             self.lbl_custom_list_path.config(text="Файл не выбран (поиск доменов не будет сохранять результаты)", foreground="#aa0000")
 
     def open_ip_grabber(self):
-        """Открывает окно граббера IP"""
         ip_grabber.show_ip_grabber(
             self.app.root, 
             self.app.app_dir, 
             self.app.log_message,
-            self.refresh_lists_table # Коллбек для обновления списка файлов в таблице
+            self.refresh_lists_table
         )
 
     def update_log_display(self):

@@ -316,11 +316,7 @@ class App:
                 bat_path = os.path.join(base_dir, "update.bat")
                 
                 if os.path.exists(bat_path):
-                    # ИСПРАВЛЕНИЕ: Запускаем батник через EXPLORER.EXE.
-                    # Это полностью разрывает связь с текущим процессом (и его переменными среды).
-                    # Эффект точно такой же, как если бы пользователь кликнул дважды мышкой.
                     subprocess.Popen(['explorer.exe', bat_path])
-                    
                     self.root.quit()
                 else:
                     messagebox.showerror("Ошибка", "Файл update.bat не найден.")
@@ -328,10 +324,8 @@ class App:
                 messagebox.showerror("Ошибка", f"Не удалось запустить обновление:\n{e}")
 
     def update_ipset_list(self):
-        """Скачивает актуальный список ipset с GitHub"""
         if not messagebox.askyesno("Обновление IPSet", "Будет загружен актуальный список IP-адресов с GitHub.\nПродолжить?"):
             return
-        
         self.run_in_thread(self._do_update_ipset)
 
     def _do_update_ipset(self):
@@ -357,10 +351,8 @@ class App:
             messagebox.showerror("Ошибка", f"Не удалось обновить ipset:\n{e}")
 
     def update_hosts_file(self):
-        """Скачивает hosts файл и открывает его для ознакомления"""
         if not messagebox.askyesno("Обновление Hosts", "Будет загружен файл hosts с GitHub и открыт для просмотра.\nВы можете вручную добавить нужные записи в системный hosts файл.\n\nПродолжить?"):
             return
-        
         self.run_in_thread(self._do_update_hosts)
 
     def _do_update_hosts(self):
@@ -375,9 +367,7 @@ class App:
                 with open(temp_path, 'w', encoding='utf-8') as f:
                     f.write(response.text)
                 self.log_message(f"Hosts скачан: {temp_path}", "success")
-                
                 webbrowser.open_new(temp_path)
-                
                 messagebox.showinfo("Информация", "Файл hosts скачан и открыт в браузере.\n\nЧтобы применить изменения, нужно вручную добавить содержимое в системный файл:\nC:\\Windows\\System32\\drivers\\etc\\hosts")
             else:
                 self.log_message(f"Ошибка скачивания: {response.status_code}", "error")
@@ -387,7 +377,6 @@ class App:
             messagebox.showerror("Ошибка", f"Не удалось обновить hosts:\n{e}")
 
     def open_ipset_folder(self):
-        """Открывает папку ipsets в проводнике"""
         try:
             ipsets_path = os.path.join(self.app_dir, 'ipsets')
             if os.path.exists(ipsets_path):
@@ -398,7 +387,6 @@ class App:
             messagebox.showerror("Ошибка", f"Не удалось открыть проводник:\n{e}")
 
     def open_hosts_folder(self):
-        """Открывает папку с hosts файлом в проводнике"""
         try:
             hosts_dir = r"C:\Windows\System32\drivers\etc"
             subprocess.Popen(['explorer.exe', hosts_dir])
@@ -408,19 +396,14 @@ class App:
     def on_closing(self):
         try:
             self.save_app_settings()
-            # ПРИНУДИТЕЛЬНАЯ ОСТАНОВКА БЕЗ ВОПРОСОВ, чтобы не висел процесс
             if self.active_processes:
                 self.stop_process()
         except Exception as e:
             pass
-            
         try:
             self.root.destroy()
         except:
             pass
-            
-        # ГАРАНТИРОВАННОЕ УБИЙСТВО ПРОЦЕССА PYTHON
-        # Это решает проблему "Папка уже используется"
         os._exit(0)
 
     def _handle_ui_error(self, e):
@@ -481,14 +464,24 @@ class App:
         self.site_test_url_menu.tk_popup(event.x_root, event.y_root)
 
     def run_site_test(self):
-        domain = self.site_test_url.get()
+        domain = self.site_test_url.get().strip()
+        if not domain: return
         custom_list = self.list_manager.get_custom_list_path()
         self.run_in_thread(testing_utils.run_site_test, domain, self.profiles, self.app_dir, self.game_filter_var.get(), self.log_message, custom_list)
 
-    def run_discord_test(self):
-        def ask(name): return messagebox.askyesno("Тест", f"Работает ли Discord с профилем {name}?")
-        custom_list = self.list_manager.get_custom_list_path()
-        self.run_in_thread(testing_utils.run_discord_test, self.profiles, self.app_dir, self.game_filter_var.get(), self.log_message, ask, custom_list)
+    def run_deep_site_analysis(self):
+        url = self.site_test_url.get().strip()
+        if not url: return
+        self.run_in_thread(self._do_deep_analysis, url)
+        
+    def _do_deep_analysis(self, url):
+        try:
+            # Импортируем скрипт глубокого анализатора (ранее check_blocks.py)
+            sys.path.insert(0, os.path.dirname(self.app_dir)) # Поднимаемся на уровень выше, так как check_blocks в корне
+            import check_blocks
+            check_blocks.run_deep_analysis_sync(url, self.log_message)
+        except Exception as e:
+            self.log_message(f"Ошибка загрузки анализатора Playwright: {e}", "error")
 
 if __name__ == "__main__":
     if not process_manager.is_admin():
