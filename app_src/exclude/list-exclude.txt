@@ -29,8 +29,4 @@ lesta.ru
 korabli.su
 tanksblitz.ru
 reg.ru
-mixamo.com
-adobe.com
-adobelogin.com
-adobe.io
-typekit.net
+

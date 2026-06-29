@@ -476,8 +476,6 @@ class App:
         
     def _do_deep_analysis(self, url):
         try:
-            # Импортируем скрипт глубокого анализатора (ранее check_blocks.py)
-            sys.path.insert(0, os.path.dirname(self.app_dir)) # Поднимаемся на уровень выше, так как check_blocks в корне
             import check_blocks
             check_blocks.run_deep_analysis_sync(url, self.log_message)
         except Exception as e:

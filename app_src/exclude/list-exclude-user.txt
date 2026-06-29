@@ -1,2 +1,11 @@
 # User exclude list
-domain.example.abc
+mixamo.com
+adobelogin.com
+adobe.io
+typekit.net
+assets.adobedtm.com
+stage.acrobat.adobe.com
+documentcloud.adobe.com
+dev.acrobat.adobe.com
+acrobat.adobe.com
+get.adobe.com
