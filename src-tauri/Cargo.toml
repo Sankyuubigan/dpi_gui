@@ -1,0 +1,20 @@
+[package]
+name = "dpi_gui"
+version = "2.0.0"
+description = "DPI Bypass GUI"
+authors = ["Sankyuubigan"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2.0.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.0.0", features = [] }
+tauri-plugin-shell = "2.0.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", features = ["blocking"] }
+headless_chrome = { version = "1.0", features = ["fetch"] }
+sysinfo = "0.32"
+dirs = "5.0"
+shlex = "1.3"

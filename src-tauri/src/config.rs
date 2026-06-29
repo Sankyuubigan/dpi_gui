@@ -1,0 +1,102 @@
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+use serde_json::json;
+
+pub fn get_app_dir() -> PathBuf {
+    let mut path = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+    path.push("DPI_GUI");
+    path
+}
+
+pub fn ensure_directories_and_files() -> Result<(), std::io::Error> {
+    let app_dir = get_app_dir();
+    let lists_dir = app_dir.join("lists");
+
+    if !app_dir.exists() {
+        fs::create_dir_all(&app_dir)?;
+    }
+    if !lists_dir.exists() {
+        fs::create_dir_all(&lists_dir)?;
+    }
+
+    let config_path = app_dir.join("config.json");
+    if !config_path.exists() {
+        let default_config = json!({
+            "selected_profile": "",
+            "game_filter": false
+        });
+        fs::write(&config_path, serde_json::to_string_pretty(&default_config).unwrap())?;
+    }
+
+    // Генерация базовых списков. IPSet списки убраны за ненадобностью.
+    let files_to_create = vec![
+        ("list-general.txt", "# General domains to bypass\n"),
+        ("list-exclude.txt", "# Domains to EXCLUDE from bypass\n"),
+        ("list-google.txt", "# Google domains\ngoogle.com\nwww.google.com\n"),
+    ];
+
+    for (filename, content) in files_to_create {
+        let file_path = lists_dir.join(filename);
+        if !file_path.exists() {
+            fs::write(&file_path, content)?;
+        }
+    }
+
+    // Проверка и инициализация профилей вынесена в read_profiles() для надежности
+    let _ = read_profiles(); 
+
+    Ok(())
+}
+
+pub fn read_config() -> Result<serde_json::Value, std::io::Error> {
+    let path = get_app_dir().join("config.json");
+    let data = fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&data).unwrap_or(json!({})))
+}
+
+pub fn write_config(config: &serde_json::Value) -> Result<(), std::io::Error> {
+    let path = get_app_dir().join("config.json");
+    fs::write(path, serde_json::to_string_pretty(config).unwrap())
+}
+
+pub fn read_profiles() -> Result<Vec<serde_json::Value>, std::io::Error> {
+    let path = get_app_dir().join("profiles.json");
+    
+    // Пытаемся прочесть текущий файл
+    if let Ok(data) = fs::read_to_string(&path) {
+        if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(&data) {
+            // Защита от бага: если файл пустой массив - восстанавливаем
+            if !parsed.is_empty() {
+                return Ok(parsed);
+            }
+        }
+    }
+    
+    // Если файла нет или он поврежден (пустой/невалидный), восстанавливаем из дефолтных
+    let default_profiles_str = include_str!("../profiles_default.json");
+    let parsed_profiles: Vec<serde_json::Value> = serde_json::from_str(default_profiles_str)
+        .expect("Invalid default profiles JSON schema!");
+        
+    // Сохраняем восстановленный профиль
+    let _ = fs::write(&path, serde_json::to_string_pretty(&parsed_profiles).unwrap());
+    
+    Ok(parsed_profiles)
+}
+
+pub fn open_file_in_editor(file_type: &str) -> Result<(), std::io::Error> {
+    let app_dir = get_app_dir();
+    let path = match file_type {
+        "list_general" => app_dir.join("lists").join("list-general.txt"),
+        "list_exclude" => app_dir.join("lists").join("list-exclude.txt"),
+        "list_google" => app_dir.join("lists").join("list-google.txt"),
+        "profiles" => app_dir.join("profiles.json"),
+        _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Unknown file type")),
+    };
+
+    Command::new("cmd")
+        .args(["/C", "start", "notepad", path.to_str().unwrap()])
+        .spawn()?;
+    
+    Ok(())
+}

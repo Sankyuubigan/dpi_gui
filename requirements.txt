@@ -1,5 +1,0 @@
-requests
-selenium
-pyinstaller
-psutil
-pywin32
