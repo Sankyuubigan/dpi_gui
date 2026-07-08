@@ -33,7 +33,6 @@ pub fn ensure_directories_and_files() -> Result<(), std::io::Error> {
     let files_to_create = vec![
         ("list-general.txt", "# General domains to bypass\n"),
         ("list-exclude.txt", "# Domains to EXCLUDE from bypass\n"),
-        ("list-google.txt", "# Google domains\ngoogle.com\nwww.google.com\n"),
     ];
 
     for (filename, content) in files_to_create {
@@ -41,6 +40,23 @@ pub fn ensure_directories_and_files() -> Result<(), std::io::Error> {
         if !file_path.exists() {
             fs::write(&file_path, content)?;
         }
+    }
+
+    // Дефолтный список исключений — встроен в бинарник, перезаписывается при каждом запуске
+    let default_exclude = include_str!("../default-exclude.txt");
+    fs::write(lists_dir.join("default-exclude.txt"), default_exclude)?;
+
+    // Дефолтные списки обхода — встроены в бинарник, перезаписываются при каждом запуске
+    let default_bypass_dir = lists_dir.join("default-bypass");
+    if !default_bypass_dir.exists() {
+        fs::create_dir_all(&default_bypass_dir)?;
+    }
+    let default_bypass_files = vec![
+        ("list-general.txt", include_str!("../default-bypass/list-general.txt")),
+        ("list-google.txt", include_str!("../default-bypass/list-google.txt")),
+    ];
+    for (filename, content) in default_bypass_files {
+        fs::write(default_bypass_dir.join(filename), content)?;
     }
 
     // Проверка и инициализация профилей вынесена в read_profiles() для надежности
@@ -89,7 +105,6 @@ pub fn open_file_in_editor(file_type: &str) -> Result<(), std::io::Error> {
     let path = match file_type {
         "list_general" => app_dir.join("lists").join("list-general.txt"),
         "list_exclude" => app_dir.join("lists").join("list-exclude.txt"),
-        "list_google" => app_dir.join("lists").join("list-google.txt"),
         "profiles" => app_dir.join("profiles.json"),
         _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Unknown file type")),
     };

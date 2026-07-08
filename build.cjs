@@ -28,8 +28,27 @@ function checkDllDependencies(exePath) {
     }
 }
 
+function isProcessRunning(processName) {
+    try {
+        const stdout = execSync(`tasklist /FI "IMAGENAME eq ${processName}" /NH`, { encoding: 'utf8', timeout: 3000 });
+        return stdout.includes(processName);
+    } catch {
+        return false;
+    }
+}
+
 async function main() {
     try {
+        // Проверка, не запущена ли программа
+        const exeToBuild = path.join(scriptDir, 'src-tauri', 'target', 'release', 'dpi_gui.exe');
+        if (fs.existsSync(exeToBuild) && isProcessRunning('dpi_gui.exe')) {
+            console.error('========================================');
+            console.error('  ⚠️  dpi_gui.exe запущен!');
+            console.error('  ➡️  Закрой программу DPI GUI и повтори сборку.');
+            console.error('========================================');
+            process.exit(1);
+        }
+
         console.log('========================================');
         console.log('[1/5] Installing Node.js dependencies...');
         await runCommand('npm', ['install']);
@@ -63,17 +82,19 @@ async function main() {
 
         process.env.RUSTFLAGS = '-Ctarget-feature=+crt-static';
 
-        try {
-            console.log('  Cleaning previous build artifacts...');
-            const targetDir = path.join(scriptDir, 'src-tauri', 'target');
-            if (fs.existsSync(targetDir)) {
-                const releaseDir = path.join(targetDir, 'release');
-                const cachedDir = path.join(targetDir, 'release', '.fingerprint');
-                if (fs.existsSync(path.join(targetDir, 'release', 'dpi_gui.exe'))) {
-                    fs.rmSync(path.join(targetDir, 'release', 'dpi_gui.exe'));
-                }
+        console.log('  Cleaning previous build artifacts...');
+        const targetDir = path.join(scriptDir, 'src-tauri', 'target');
+        if (fs.existsSync(path.join(targetDir, 'release', 'dpi_gui.exe'))) {
+            try {
+                fs.rmSync(path.join(targetDir, 'release', 'dpi_gui.exe'));
+            } catch (e) {
+                console.error('');
+                console.error('  ⚠️  Не удалось удалить старый dpi_gui.exe — файл занят.');
+                console.error('  ➡️  Закрой программу DPI GUI и повтори сборку.');
+                console.error('');
+                process.exit(1);
             }
-        } catch (e) {}
+        }
 
         let buildOk = false;
         try {
@@ -99,24 +120,31 @@ async function main() {
             console.log('  Sidecars copied to release/bin/');
         }
 
-        const exePath = path.join(releaseDir, 'dpi_gui.exe');
-        if (!fs.existsSync(exePath)) {
+        if (!fs.existsSync(exeToBuild)) {
             throw new Error('dpi_gui.exe not found! Build failed.');
         }
 
-        const exeSize = fs.statSync(exePath).size;
+        const exeSize = fs.statSync(exeToBuild).size;
         console.log(`  EXE size: ${(exeSize / 1024 / 1024).toFixed(1)} MB`);
 
         console.log('  Verifying DLL dependencies...');
-        checkDllDependencies(exePath);
+        checkDllDependencies(exeToBuild);
 
         console.log('\n========================================');
         console.log('[5/5] Build complete!');
-        console.log(`  EXE: ${exePath}`);
+        console.log(`  EXE: ${exeToBuild}`);
 
     } catch (e) {
+        const msg = e.message || '';
+        const isFileLocked = /os error 5|Отказано в доступе|failed to remove file|EBUSY|EPERM|EACCES/.test(msg);
+
         console.error('\n========================================');
-        console.error('ERROR:', e.message);
+        if (isFileLocked) {
+            console.error('  ⚠️  Не удалось собрать — dpi_gui.exe всё ещё запущен.');
+            console.error('  ➡️  Закрой программу DPI GUI и повтори сборку.');
+        } else {
+            console.error('ERROR:', msg);
+        }
         console.error('========================================');
         process.exit(1);
     }

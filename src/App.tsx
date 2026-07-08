@@ -9,6 +9,9 @@ export default function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [profiles, setProfiles] = useState<any[]>([]);
   const [config, setConfig] = useState<any>({ selected_profile: "", game_filter: false });
+  const [testingLog, setTestingLog] = useState<string[]>([]);
+  const [testingUrl, setTestingUrl] = useState("youtube.com");
+  const [testingIsTesting, setTestingIsTesting] = useState(false);
 
   // Загрузка конфигурации при старте
   useEffect(() => {
@@ -77,7 +80,18 @@ export default function App() {
           />
         )}
         {activeTab === "settings" && <SettingsTab />}
-        {activeTab === "testing" && <TestingTab profiles={profiles} config={config} />}
+        {activeTab === "testing" && (
+          <TestingTab 
+            profiles={profiles} 
+            config={config}
+            log={testingLog}
+            setLog={setTestingLog}
+            url={testingUrl}
+            setUrl={setTestingUrl}
+            isTesting={testingIsTesting}
+            setIsTesting={setTestingIsTesting}
+          />
+        )}
       </div>
     </div>
   );

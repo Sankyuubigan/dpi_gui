@@ -16,6 +16,7 @@
 *   `profiles.json` (профили обхода, генерируются при первом запуске)
 *   `lists/custom-list.txt` (кастомный список пользователя)
 *   `lists/exclude-list.txt` (исключения)
+*   `lists/default-exclude.txt` (встроенные исключения — перезаписываются при каждом запуске из `src-tauri/default-exclude.txt`)
 
 ## Папка bin/
 Файлы `winws.exe`, `WinDivert64.sys` и `.bin` фейки должны лежать в папке `bin/` рядом с запущенным `dpi_gui.exe` (или в корне проекта рядом с `dev.bat` при разработке). 

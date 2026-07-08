@@ -1,15 +1,31 @@
-import { useState } from "react";
+import { useEffect, type Dispatch, type SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Search, Globe, Activity } from "lucide-react";
 
-export default function TestingTab({ profiles, config }: any) {
-  const [url, setUrl] = useState("youtube.com");
-  const [log, setLog] = useState<string[]>([]);
-  const [isTesting, setIsTesting] = useState(false);
-
+export default function TestingTab({ profiles, config, log, setLog, url, setUrl, isTesting, setIsTesting }: {
+  profiles: any[];
+  config: any;
+  log: string[];
+  setLog: Dispatch<SetStateAction<string[]>>;
+  url: string;
+  setUrl: Dispatch<SetStateAction<string>>;
+  isTesting: boolean;
+  setIsTesting: Dispatch<SetStateAction<boolean>>;
+}) {
   const appendLog = (msg: string) => {
-    setLog(prev => [...prev, msg]);
+    setLog((prev: string[]) => [...prev, msg].slice(-100));
   };
+
+  useEffect(() => {
+    // Слушаем логи winws во время теста
+    const unlisten = listen<string>("log", (event) => {
+      appendLog(`[СИСТЕМА] ${event.payload}`);
+    });
+    return () => {
+      unlisten.then(f => f());
+    };
+  }, []);
 
   const runDeepAnalysis = async () => {
     if (!url) return;

@@ -1,0 +1,25 @@
+# Default domains for general bypass
+# Этот файл перезаписывается при каждом запуске приложения.
+# Для своих доменов используйте list-general.txt.
+cloudflare-ech.com
+encryptedsni.com
+cloudflareaccess.com
+cloudflareapps.com
+cloudflarebolt.com
+cloudflareclient.com
+cloudflareinsights.com
+cloudflareok.com
+cloudflarepartners.com
+cloudflareportal.com
+cloudflarepreview.com
+cloudflareresolve.com
+cloudflaressl.com
+cloudflarestatus.com
+cloudflarestorage.com
+cloudflarestream.com
+cloudflaretest.com
+frankerfacez.com
+ffzap.com
+betterttv.net
+7tv.app
+7tv.io

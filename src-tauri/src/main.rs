@@ -5,6 +5,8 @@ mod process;
 mod analyzer;
 mod testing;
 
+use tauri::AppHandle;
+
 #[tauri::command]
 fn init_app() -> Result<(), String> {
     config::ensure_directories_and_files().map_err(|e| e.to_string())
@@ -31,8 +33,8 @@ fn open_file(file_type: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn start_bypass(profile_name: String, game_filter: bool) -> Result<String, String> {
-    process::start_winws(&profile_name, game_filter).map_err(|e| e.to_string())
+fn start_bypass(app: AppHandle, profile_name: String, game_filter: bool) -> Result<String, String> {
+    process::start_winws(app, &profile_name, game_filter).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -51,8 +53,8 @@ fn run_deep_analysis(url: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn test_profile(profile_name: String, url: String, game_filter: bool) -> Result<String, String> {
-    testing::test_single_profile(&profile_name, &url, game_filter).map_err(|e| e.to_string())
+fn test_profile(app: AppHandle, profile_name: String, url: String, game_filter: bool) -> Result<String, String> {
+    testing::test_single_profile(app, &profile_name, &url, game_filter).map_err(|e| e.to_string())
 }
 
 fn main() {

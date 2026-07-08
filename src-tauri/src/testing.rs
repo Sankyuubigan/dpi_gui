@@ -2,8 +2,9 @@ use crate::process;
 use std::thread;
 use std::time::Duration;
 use reqwest::blocking::Client;
+use tauri::AppHandle;
 
-pub fn test_single_profile(profile_name: &str, url: &str, game_filter: bool) -> Result<String, String> {
+pub fn test_single_profile(app: AppHandle, profile_name: &str, url: &str, game_filter: bool) -> Result<String, String> {
     let target_url = if !url.starts_with("http") {
         format!("https://{}", url)
     } else {
@@ -11,7 +12,7 @@ pub fn test_single_profile(profile_name: &str, url: &str, game_filter: bool) -> 
     };
 
     // Запускаем
-    if let Err(e) = process::start_winws(profile_name, game_filter) {
+    if let Err(e) = process::start_winws(app.clone(), profile_name, game_filter) {
         return Err(format!("Ошибка запуска {}: {}", profile_name, e));
     }
 

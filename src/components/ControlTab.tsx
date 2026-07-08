@@ -1,14 +1,30 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Play, Square, Activity } from "lucide-react";
 
 export default function ControlTab({ isRunning, profiles, config, saveConfig }: any) {
   const [logs, setLogs] = useState<string[]>([]);
+  const logEndRef = useRef<HTMLDivElement>(null);
 
   const logMsg = (msg: string) => {
     const time = new Date().toLocaleTimeString();
-    setLogs(prev => [`[${time}] ${msg}`, ...prev].slice(0, 100));
+    setLogs(prev => [...prev, `[${time}] ${msg}`].slice(-300));
   };
+
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [logs]);
+
+  useEffect(() => {
+    const unlisten = listen<string>("log", (event) => {
+      logMsg(event.payload);
+    });
+    
+    return () => {
+      unlisten.then(f => f());
+    };
+  }, []);
 
   const handleStart = async () => {
     if (!config.selected_profile) {
@@ -32,6 +48,7 @@ export default function ControlTab({ isRunning, profiles, config, saveConfig }: 
       logMsg("Остановка процессов...");
       const result: string = await invoke("stop_bypass");
       logMsg(result);
+      logMsg("Статус: ОСТАНОВЛЕНО");
     } catch (e: any) {
       logMsg(`Ошибка остановки: ${e}`);
     }
@@ -102,6 +119,7 @@ export default function ControlTab({ isRunning, profiles, config, saveConfig }: 
         <div className="flex-1 overflow-y-auto text-green-400 font-mono text-sm break-all space-y-1">
           {logs.length === 0 ? <span className="text-gray-600">Ожидание действий...</span> : null}
           {logs.map((l, i) => <div key={i}>{l}</div>)}
+          <div ref={logEndRef} />
         </div>
       </div>
     </div>
