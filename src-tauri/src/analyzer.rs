@@ -1,6 +1,7 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::thread;
 use std::path::PathBuf;
 use url::Url;
@@ -12,32 +13,69 @@ use sysinfo::System;
 use crate::process;
 use crate::bypass_lists;
 
-// Скрывает окна (в т.ч. пустую консоль), которые порождает headless Chrome на Windows.
-// headless_chrome ставит CREATE_NO_WINDOW, но в новом headless-режиме Chrome всё равно
-// может на мгновение нарисовать окно/консоль — прячем их по PID через Win32.
+// Скрывает КОНСОЛЬНЫЕ окна, которые порождает headless Chrome на Windows.
+// headless_chrome ставит CREATE_NO_WINDOW главному процессу, но Chrome сам внутри
+// спавнит дочерние процессы (renderer/GPU/crashpad) без этого флага, и у них
+// появляется чёрное консольное окно. Перебираем окна напрямую через Win32 API
+// (быстро, без тяжёлого опроса процессов) и прячем именно консольные окна Chrome,
+// не трогая реальный браузер пользователя (у него окна класса Chrome_WidgetWin_*).
 #[cfg(windows)]
 mod win_hide {
-    use windows_sys::Win32::Foundation::{BOOL, HWND};
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    use windows_sys::Win32::Foundation::{BOOL, FALSE, HWND, TRUE};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, QueryFullProcessImageNameW,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindowThreadProcessId, ShowWindow, SW_HIDE,
     };
 
-    unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: isize) -> BOOL {
-        let pids = &*(lparam as *const Vec<u32>);
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        if pids.contains(&pid) {
-            ShowWindow(hwnd, SW_HIDE);
-        }
-        true as BOOL
+    pub struct Ctx {
+        pub known: Arc<Mutex<HashSet<u32>>>,
     }
 
-    pub fn hide_windows_for_pids(pids: &Vec<u32>) {
-        if pids.is_empty() {
-            return;
+    unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: isize) -> BOOL {
+        let ctx = &*(lparam as *const Ctx);
+
+        // Не трогаем окна уже запущенного браузера пользователя (его вкладки).
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if ctx.known.lock().unwrap().contains(&pid) {
+            return TRUE;
         }
+
+        // Проверяем, что окно принадлежит chrome.exe. Используем только
+        // PROCESS_QUERY_INFORMATION — PROCESS_VM_READ может не пройти для
+        // дочерних процессов Chrome (crashpad-handler и т.п.), и тогда окно
+        // останется видимым.
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+        let mut is_chrome = false;
+        if handle != 0 {
+            let mut buf = [0u16; 1024];
+            let mut size: u32 = buf.len() as u32;
+            if QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size) != 0 {
+                let path = String::from_utf16_lossy(&buf[..size as usize]);
+                let name = path.rsplit(['\\', '/']).next().unwrap_or("");
+                is_chrome = name.eq_ignore_ascii_case("chrome.exe");
+            }
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+        if is_chrome {
+            // Прячем ЛЮБОЕ окно дочернего процесса Chrome (в т.ч. чёрную
+            // консоль), чтобы юзер не видел ни мгновенного мелькания.
+            ShowWindow(hwnd, SW_HIDE);
+        }
+
+        TRUE
+    }
+
+    // Один быстрый проход: прячет все консольные окна Chrome, кроме известных PID юзера.
+    pub fn hide_chrome_consoles(known: &Arc<Mutex<HashSet<u32>>>) {
+        let ctx = Ctx { known: known.clone() };
         unsafe {
-            EnumWindows(Some(enum_cb), pids as *const Vec<u32> as isize);
+            EnumWindows(Some(enum_cb), &ctx as *const Ctx as isize);
         }
     }
 }
@@ -81,13 +119,39 @@ fn extract_value(s: &str, key: &str) -> Option<String> {
 pub fn analyze_url(url: &str) -> Result<String, String> {
     let target_url = if !url.starts_with("http") { format!("https://{}", url) } else { url.to_string() };
 
+    // Используем НОВЫЙ headless-режим (--headless=new). В отличие от старого
+    // --headless, в новом режиме Chrome не спавнит отдельные консольные дочерние
+    // процессы (renderer/GPU/crashpad), поэтому чёрное консольное окно вообще
+    // не появляется. headless_chrome сам добавляет старый --headless, поэтому
+    // ставим headless=false и передаём --headless=new явно через args.
     let options = LaunchOptions::default_builder()
-        .headless(true)
+        .headless(false)
+        .args(vec![std::ffi::OsStr::new("--headless=new")])
         .build()
         .map_err(|e| format!("Ошибка опций запуска Chrome: {}", e))?;
 
     // Запоминаем уже запущенные chrome-ы (свои вкладки юзера), чтобы не трогать их окна.
-    let mut known_chrome: HashSet<u32> = chrome_pids().into_iter().collect();
+    let known_chrome: Arc<Mutex<HashSet<u32>>> =
+        Arc::new(Mutex::new(chrome_pids().into_iter().collect()));
+
+    // Фоновый поток СКРЫТИЯ окон. Запускаем ЕГО ДО старта Chrome, иначе консольные
+    // окна дочерних процессов Chrome (renderer/GPU/crashpad) успевают нарисоваться
+    // во время Browser::new и мелькают перед юзером. Прячем их по PID в реальном времени.
+    #[cfg(windows)]
+    let hide_stop = Arc::new(AtomicBool::new(false));
+    #[cfg(windows)]
+    let hide_handle = {
+        let known = known_chrome.clone();
+        let stop = hide_stop.clone();
+        // Быстрый цикл: прячем консольные окна Chrome каждые ~10 мс, начиная ДО
+        // старта браузера, чтобы юзер не видел даже мгновенного мелькания.
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                win_hide::hide_chrome_consoles(&known);
+                thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
 
     let browser = Browser::new(options).map_err(|e| format!("Ошибка запуска Chrome (установлен ли он?): {}", e))?;
     let tab = browser.new_tab().map_err(|e| format!("Ошибка создания вкладки: {}", e))?;
@@ -154,21 +218,16 @@ pub fn analyze_url(url: &str) -> Result<String, String> {
     let _ = tab.navigate_to(&target_url);
 
     // Даем странице время подгрузить под-ресурсы (скрипты, API, CDN и т.д.).
-    // Параллельно прячем любые окна/консоли, которые порождает Chrome (чтобы юзер
-    // не видел мигающее пустое окно). known_chrome — chrome-ы, запущенные ДО анализа
-    // (свои вкладки юзера), трогать не будем.
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(15) {
-        let current = chrome_pids();
-        let mut new_ones: Vec<u32> = Vec::new();
-        for p in &current {
-            if known_chrome.insert(*p) {
-                new_ones.push(*p);
-            }
-        }
-        #[cfg(windows)]
-        win_hide::hide_windows_for_pids(&new_ones);
-        thread::sleep(Duration::from_millis(500));
+    // Скрытие окон/консолей, которые порождает Chrome, выполняет фоновый поток,
+    // запущенный выше (до старта браузера). Здесь только ждем загрузку.
+    // known_chrome — chrome-ы, запущенные ДО анализа (свои вкладки юзера), трогать не будем.
+    thread::sleep(Duration::from_secs(15));
+
+    // Останавливаем фоновый поток скрытия окон.
+    #[cfg(windows)]
+    {
+        hide_stop.store(true, Ordering::Relaxed);
+        let _ = hide_handle.join();
     }
 
     let discovered: Vec<String> = {
