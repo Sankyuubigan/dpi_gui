@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use std::thread;
+use std::path::PathBuf;
 use url::Url;
 use headless_chrome::{Browser, LaunchOptions};
 use headless_chrome::protocol::cdp::types::Event;
@@ -9,6 +10,7 @@ use headless_chrome::protocol::cdp::Network;
 use reqwest::blocking::Client as HttpClient;
 use sysinfo::System;
 use crate::process;
+use crate::bypass_lists;
 
 // Скрывает окна (в т.ч. пустую консоль), которые порождает headless Chrome на Windows.
 // headless_chrome ставит CREATE_NO_WINDOW, но в новом headless-режиме Chrome всё равно
@@ -250,6 +252,16 @@ pub fn analyze_url(url: &str) -> Result<String, String> {
     dns_fail.sort();
     ok.sort();
 
+    // === Кросс-чек с списками обхода ===
+    // Ищем домены сайта, которые УЖЕ внесены в списки обхода (hostlist). Если такой домен
+    // там по ошибке — обход его «мучает» и может ломать сайт. Советуем убрать из списка.
+    let bypass_map = bypass_lists::load_bypass_domains();
+    let bypass_matches = bypass_lists::find_bypass_matches(&discovered, &bypass_map);
+    // Домены, которые одновременно сломаны обходом И присутствуют в списке обхода
+    let broken_set: HashSet<String> = broken.iter().map(|(h, _)| h.clone()).collect();
+    // Текущие исключения юзера (чтобы не советовать добавлять уже добавленное)
+    let exclude_set = bypass_lists::load_exclude_domains();
+
     // === Формируем отчет ===
     let mut log = String::new();
     log.push_str(&format!("=== АНАЛИЗ ДОМЕНОВ: {} ===\n\n", target_url));
@@ -267,8 +279,77 @@ pub fn analyze_url(url: &str) -> Result<String, String> {
     if broken.is_empty() {
         log.push_str("  - (пусто) все домены доступны через обход\n");
     } else {
+        // Родительские домены среди сломанных (не покрытых исключениями) — для сокращения
+        let mut parent_suggestions: Vec<String> = Vec::new();
         for (h, err) in &broken {
-            log.push_str(&format!("  - {}   (причина: {})\n", h, err.lines().next().unwrap_or(err)));
+            let reason = err.lines().next().unwrap_or(err);
+            let parent = bypass_lists::parent_domain(h);
+            let kind = if parent == h.to_lowercase() {
+                "[корневой домен]".to_string()
+            } else {
+                format!("[субдомен, родитель: {}]", parent)
+            };
+            let covered = bypass_lists::is_excluded(h, &exclude_set);
+            let action = match covered {
+                Some(entry) => format!("уже в исключениях: {} — не дублируйте", entry),
+                None => {
+                    if parent != h.to_lowercase() && !parent_suggestions.contains(&parent) {
+                        parent_suggestions.push(parent.clone());
+                    }
+                    "добавьте в исключения".to_string()
+                }
+            };
+            log.push_str(&format!(
+                "  - {}   (причина: {})   {}   {}\n",
+                h, reason, kind, action
+            ));
+        }
+        if !parent_suggestions.is_empty() {
+            parent_suggestions.sort();
+            log.push_str(&format!(
+                "  💡 Родительские домены (winws матчит поддомены, можно сократить список): {}\n",
+                parent_suggestions.join(", ")
+            ));
+        }
+    }
+    log.push('\n');
+
+    // === Домены сайта, уже внесённые в обход ===
+    let is_builtin = |p: &PathBuf| -> bool {
+        p.to_string_lossy().replace("\\", "/").contains("default-bypass/")
+    };
+    log.push_str("🗑️ ДОМЕНЫ САЙТА, УЖЕ ВНЕСЁННЫЕ В ОБХОД (проверьте, не ломают ли они сайт):\n");
+    if bypass_matches.is_empty() {
+        log.push_str("  - (пусто) ни один домен сайта не найден в списках обхода\n");
+    } else {
+        for (domain, files) in &bypass_matches {
+            let also_broken = broken_set.contains(domain);
+            let mut labels: Vec<String> = Vec::new();
+            for f in files {
+                let path = f.to_string_lossy().replace("\\", "/");
+                if is_builtin(f) {
+                    labels.push(format!("встроенный список {}", path));
+                } else {
+                    labels.push(format!("список обхода {}", path));
+                }
+            }
+            if also_broken {
+                // Совет удалить — ТОЛЬКО если домен реально ломается обходом
+                log.push_str(&format!(
+                    "  - {}   (в {} — ЛОМАЕТ САЙТ, удалите из обхода в приоритете!)\n",
+                    domain, labels.join(", ")
+                ));
+            } else if is_builtin(files.first().unwrap()) {
+                log.push_str(&format!(
+                    "  - {}   (в {} — встроенный, перезаписывается при запуске; работает, трогать не обязательно)\n",
+                    domain, labels.join(", ")
+                ));
+            } else {
+                log.push_str(&format!(
+                    "  - {}   (в {} — работает, трогать не обязательно)\n",
+                    domain, labels.join(", ")
+                ));
+            }
         }
     }
     log.push('\n');
@@ -292,7 +373,7 @@ pub fn analyze_url(url: &str) -> Result<String, String> {
         }
     }
 
-    log.push_str("\n💡 СОВЕТ: домены из списка ❌ добавьте в список исключений (кнопка открытия списка исключений на другой вкладке).");
+    log.push_str("\n💡 СОВЕТ: домены из списка ❌ (помеченные «добавьте в исключения») внесите в список исключений (кнопка открытия списка исключений на другой вкладке). Домены из списка 🗑️ удаляйте из обхода только если они помечены «ЛОМАЕТ САЙТ».");
 
     Ok(log)
 }

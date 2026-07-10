@@ -4,6 +4,7 @@ mod config;
 mod process;
 mod analyzer;
 mod testing;
+mod bypass_lists;
 
 use tauri::AppHandle;
 
