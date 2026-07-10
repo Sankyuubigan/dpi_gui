@@ -18,3 +18,8 @@
 *.exp
 *.lib
 /test/zapret-discord-youtube
+
+# Updater signing key (NEVER commit) and release artifacts
+/src-tauri/tauri.key
+/src-tauri/release.build.conf.json
+/latest.json

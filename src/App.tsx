@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import ControlTab from "./components/ControlTab";
 import SettingsTab from "./components/SettingsTab";
 import TestingTab from "./components/TestingTab";
+import AboutTab from "./components/AboutTab";
 
 export default function App() {
   const [activeTab, setActiveTab] = useState("control");
@@ -67,6 +68,12 @@ export default function App() {
         >
           Инструменты
         </button>
+        <button
+          className={`px-4 py-3 font-semibold ${activeTab === "about" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
+          onClick={() => setActiveTab("about")}
+        >
+          О программе
+        </button>
       </div>
 
       {/* Содержимое вкладок */}
@@ -92,6 +99,7 @@ export default function App() {
             setIsTesting={setTestingIsTesting}
           />
         )}
+        {activeTab === "about" && <AboutTab />}
       </div>
     </div>
   );

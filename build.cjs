@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn, execSync } = require('child_process');
+const { bumpVersion } = require('./version.cjs');
 
 const scriptDir = __dirname;
 
@@ -50,14 +51,20 @@ async function main() {
         killProcess('dpi_gui.exe');
         console.log('========================================');
 
+        console.log('========================================');
+        console.log('[1/6] Obnovlenie versii (build counter)...');
+        const builtVersion = bumpVersion(scriptDir);
+        console.log(`Versiya sborki: ${builtVersion}`);
+        console.log('========================================');
+
         const exeToBuild = path.join(scriptDir, 'src-tauri', 'target', 'release', 'dpi_gui.exe');
 
         console.log('========================================');
-        console.log('[1/5] Installing Node.js dependencies...');
-        await runCommand('npm', ['install']);
+        console.log('[2/6] Installing Node.js dependencies...');
+        await runCommand('npm', ['install', '--legacy-peer-deps']);
 
         console.log('\n========================================');
-        console.log('[2/5] Preparing sidecars (bin/)...');
+        console.log('[3/6] Preparing sidecars (bin/)...');
         const binDir = path.join(scriptDir, 'bin');
         if (!fs.existsSync(binDir)) {
             console.warn('  WARNING: bin/ folder not found in project root.');
@@ -69,7 +76,7 @@ async function main() {
         }
 
         console.log('\n========================================');
-        console.log('[3/5] Checking icons...');
+        console.log('[4/6] Checking icons...');
         const iconPath = path.join(scriptDir, 'src-tauri', 'icons', 'icon.ico');
         if (fs.existsSync(iconPath)) {
             console.log('  icon.ico is valid.');
@@ -78,7 +85,7 @@ async function main() {
         }
 
         console.log('\n========================================');
-        console.log('[4/5] Building Tauri app...');
+        console.log('[5/6] Building Tauri app...');
 
         const overridePath = path.join(scriptDir, 'src-tauri', 'tauri-dev-override.json');
         fs.writeFileSync(overridePath, JSON.stringify({ bundle: { active: false } }));
@@ -134,7 +141,7 @@ async function main() {
         checkDllDependencies(exeToBuild);
 
         console.log('\n========================================');
-        console.log('[5/5] Build complete!');
+        console.log('[6/6] Build complete!');
         console.log(`  EXE: ${exeToBuild}`);
 
     } catch (e) {
