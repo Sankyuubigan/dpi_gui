@@ -47,14 +47,26 @@ fn check_status() -> bool {
     process::is_winws_running()
 }
 
+// Оборачиваем долгие команды в асинхронные таски, чтобы не вешать UI-поток
 #[tauri::command]
-fn run_deep_analysis(url: String) -> Result<String, String> {
-    analyzer::analyze_url(&url).map_err(|e| e.to_string())
+async fn run_domain_analysis(url: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        analyzer::analyze_url(&url)
+    }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
 }
 
 #[tauri::command]
-fn test_profile(app: AppHandle, profile_name: String, url: String, game_filter: bool) -> Result<String, String> {
-    testing::test_single_profile(app, &profile_name, &url, game_filter).map_err(|e| e.to_string())
+async fn test_profile(app: AppHandle, profile_name: String, url: String, game_filter: bool) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        testing::test_single_profile(app, &profile_name, &url, game_filter)
+    }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
+}
+
+#[tauri::command]
+async fn test_dns(url: String, dns_ip: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        testing::test_dns(&url, &dns_ip)
+    }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
 }
 
 fn main() {
@@ -69,8 +81,9 @@ fn main() {
             start_bypass,
             stop_bypass,
             check_status,
-            run_deep_analysis,
-            test_profile
+            run_domain_analysis,
+            test_profile,
+            test_dns
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

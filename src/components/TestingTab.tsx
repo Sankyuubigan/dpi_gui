@@ -1,7 +1,7 @@
-import { useEffect, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Search, Globe, Activity } from "lucide-react";
+import { Search, Globe, Activity, ShieldQuestion } from "lucide-react";
 
 export default function TestingTab({ profiles, config, log, setLog, url, setUrl, isTesting, setIsTesting }: {
   profiles: any[];
@@ -13,12 +13,13 @@ export default function TestingTab({ profiles, config, log, setLog, url, setUrl,
   isTesting: boolean;
   setIsTesting: Dispatch<SetStateAction<boolean>>;
 }) {
+  const [dnsIp, setDnsIp] = useState("1.1.1.1"); // Cloudflare по умолчанию
+
   const appendLog = (msg: string) => {
     setLog((prev: string[]) => [...prev, msg].slice(-100));
   };
 
   useEffect(() => {
-    // Слушаем логи winws во время теста
     const unlisten = listen<string>("log", (event) => {
       appendLog(`[СИСТЕМА] ${event.payload}`);
     });
@@ -30,13 +31,16 @@ export default function TestingTab({ profiles, config, log, setLog, url, setUrl,
   const runDeepAnalysis = async () => {
     if (!url) return;
     setIsTesting(true);
-    setLog([`[Анализ] Запуск глубокого анализа для: ${url}...`, "Это может занять до 20 секунд. Открывается фоновый браузер..."]);
+    setLog([
+      `[Анализ] Запуск анализа доменов для: ${url}...`, 
+      "Фоновый браузер запущен. Сбор доменов и проверка их доступности через обход (займет до ~25 сек)..."
+    ]);
     
     try {
-      const result: string = await invoke("run_deep_analysis", { url });
+      const result: string = await invoke("run_domain_analysis", { url });
       appendLog(result);
     } catch (e: any) {
-      appendLog(`[Ошибка]: ${e}`);
+      appendLog(`[Ошибка анализа]: ${e}`);
     } finally {
       setIsTesting(false);
     }
@@ -65,6 +69,21 @@ export default function TestingTab({ profiles, config, log, setLog, url, setUrl,
     }
   };
 
+  const runDnsTest = async () => {
+    if (!url || !dnsIp) return;
+    setIsTesting(true);
+    setLog([`[Тест DNS] Проверка сайта ${url} через кастомный DNS (${dnsIp})...`]);
+
+    try {
+      const result: string = await invoke("test_dns", { url, dnsIp });
+      appendLog(result);
+    } catch (e: any) {
+      appendLog(`[Ошибка DNS Теста]: ${e}`);
+    } finally {
+      setIsTesting(false);
+    }
+  };
+
   return (
     <div className="flex flex-col h-full gap-4">
       <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
@@ -83,21 +102,41 @@ export default function TestingTab({ profiles, config, log, setLog, url, setUrl,
           </div>
         </div>
 
-        <div className="flex gap-3">
-          <button 
-            onClick={runDeepAnalysis}
-            disabled={isTesting}
-            className="flex-1 flex items-center justify-center gap-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-400 text-white py-2 rounded-lg font-bold"
-          >
-            <Search size={18} /> Глубокий анализ (Поиск доменов)
-          </button>
-          <button 
-            onClick={runProfileTest}
-            disabled={isTesting}
-            className="flex-1 flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-400 text-white py-2 rounded-lg font-bold"
-          >
-            <Activity size={18} /> Прогнать по всем профилям
-          </button>
+        <div className="flex flex-col gap-3">
+          <div className="flex gap-3">
+            <button 
+              onClick={runDeepAnalysis}
+              disabled={isTesting}
+              className="flex-1 flex items-center justify-center gap-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-400 text-white py-2 rounded-lg font-bold transition"
+            >
+              <Search size={18} /> Анализ доменов
+            </button>
+            <button 
+              onClick={runProfileTest}
+              disabled={isTesting}
+              className="flex-1 flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-400 text-white py-2 rounded-lg font-bold transition"
+            >
+              <Activity size={18} /> Тест профилей
+            </button>
+          </div>
+
+          <div className="flex gap-3 mt-2 items-center border-t border-gray-100 pt-4">
+            <input 
+              type="text" 
+              value={dnsIp}
+              onChange={(e) => setDnsIp(e.target.value)}
+              placeholder="IP DNS (например 1.1.1.1)"
+              className="w-1/3 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 outline-none text-sm"
+              title="Введите кастомный IP-адрес DNS-сервера"
+            />
+            <button 
+              onClick={runDnsTest}
+              disabled={isTesting}
+              className="flex-1 flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-400 text-white py-2 rounded-lg font-bold transition"
+            >
+              <ShieldQuestion size={18} /> Тест подмены DNS
+            </button>
+          </div>
         </div>
       </div>
 

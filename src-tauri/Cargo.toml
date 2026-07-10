@@ -18,3 +18,6 @@ headless_chrome = { version = "1.0", features = ["fetch"] }
 sysinfo = "0.32"
 dirs = "5.0"
 shlex = "1.3"
+url = "2.5"
+trust-dns-resolver = "0.23"
+windows-sys = { version = "0.52", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
