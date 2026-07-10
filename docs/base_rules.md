@@ -71,6 +71,51 @@
     ошибки, если процесс не запущен). НЕ делай это в `.bat` из-за описанных выше
     ловушек с `(` `)`.
 
+### Инициализация MSVC (обязательно для любого .bat со сборкой)
+
+Любой `.bat`, который запускает `cargo` / `npx tauri build` (и `build.bat`, и
+`release.bat`), ДОЛЖЕН сначала инициализировать MSVC-окружение. Иначе `cl.exe` /
+`link.exe` не попадают в `PATH`, и сборка падает — в т.ч. `sccache` не может
+найти компилятор и выдаёт `cannot find binary path`.
+
+Правильный сниппет (ровно как в `build.bat`), ASCII, CRLF:
+
+```bat
+@echo off
+cd /d "%~dp0"
+
+REM Auto-detect and init MSVC (Visual Studio Build Tools)
+for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -legacy -property installationPath 2^>nul`) do (
+    if exist "%%i\VC\Auxiliary\Build\vcvarsall.bat" (
+        call "%%i\VC\Auxiliary\Build\vcvarsall.bat" x64 >nul 2>&1
+    )
+)
+
+node build.cjs
+```
+
+Правила:
+- `vswhere.exe` сам находит путь к установленному Visual Studio — не хардкодь
+  путь вручную.
+- `vcvarsall.bat x64` добавляет `cl.exe`, `link.exe` и пр. в `PATH` ТОЛЬКО для
+  текущего `cmd`-процесса и его потомков (`node` → `cargo` → `cc-rs`). Поэтому
+  `vcvarsall` вызывают в том же `.bat`, ДО запуска `node ...cjs`.
+- `>nul 2>&1` глушит шумный вывод инициализации — это безопасно.
+- Если сборка (релизная) запускается из другого `.bat` и падает с ошибкой
+  компилятора/sccache — первым делом проверь, что `vcvarsall` вызван.
+
+### sccache отключать НЕЛЬЗЯ
+
+Проект использует `sccache` как кэш-обёртку компилятора (через `RUSTC_WRAPPER`
+либо конфиг cargo). Он работает корректно и ускоряет сборку — **НЕ отключай его**
+(никаких `SCCACHE_DISABLE=1`, `set RUSTC_WRAPPER=` и т.п.) и не убирай из
+конфигурации.
+
+Если вдруг появляется `sccache: cannot find binary path` — это НЕ значит, что
+sccache сломан. Это значит, что перед сборкой НЕ была инициализирована
+MSVC-среда (см. раздел выше), и `cl.exe` нет на PATH. Лечить надо вызовом
+`vcvarsall`, а не отключением sccache.
+
 ### Почему это важно
 
 - Ошибка «Неизвестный символ» не указывает на реальную проблему кода — она от
