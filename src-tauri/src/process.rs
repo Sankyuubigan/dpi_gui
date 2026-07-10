@@ -10,7 +10,7 @@ use crate::config;
 
 const WINWS_EXE: &str = "winws.exe";
 // Флаг для скрытия окна консоли в Windows
-const CREATE_NO_WINDOW: u32 = 0x08000000; 
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 pub fn get_bin_dir() -> PathBuf {
     // Ищем bin рядом с экзешником (релиз) или в текущей директории (дев)
@@ -24,31 +24,21 @@ pub fn get_bin_dir() -> PathBuf {
     PathBuf::from("bin")
 }
 
-pub fn start_winws(app: AppHandle, profile_name: &str, game_filter: bool) -> Result<String, String> {
-    let _ = app.emit("log", format!("Подготовка к запуску профиля: {}", profile_name));
-
-    let profiles = config::read_profiles().map_err(|e| e.to_string())?;
-    
-    let profile = profiles.iter().find(|p| p["name"] == profile_name)
-        .ok_or("Профиль не найден")?;
-        
-    let args_template = profile["args"].as_str().unwrap_or("");
-    
+/// Строит итоговый список аргументов winws из шаблона (с плейсхолдерами).
+/// Вынесено отдельно, чтобы переиспользоваться и для запуска по имени профиля,
+/// и для запуска произвольного шаблона (диагностика).
+fn resolve_args(app: &AppHandle, raw_args_template: &str, game_filter: bool) -> Result<Vec<String>, String> {
     let app_dir = config::get_app_dir();
     let lists_dir = app_dir.join("lists").to_string_lossy().replace("\\", "/");
     let bin_dir = get_bin_dir().to_string_lossy().replace("\\", "/");
     let game_ports = if game_filter { "1024-65535" } else { "12" };
 
-    let _ = app.emit("log", format!("Настройки портов для игр: {}", game_ports));
-
-    // Форматируем строку (заменяем плейсхолдеры)
-    let raw_args = args_template
+    let raw_args = raw_args_template
         .replace("{LISTS_DIR}", &lists_dir)
         .replace("{BIN_DIR}", &bin_dir)
         .replace("{EXCLUDE_DIR}", &lists_dir)
         .replace("{GAME_FILTER}", game_ports);
 
-    // Парсим аргументы через shlex, чтобы не ломались пути с пробелами в кавычках
     let parsed_args = match shlex::split(&raw_args) {
         Some(a) => a,
         None => return Err("Ошибка парсинга аргументов. Проверьте правильность кавычек в профиле.".to_string()),
@@ -58,7 +48,7 @@ pub fn start_winws(app: AppHandle, profile_name: &str, game_filter: bool) -> Res
     let default_exclude_arg = format!("--hostlist-exclude={}/default-exclude.txt", lists_dir);
     let default_bypass_general_arg = format!("--hostlist={}/default-bypass/list-general.txt", lists_dir);
     let default_bypass_google_arg = format!("--hostlist={}/default-bypass/list-google.txt", lists_dir);
-    
+
     for arg in parsed_args {
         // Мы жестко вырезаем логику IPSet, чтобы не зависеть от лишних файлов
         if arg.starts_with("--ipset=") || arg.starts_with("--ipset-exclude=") {
@@ -80,8 +70,13 @@ pub fn start_winws(app: AppHandle, profile_name: &str, game_filter: bool) -> Res
         }
     }
 
-    let _ = app.emit("log", format!("Итоговые аргументы запуска ({} шт.):\n{}", final_args.len(), final_args.join(" ")));
+    let _ = app.emit("log", format!("Итоговые аргументы запуска ({} шт.)", final_args.len()));
 
+    Ok(final_args)
+}
+
+/// Собственно запуск winws с готовым списком аргументов.
+fn spawn_winws(app: &AppHandle, final_args: Vec<String>) -> Result<String, String> {
     let winws_path = get_bin_dir().join(WINWS_EXE);
 
     if !winws_path.exists() {
@@ -107,7 +102,7 @@ pub fn start_winws(app: AppHandle, profile_name: &str, game_filter: bool) -> Res
     // Перехват stdout
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    
+
     let app_clone = app.clone();
     if let Some(out) = stdout {
         thread::spawn(move || {
@@ -132,13 +127,30 @@ pub fn start_winws(app: AppHandle, profile_name: &str, game_filter: bool) -> Res
     Ok(format!("Запущено успешно. PID: {}", pid))
 }
 
+pub fn start_winws(app: AppHandle, profile_name: &str, game_filter: bool) -> Result<String, String> {
+    let profiles = config::read_profiles().map_err(|e| e.to_string())?;
+
+    let profile = profiles.iter().find(|p| p["name"] == profile_name)
+        .ok_or("Профиль не найден")?;
+
+    let args_template = profile["args"].as_str().unwrap_or("");
+    let final_args = resolve_args(&app, args_template, game_filter)?;
+    spawn_winws(&app, final_args)
+}
+
+/// Запуск winws с произвольным шаблоном аргументов (используется диагностикой).
+pub fn start_winws_custom(app: AppHandle, raw_args_template: &str, game_filter: bool) -> Result<String, String> {
+    let final_args = resolve_args(&app, raw_args_template, game_filter)?;
+    spawn_winws(&app, final_args)
+}
+
 pub fn stop_winws() -> Result<String, String> {
     // Останавливаем скрыто, без моргания окон консоли
     let _ = Command::new("taskkill")
         .args(["/F", "/IM", WINWS_EXE])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
-        
+
     let _ = Command::new("taskkill")
         .args(["/F", "/IM", "WinDivert.exe"]) // На всякий случай
         .creation_flags(CREATE_NO_WINDOW)

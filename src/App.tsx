@@ -90,6 +90,7 @@ export default function App() {
         {activeTab === "testing" && (
           <TestingTab 
             profiles={profiles} 
+            setProfiles={setProfiles}
             config={config}
             log={testingLog}
             setLog={setTestingLog}

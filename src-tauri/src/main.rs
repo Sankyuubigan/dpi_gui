@@ -5,6 +5,10 @@ mod process;
 mod analyzer;
 mod testing;
 mod bypass_lists;
+mod diagnostics;
+mod diagnostics_probe;
+mod diagnostics_techniques;
+mod diagnostics_report;
 
 use tauri::AppHandle;
 
@@ -70,6 +74,13 @@ async fn test_dns(url: String, dns_ip: String) -> Result<String, String> {
     }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
 }
 
+#[tauri::command]
+async fn run_diagnostics(app: AppHandle, url: String, game_filter: bool) -> Result<diagnostics::DiagnosticsReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        diagnostics::run_diagnostics(app, url, game_filter)
+    }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -86,7 +97,8 @@ fn main() {
             check_status,
             run_domain_analysis,
             test_profile,
-            test_dns
+            test_dns,
+            run_diagnostics
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

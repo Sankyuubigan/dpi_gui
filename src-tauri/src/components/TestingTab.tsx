@@ -113,11 +113,25 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
     }
   };
 
-  const copyLogs = () => {
-    if (log.length === 0) return;
-    navigator.clipboard.writeText(log.join("\n")).then(
-      () => appendLog("[Лог] Скопировано в буфер обмена."),
-      () => appendLog("[Лог] Не удалось скопировать в буфер обмена.")
+  const copyReport = () => {
+    if (!diag) return;
+    const parts = [
+      "=== ОТЧЁТ ДИАГНОСТИКИ ===",
+      `Отпечаток: ${diag.fingerprint}`,
+      "",
+      "Рекомендация:",
+      diag.recommendation,
+      "",
+      "Техники:",
+      ...(diag.techniques || []).map((t: any) => `  - ${t.name}: ${t.passed ? "ПРОХОДИТ" : t.detail}`),
+      "",
+      diag.generated_profile_name
+        ? `Авто-профиль: ${diag.generated_profile_name} (проверен: ${diag.generated_profile_verified === true ? "ДА" : diag.generated_profile_verified === false ? "НЕТ" : "н/д"})`
+        : "Авто-профиль: не создан",
+    ];
+    navigator.clipboard.writeText(parts.join("\n")).then(
+      () => appendLog("[Диагностика] Отчёт скопирован в буфер обмена."),
+      () => appendLog("[Диагностика] Не удалось скопировать отчёт.")
     );
   };
 
@@ -183,6 +197,14 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
             >
               <Stethoscope size={18} /> Диагностика соединения + авто-профиль
             </button>
+            <button
+              onClick={copyReport}
+              disabled={!diag}
+              className="flex items-center justify-center gap-2 bg-gray-700 hover:bg-gray-800 disabled:bg-gray-400 text-white px-4 py-2 rounded-lg font-bold transition"
+              title="Скопировать отчёт для разработчика"
+            >
+              <ClipboardCopy size={18} /> Отчёт
+            </button>
           </div>
         </div>
       </div>
@@ -218,19 +240,6 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
             </div>
           </div>
 
-          {diag.existing_profiles && diag.existing_profiles.length > 0 && (
-            <div className="mb-3">
-              <div className="font-semibold text-gray-700 mb-1">Ваши профили:</div>
-              <div className="flex flex-wrap gap-1">
-                {diag.existing_profiles.map((t: any) => (
-                  <span key={t.name} className={`px-2 py-0.5 rounded text-xs ${t.passed ? "bg-green-100 text-green-700" : "bg-red-50 text-red-500"}`} title={t.detail}>
-                    {t.name}: {t.passed ? "OK" : "x"}
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
-
           <div className="bg-gray-900 text-blue-300 font-mono text-xs p-3 rounded break-all whitespace-pre-wrap mb-2">
             {diag.fingerprint}
           </div>
@@ -250,16 +259,8 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
       )}
 
       <div className="flex-1 bg-gray-900 rounded-xl p-4 flex flex-col min-h-[300px]">
-        <div className="flex items-center justify-between mb-2 border-b border-gray-700 pb-2">
-          <span className="text-gray-400 text-sm font-semibold">Результаты тестирования</span>
-          <button
-            onClick={copyLogs}
-            disabled={log.length === 0}
-            className="flex items-center gap-1 bg-gray-700 hover:bg-gray-800 disabled:bg-gray-500 text-white px-3 py-1 rounded text-xs font-bold transition"
-            title="Скопировать все логи в буфер обмена"
-          >
-            <ClipboardCopy size={14} /> Копировать логи
-          </button>
+        <div className="text-gray-400 mb-2 border-b border-gray-700 pb-2 text-sm font-semibold">
+          Результаты тестирования
         </div>
         <div className="flex-1 overflow-y-auto text-blue-300 font-mono text-sm break-all space-y-1 whitespace-pre-wrap">
           {log.length === 0 ? <span className="text-gray-600">Ожидание...</span> : null}

@@ -1,6 +1,6 @@
 [package]
 name = "dpi_gui"
-version = "26.7.5"
+version = "26.7.9"
 description = "DPI Bypass GUI"
 authors = ["Sankyuubigan"]
 edition = "2021"

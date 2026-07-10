@@ -101,6 +101,24 @@ pub fn read_profiles() -> Result<Vec<serde_json::Value>, std::io::Error> {
     Ok(parsed_profiles)
 }
 
+/// Добавляет (или заменяет, если имя совпадает) профиль в profiles.json.
+/// Используется диагностикой для сохранения авто-сгенерированного профиля.
+pub fn append_profile(profile: serde_json::Value) -> Result<(), String> {
+    let mut profiles = read_profiles().map_err(|e| e.to_string())?;
+
+    let name = profile["name"].as_str().unwrap_or("");
+    if let Some(idx) = profiles.iter().position(|p| p["name"] == name) {
+        profiles[idx] = profile;
+    } else {
+        profiles.push(profile);
+    }
+
+    let path = get_app_dir().join("profiles.json");
+    fs::write(&path, serde_json::to_string_pretty(&profiles).unwrap())
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub fn open_file_in_editor(file_type: &str) -> Result<(), std::io::Error> {
     let app_dir = get_app_dir();
     let path = match file_type {
