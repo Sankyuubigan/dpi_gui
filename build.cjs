@@ -28,26 +28,29 @@ function checkDllDependencies(exePath) {
     }
 }
 
-function isProcessRunning(processName) {
+// Принудительно останавливаем процесс перед сборкой. Нужно, чтобы tauri-build
+// мог перезаписать sidecar-бинари (winws.exe и др.) в target\release\bin\.
+// Если процесс не запущен — execSync упадёт, поэтому ошибку глушим.
+function killProcess(processName) {
     try {
-        const stdout = execSync(`tasklist /FI "IMAGENAME eq ${processName}" /NH`, { encoding: 'utf8', timeout: 3000 });
-        return stdout.includes(processName);
-    } catch {
-        return false;
+        execSync(`taskkill /f /im ${processName}`, { stdio: 'ignore', timeout: 5000 });
+        console.log(`  Останавливаем запущенный процесс: ${processName}`);
+    } catch (e) {
+        // процесс не запущен — это нормально, просто игнорируем
     }
 }
 
 async function main() {
     try {
-        // Проверка, не запущена ли программа
+        // Перед сборкой останавливаем запущенные копии, иначе tauri-build не
+        // сможет перезаписать занятые файлы (os error 32: файл занят).
+        console.log('========================================');
+        console.log('  Останавливаем мешающие процессы перед сборкой...');
+        killProcess('winws.exe');
+        killProcess('dpi_gui.exe');
+        console.log('========================================');
+
         const exeToBuild = path.join(scriptDir, 'src-tauri', 'target', 'release', 'dpi_gui.exe');
-        if (fs.existsSync(exeToBuild) && isProcessRunning('dpi_gui.exe')) {
-            console.error('========================================');
-            console.error('  ⚠️  dpi_gui.exe запущен!');
-            console.error('  ➡️  Закрой программу DPI GUI и повтори сборку.');
-            console.error('========================================');
-            process.exit(1);
-        }
 
         console.log('========================================');
         console.log('[1/5] Installing Node.js dependencies...');
