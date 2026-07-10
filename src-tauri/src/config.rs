@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use serde_json::json;
@@ -110,8 +111,9 @@ pub fn open_file_in_editor(file_type: &str) -> Result<(), std::io::Error> {
     };
 
     Command::new("cmd")
-        .args(["/C", "start", "notepad", path.to_str().unwrap()])
+        .args(["/C", "start", "", "notepad", path.to_str().unwrap()])
+        .creation_flags(0x08000000)
         .spawn()?;
-    
+
     Ok(())
 }
