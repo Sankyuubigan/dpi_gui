@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -52,6 +53,13 @@ export default function AboutTab() {
     setIsDownloading(true);
     setProgress(0);
     try {
+      // Останавливаем обход перед установкой: иначе winws.exe / WinDivert
+      // держат файлы в bin/ заблокированными и установщик не сможет их перезаписать.
+      try {
+        await invoke("stop_bypass");
+      } catch (_) {
+        // Даже если остановить не удалось — продолжаем попытку обновления.
+      }
       let downloaded = 0;
       let total = 0;
       await update.downloadAndInstall((event) => {

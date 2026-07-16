@@ -33,6 +33,7 @@ pub fn ensure_directories_and_files() -> Result<(), std::io::Error> {
     // Генерация базовых списков. IPSet списки убраны за ненадобностью.
     let files_to_create = vec![
         ("list-general.txt", "# General domains to bypass\n"),
+        ("list-google.txt", "# Google domains to bypass\n"),
         ("list-exclude.txt", "# Domains to EXCLUDE from bypass\n"),
     ];
 

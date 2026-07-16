@@ -100,6 +100,13 @@ fn main() {
             test_dns,
             run_diagnostics
         ])
+        .on_window_event(|_window, event| {
+            // При закрытии окна гасим обход и выгружаем драйвер WinDivert,
+            // чтобы он не оставался в памяти и не блокировал файлы при обновлении.
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                let _ = process::stop_winws();
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

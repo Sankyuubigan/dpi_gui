@@ -267,3 +267,110 @@ npx tauri signer generate -w "<путь к папке>\tauri.key"
 - При добавлении нового места, где нужна версия (бэкенд, инсталлятор и т.п.) —
   читай её из `tauri.conf.json`, а не дублируй константой.
 
+### 4.6 Режим установки и почему приложение в Program Files (НЕ в AppData)
+
+Приложение требует прав администратора (`requireAdministrator` в `src-tauri/build.rs`),
+потому что WinDivert для загрузки драйвера нужны права админа. Поэтому установщик
+должен стоять в режиме **`perMachine`**, иначе автообновление ломается.
+
+В `tauri.conf.json` задан блок (обязательно сохранять!):
+
+```json
+"bundle": {
+  "windows": {
+    "nsis": {
+      "installMode": "perMachine",
+      "installerHooks": "./installer.nsh"
+    }
+  }
+}
+```
+
+- `installMode: perMachine` → установка в `C:\Program Files\DPI_GUI`. Это **единый**
+  каталог для всех пользователей и не зависит от того, под каким токеном запущен
+  установщик.
+- Если оставить дефолтный `currentUser` (без этого блока), установщик ставит в
+  `%LOCALAPPDATA%\DPI_GUI`. Но приложение запускается elevated (админ-токен), и
+  запущенный им установщик наследует этот токен — `%LOCALAPPDATA%` под ним резолвится
+  в профиль админа, **мимо запускаемого бинаря пользователя**. В итоге новая версия
+  ставится «куда-то ещё», запускаемый exe остаётся старым, обновление «висит» как
+  доступное, а `relaunch()` не стартует новый бинарь. **Этот баг уже был у пользователей
+  — не возвращай дефолтный режим.**
+
+#### Миграция со старой per-user установки
+
+Смена режима НЕ удаляет старую копию. При выпуске релиза, меняющего режим на
+`perMachine`, пользователям нужно сделать ОДИН раз вручную:
+
+1. Закрыть DPI_GUI, выключить обход.
+2. Удалить старую версию: «Параметры → Приложения → DPI_GUI → Удалить».
+3. Удалить остаток каталога: `C:\Users\<user>\AppData\Local\DPI_GUI`.
+   - Списки/профили в `C:\Users\<user>\AppData\Roaming\DPI_GUI` НЕ трогать — они
+     переживут переустановку и подхватятся новой версией.
+4. Установить новый `-setup.exe` (встанет в `C:\Program Files\DPI_GUI`).
+
+После этого автообновление через кнопку «Обновиться» работает штатно.
+
+### 4.7 Блокировка файлов при установке/обновлении (WinDivert64.sys)
+
+`stop_winws()` в `src-tauri/src/process.rs` останавливает НЕ ТОЛЬКО процесс `winws.exe`,
+но и **службу-драйвер WinDivert** (`sc stop WinDivert` / `WinDivert1.4` / `windivert`)
+с паузой, чтобы ядро выгрузило драйвер. Это обязательно: жёсткое `taskkill /F winws.exe`
+не выгружает драйвер, файл `bin/WinDivert64.sys` остаётся заблокированным ядром, и
+установщик падает с ошибкой:
+
+```
+Error opening file for writing:
+C:\Users\<user>\AppData\Local\DPI_GUI\bin\WinDivert64.sys
+Can't write: C:\...\bin\WinDivert64.sys
+```
+
+Правила, чтобы ошибка не вернулась:
+
+- **Не убирай остановку службы WinDivert** из `stop_winws()` — иначе установщик не
+  сможет перезаписать `.sys`.
+- **Не убирай `installerHooks`** (`src-tauri/installer.nsh`) — в хуках
+  `NSIS_HOOK_PREINSTALL` / `NSIS_HOOK_PREUNINSTALL` делается `taskkill` обхода и
+  `sc stop WinDivert` ДО копирования файлов. Это спасает ручную установку поверх
+  запущенного обхода.
+- **`AboutTab.tsx` вызывает `stop_bypass` (который дёргает `stop_winws`) перед
+  `downloadAndInstall()`** — не удаляй этот вызов, иначе встроенное автообновление
+  не сможет перезаписать `WinDivert64.sys`.
+- `main.rs` гасит обход при закрытии окна (`on_window_event` → `stop_winws`) — чтобы
+  драйвер не оставался в памяти после выхода и не мешал следующей установке.
+
+### 4.8 Диагностика: ложные ADMIN=0 / WINDIVERT=FAIL
+
+Раньше диагностика выдавала на исправных машинах `ADMIN=0` и `WINDIVERT=FAIL`, хотя
+приложение запущено от админа и WinDivert работает. Причины (исправлены, НЕ возвращать):
+
+- `check_admin()` проверял `net session /fo list /nh` — у `net session` нет ключа
+  `/fo`, команда всегда падала → `ADMIN=0`. Используется **только `net session`**.
+- Тест WinDivert передавал аргумент с кавычками `--hostlist=".../diag-windivert.txt"`
+  прямо в `Command::args` (кавычки попадали в имя файла) → файл не находился →
+  `WINDIVERT=FAIL`. Кавычек в аргументах `Command::args` **быть не должно**.
+
+### 4.9 Отсутствующий list-google.txt
+
+Профили по умолчанию ссылаются на `lists/list-google.txt`. Раньше файл не создавался
+автомато (`files_to_create` в `config.rs`), и winws падал с
+`cannot access hostlist file '.../lists/list-google.txt'`, а профиль «прыгал» между
+состояниями. Файл добавлен в `files_to_create` и создаётся в `lists/` при старте
+(наряду с `list-general.txt`, `list-exclude.txt`). **Не убирай `list-google.txt` из
+списка создаваемых файлов.**
+
+### 4.10 Что бандлится в установщик
+
+Из `bin/` в `<INSTALL>\bin\` попадают все 9 файлов: `winws.exe`, `WinDivert64.sys`,
+`WinDivert.dll`, `cygwin1.dll` и 5 `.bin`-фейков
+(`quic_initial_www_google_com.bin`, `stun.bin`, `tls_clienthello_4pda_to.bin`,
+`tls_clienthello_max_ru.bin`, `tls_clienthello_www_google_com.bin`). `release.cjs`
+копирует `../bin` в `target/release/bin/` ДО `tauri build`, поэтому resources
+(`../bin` → `bin`) подхватывают актуальные файлы. `get_bin_dir()` ищет `bin` рядом с
+exe — совпадает.
+
+Списки (`list-*.txt`, `default-bypass/*`, `default-exclude.txt`) и `profiles.json` **не
+бандлятся**, а генерируются в `AppData/Roaming/DPI_GUI` при старте (`init_app` →
+`config.rs`), поэтому не затираются при обновлении. При тестировании новой сборки
+проверяй, что эти файлы присутствуют в `AppData`, а не только в установочном каталоге.
+

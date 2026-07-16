@@ -50,7 +50,7 @@ pub fn check_admin() -> bool {
     let res = run_with_timeout(
         || {
             std::process::Command::new("cmd")
-                .args(["/C", "net", "session", "/fo", "list", "/nh"])
+                .args(["/C", "net", "session"])
                 .creation_flags(CREATE_NO_WINDOW)
                 .output()
                 .map(|o| o.status.success())
@@ -86,7 +86,7 @@ pub fn test_windivert(_app: &AppHandle) -> (bool, String) {
     let mut child = match std::process::Command::new(&bin)
         .args([
             "--filter-tcp=443",
-            &format!("--hostlist=\"{}/diag-windivert.txt\"", lists_str),
+            &format!("--hostlist={}/diag-windivert.txt", lists_str),
             "--dpi-desync=fake",
             "--dpi-desync-repeats=1",
         ])
