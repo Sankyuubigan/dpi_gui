@@ -13,8 +13,7 @@ use crate::process;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /// Результат классификации HTTP-проверки сайта.
-#[derive(Debug)]
-#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub enum HttpResult {
     Ok(u16),
     BlockPage,   // Ответ получен, но это страница-заглушка блокировки
@@ -145,6 +144,7 @@ pub fn test_windivert(_app: &AppHandle) -> (bool, String) {
     }
 }
 
+#[derive(Debug)]
 pub struct DnsInfo {
     pub system: Vec<IpAddr>,
     pub cloudflare: Vec<IpAddr>,
@@ -174,7 +174,19 @@ fn resolve_via(domain: &str, ns: &str) -> Vec<IpAddr> {
             bind_addr: None,
         });
     }
-    if let Ok(r) = Resolver::new(cfg, ResolverOpts::default()) {
+    let mut opts = ResolverOpts::default();
+    opts.timeout = Duration::from_secs(3);
+    opts.attempts = 2;
+    if let Ok(r) = Resolver::new(cfg, opts) {
+        if let Ok(resp) = r.lookup_ip(domain) {
+            return resp.iter().collect();
+        }
+    }
+    vec![]
+}
+
+fn resolve_system(domain: &str) -> Vec<IpAddr> {
+    if let Ok(r) = Resolver::from_system_conf() {
         if let Ok(resp) = r.lookup_ip(domain) {
             return resp.iter().collect();
         }
@@ -184,19 +196,54 @@ fn resolve_via(domain: &str, ns: &str) -> Vec<IpAddr> {
 
 /// Резолв заблокированного домена через системный DNS и два публичных.
 /// Разница между ними — признак DNS-цензуры.
+/// Резолвы выполняются параллельно, каждый — с жёстким таймаутом, чтобы
+/// недоступный публичный DNS не вешал диагностику на десятки секунд.
 pub fn dns_multi(domain: &str) -> DnsInfo {
     let mut info = DnsInfo::new();
 
-    if let Ok(r) = Resolver::from_system_conf() {
-        if let Ok(resp) = r.lookup_ip(domain) {
-            info.system = resp.iter().collect();
+    let (tx, rx) = mpsc::channel();
+
+    let d = domain.to_string();
+    let t = tx.clone();
+    thread::spawn(move || {
+        let _ = t.send(("sys", resolve_system(&d)));
+    });
+    let d = domain.to_string();
+    let t = tx.clone();
+    thread::spawn(move || {
+        let _ = t.send(("cf", resolve_via(&d, "1.1.1.1")));
+    });
+    let d = domain.to_string();
+    thread::spawn(move || {
+        let _ = tx.send(("gg", resolve_via(&d, "8.8.8.8")));
+    });
+
+    // Ждём каждый резолв с жёстким таймаутом. Зависший DNS живёт в фоне и не
+    // блокирует диагностику.
+    let mut got = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while got < 3 {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
         }
-    } else {
-        info.err = "не удалось прочитать системный DNS".to_string();
+        match rx.recv_timeout(deadline - now) {
+            Ok((kind, ips)) => {
+                match kind {
+                    "sys" => info.system = ips,
+                    "cf" => info.cloudflare = ips,
+                    _ => info.google = ips,
+                }
+                got += 1;
+            }
+            Err(_) => break,
+        }
     }
 
-    info.cloudflare = resolve_via(domain, "1.1.1.1");
-    info.google = resolve_via(domain, "8.8.8.8");
+    if info.system.is_empty() && info.cloudflare.is_empty() && info.google.is_empty() {
+        info.err = "ни системный, ни публичные DNS не вернули адрес".to_string();
+    }
+
     info
 }
 
@@ -265,21 +312,21 @@ pub fn http_classify_with(url: &str, secs: u64) -> HttpResult {
     match client.get(url).send() {
         Ok(resp) => {
             let status = resp.status().as_u16();
+            if status == 403 || status == 451 {
+                return HttpResult::BlockPage;
+            }
             if (200..=399).contains(&status) {
-                let body = resp.text().unwrap_or_default();
-                let low = body.to_lowercase();
+                let low = resp.text().unwrap_or_default().to_lowercase();
                 if low.contains("роскомнадзор")
                     || low.contains("заблокир")
-                    || low.contains("blocked")
-                    || low.contains("access denied")
-                    || low.contains("451")
+                    || low.contains("this site is blocked")
+                    || low.contains("access denied: by order")
+                    || low.contains("страница не может быть отображена")
                 {
                     HttpResult::BlockPage
                 } else {
                     HttpResult::Ok(status)
                 }
-            } else if status == 403 || status == 451 {
-                HttpResult::BlockPage
             } else {
                 HttpResult::Ok(status)
             }

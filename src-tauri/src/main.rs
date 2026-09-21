@@ -3,6 +3,9 @@
 mod config;
 mod process;
 mod analyzer;
+mod analyzer_probe;
+mod analyzer_report;
+mod site_probe;
 mod testing;
 mod bypass_lists;
 mod diagnostics;
@@ -54,9 +57,9 @@ fn check_status() -> bool {
 
 // Оборачиваем долгие команды в асинхронные таски, чтобы не вешать UI-поток
 #[tauri::command]
-async fn run_domain_analysis(url: String) -> Result<String, String> {
+async fn run_domain_analysis(app: AppHandle, url: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        analyzer::analyze_url(&url)
+        analyzer::analyze_url(&app, &url)
     }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
 }
 
