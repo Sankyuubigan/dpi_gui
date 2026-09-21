@@ -50,7 +50,7 @@ fn try_catch<T>(label: &str, app: &AppHandle, f: impl FnOnce() -> T) -> Option<T
 
 /// Проверка конкретного профиля (по имени) против тестового домена.
 fn test_profile_against(app: &AppHandle, name: &str, domain: &str, game_filter: bool) -> (bool, String) {
-    match process::start_winws(app.clone(), name, game_filter) {
+    match process::start_winws_quiet(app.clone(), name, game_filter) {
         Ok(_) => {
             thread::sleep(Duration::from_secs(3));
             let r = diagnostics_probe::http_classify(&format!("https://{}/", domain));
@@ -233,7 +233,7 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
         let _ = process::stop_winws();
         thread::sleep(Duration::from_millis(500));
         verified = try_catch("verify_profile", &app, || {
-            match process::start_winws_custom(app.clone(), &args, game_filter) {
+            match process::start_winws_custom_quiet(app.clone(), &args, game_filter) {
                 Ok(_) => {
                     thread::sleep(Duration::from_secs(3));
                     let r = diagnostics_probe::http_classify(&format!("https://{}/", domain));
@@ -274,7 +274,7 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
                 let _ = process::stop_winws();
                 thread::sleep(Duration::from_millis(500));
                 verified = try_catch("verify_clone", &app, || {
-                    match process::start_winws_custom(app.clone(), &cargs, game_filter) {
+                    match process::start_winws_custom_quiet(app.clone(), &cargs, game_filter) {
                         Ok(_) => {
                             thread::sleep(Duration::from_secs(3));
                             let r = diagnostics_probe::http_classify(&format!("https://{}/", domain));

@@ -79,7 +79,7 @@ pub fn test_technique(app: &AppHandle, spec: &TechniqueSpec, domain: &str, game_
         lists_str, hostlist_name, desync
     );
 
-    if let Err(e) = process::start_winws_custom(app.clone(), &raw_args, game_filter) {
+    if let Err(e) = process::start_winws_custom_quiet(app.clone(), &raw_args, game_filter) {
         return (false, format!("запуск winws: {}", e));
     }
 

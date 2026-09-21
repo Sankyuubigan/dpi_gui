@@ -64,7 +64,7 @@ async fn run_domain_analysis(app: AppHandle, url: String) -> Result<String, Stri
 }
 
 #[tauri::command]
-async fn test_profile(app: AppHandle, profile_name: String, url: String, game_filter: bool) -> Result<String, String> {
+async fn test_profile(app: AppHandle, profile_name: String, url: String, game_filter: bool) -> Result<testing::ProfileTestOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
         testing::test_single_profile(app, &profile_name, &url, game_filter)
     }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))

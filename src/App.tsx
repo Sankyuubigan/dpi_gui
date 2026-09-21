@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import ControlTab from "./components/ControlTab";
 import SettingsTab from "./components/SettingsTab";
-import TestingTab from "./components/TestingTab";
+import TestingTab, { type LogEntry } from "./components/TestingTab";
 import AboutTab from "./components/AboutTab";
 
 export default function App() {
@@ -10,7 +10,7 @@ export default function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [profiles, setProfiles] = useState<any[]>([]);
   const [config, setConfig] = useState<any>({ selected_profile: "", game_filter: false });
-  const [testingLog, setTestingLog] = useState<string[]>([]);
+  const [testingLog, setTestingLog] = useState<LogEntry[]>([]);
   const [testingUrl, setTestingUrl] = useState("youtube.com");
   const [testingIsTesting, setTestingIsTesting] = useState(false);
 

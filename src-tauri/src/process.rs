@@ -27,7 +27,10 @@ pub fn get_bin_dir() -> PathBuf {
 /// Строит итоговый список аргументов winws из шаблона (с плейсхолдерами).
 /// Вынесено отдельно, чтобы переиспользоваться и для запуска по имени профиля,
 /// и для запуска произвольного шаблона (диагностика).
-fn resolve_args(app: &AppHandle, raw_args_template: &str, game_filter: bool) -> Result<Vec<String>, String> {
+///
+/// В тихом режиме (`quiet`) не сыпем служебные строки «ПРОПУСК АРГУМЕНТА» и
+/// «Итоговые аргументы», чтобы логи тестов/диагностики оставались чистыми.
+fn resolve_args(app: &AppHandle, raw_args_template: &str, game_filter: bool, quiet: bool) -> Result<Vec<String>, String> {
     let app_dir = config::get_app_dir();
     let lists_dir = app_dir.join("lists").to_string_lossy().replace("\\", "/");
     let bin_dir = get_bin_dir().to_string_lossy().replace("\\", "/");
@@ -52,7 +55,9 @@ fn resolve_args(app: &AppHandle, raw_args_template: &str, game_filter: bool) -> 
     for arg in parsed_args {
         // Мы жестко вырезаем логику IPSet, чтобы не зависеть от лишних файлов
         if arg.starts_with("--ipset=") || arg.starts_with("--ipset-exclude=") {
-            let _ = app.emit("log", format!("[ПРОПУСК АРГУМЕНТА] {}", arg));
+            if !quiet {
+                let _ = app.emit("log", format!("[ПРОПУСК АРГУМЕНТА] {}", arg));
+            }
             continue;
         }
         final_args.push(arg.clone());
@@ -70,13 +75,15 @@ fn resolve_args(app: &AppHandle, raw_args_template: &str, game_filter: bool) -> 
         }
     }
 
-    let _ = app.emit("log", format!("Итоговые аргументы запуска ({} шт.)", final_args.len()));
+    if !quiet {
+        let _ = app.emit("log", format!("Итоговые аргументы запуска ({} шт.)", final_args.len()));
+    }
 
     Ok(final_args)
 }
 
 /// Собственно запуск winws с готовым списком аргументов.
-fn spawn_winws(app: &AppHandle, final_args: Vec<String>) -> Result<String, String> {
+fn spawn_winws(app: &AppHandle, final_args: Vec<String>, quiet: bool) -> Result<String, String> {
     let winws_path = get_bin_dir().join(WINWS_EXE);
 
     if !winws_path.exists() {
@@ -99,7 +106,8 @@ fn spawn_winws(app: &AppHandle, final_args: Vec<String>) -> Result<String, Strin
     let pid = child.id();
     let _ = app.emit("log", format!("Процесс запущен успешно. PID: {}", pid));
 
-    // Перехват stdout
+    // Перехват stdout. В тихом режиме кухню процесса в лог не льём —
+    // winws выводит десятки служебных строк, бесполезных пользователю.
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
@@ -108,7 +116,9 @@ fn spawn_winws(app: &AppHandle, final_args: Vec<String>) -> Result<String, Strin
         thread::spawn(move || {
             let reader = BufReader::new(out);
             for line in reader.lines().flatten() {
-                let _ = app_clone.emit("log", format!("[winws] {}", line));
+                if !quiet {
+                    let _ = app_clone.emit("log", format!("[winws] {}", line));
+                }
             }
         });
     }
@@ -128,20 +138,29 @@ fn spawn_winws(app: &AppHandle, final_args: Vec<String>) -> Result<String, Strin
 }
 
 pub fn start_winws(app: AppHandle, profile_name: &str, game_filter: bool) -> Result<String, String> {
+    start_winws_inner(app, profile_name, game_filter, false)
+}
+
+/// Тихий запуск: без служебной кухни winws в логах (тесты профилей, диагностика).
+pub fn start_winws_quiet(app: AppHandle, profile_name: &str, game_filter: bool) -> Result<String, String> {
+    start_winws_inner(app, profile_name, game_filter, true)
+}
+
+fn start_winws_inner(app: AppHandle, profile_name: &str, game_filter: bool, quiet: bool) -> Result<String, String> {
     let profiles = config::read_profiles().map_err(|e| e.to_string())?;
 
     let profile = profiles.iter().find(|p| p["name"] == profile_name)
         .ok_or("Профиль не найден")?;
 
     let args_template = profile["args"].as_str().unwrap_or("");
-    let final_args = resolve_args(&app, args_template, game_filter)?;
-    spawn_winws(&app, final_args)
+    let final_args = resolve_args(&app, args_template, game_filter, quiet)?;
+    spawn_winws(&app, final_args, quiet)
 }
 
-/// Запуск winws с произвольным шаблоном аргументов (используется диагностикой).
-pub fn start_winws_custom(app: AppHandle, raw_args_template: &str, game_filter: bool) -> Result<String, String> {
-    let final_args = resolve_args(&app, raw_args_template, game_filter)?;
-    spawn_winws(&app, final_args)
+/// Тихий запуск произвольного шаблона аргументов (используется диагностикой).
+pub fn start_winws_custom_quiet(app: AppHandle, raw_args_template: &str, game_filter: bool) -> Result<String, String> {
+    let final_args = resolve_args(&app, raw_args_template, game_filter, true)?;
+    spawn_winws(&app, final_args, true)
 }
 
 pub fn stop_winws() -> Result<String, String> {

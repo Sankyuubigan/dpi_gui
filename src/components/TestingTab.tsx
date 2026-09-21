@@ -1,14 +1,17 @@
 import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Search, Globe, Activity, ShieldQuestion, Stethoscope, ClipboardCopy } from "lucide-react";
+import { Search, Globe, Activity, ShieldQuestion, Stethoscope, ClipboardCopy, CheckCircle2, XCircle } from "lucide-react";
+
+export type LogKind = "info" | "ok" | "fail" | "sys";
+export type LogEntry = { text: string; kind: LogKind };
 
 export default function TestingTab({ profiles, setProfiles, config, log, setLog, url, setUrl, isTesting, setIsTesting }: {
   profiles: any[];
   setProfiles: Dispatch<SetStateAction<any[]>>;
   config: any;
-  log: string[];
-  setLog: Dispatch<SetStateAction<string[]>>;
+  log: LogEntry[];
+  setLog: Dispatch<SetStateAction<LogEntry[]>>;
   url: string;
   setUrl: Dispatch<SetStateAction<string>>;
   isTesting: boolean;
@@ -16,14 +19,19 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
 }) {
   const [dnsIp, setDnsIp] = useState("1.1.1.1"); // Cloudflare по умолчанию
   const [diag, setDiag] = useState<any>(null);
+  const [testProgress, setTestProgress] = useState<{ total: number; done: number; current: string } | null>(null);
+
+  const appendEntry = (text: string, kind: LogKind) => {
+    setLog((prev: LogEntry[]) => [...prev, { text, kind }].slice(-100));
+  };
 
   const appendLog = (msg: string) => {
-    setLog((prev: string[]) => [...prev, msg].slice(-100));
+    appendEntry(msg, "info");
   };
 
   useEffect(() => {
     const unlisten = listen<string>("log", (event) => {
-      appendLog(`[СИСТЕМА] ${event.payload}`);
+      appendEntry(`[СИСТЕМА] ${event.payload}`, "sys");
     });
     return () => {
       unlisten.then(f => f());
@@ -34,8 +42,8 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
     if (!url) return;
     setIsTesting(true);
     setLog([
-      `[Анализ] Запуск анализа доменов для: ${url}...`,
-      "Фоновый браузер запущен. Сбор доменов и проверка их доступности через обход (займет до ~25 сек)..."
+      { text: `[Анализ] Запуск анализа доменов для: ${url}...`, kind: "info" },
+      { text: "Фоновый браузер запущен. Сбор доменов и проверка их доступности через обход (займет до ~25 сек)...", kind: "info" }
     ]);
 
     try {
@@ -51,22 +59,71 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
   const runProfileTest = async () => {
     if (!url) return;
     setIsTesting(true);
-    setLog([`[Тест] Пинг сайта ${url} по всем профилям...`]);
+    const total = profiles.length;
+    setTestProgress({ total, done: 0, current: "..." });
+    setLog([{ text: `[Тест] Пинг сайта ${url} по всем профилям (всего ${total})...`, kind: "info" }]);
+    const startTime = Date.now();
+    const flatUrl = url.replace(/^https?:\/\//, "").split("/")[0];
+    const counts: Record<string, number> = {};
+    const successes: string[] = [];
+    const failures: { name: string; verdict: string }[] = [];
 
     try {
-      for (const p of profiles) {
-        appendLog(`-> Тест профиля: ${p.name}`);
-        const result: string = await invoke("test_profile", {
-          profileName: p.name,
-          url,
-          gameFilter: config.game_filter
-        });
-        appendLog(`   Результат: ${result}`);
+      for (let i = 0; i < profiles.length; i++) {
+        const p = profiles[i];
+        const num = i + 1;
+        setTestProgress({ total, done: i, current: p.name });
+        const isAuto = String(p.name ?? "").startsWith("Авто-профиль");
+        appendLog(
+          `[${num}/${total}] Тест профиля: ${p.name}` +
+          (isAuto ? ` — авто-профиль, привязан к своему домену (на ${flatUrl} не показателен)` : "")
+        );
+        try {
+          const outcome: any = await invoke("test_profile", {
+            profileName: p.name,
+            url,
+            gameFilter: config.game_filter
+          });
+          const secs = ((outcome.elapsed_ms ?? 0) / 1000).toFixed(1);
+          if (outcome.ok) {
+            appendEntry(`   Результат: ${outcome.verdict || "УСПЕХ"} · ${secs}с`, "ok");
+            counts["УСПЕХ"] = (counts["УСПЕХ"] ?? 0) + 1;
+            successes.push(String(p.name ?? ""));
+          } else {
+            appendEntry(`   Результат: ${outcome.verdict || "Неудача"} · ${secs}с`, "fail");
+            if (outcome.detail && outcome.detail !== outcome.verdict) {
+              appendLog(`   Причина: ${outcome.detail}`);
+            }
+            const key = outcome.verdict || "Неудача";
+            counts[key] = (counts[key] ?? 0) + 1;
+            failures.push({ name: String(p.name ?? ""), verdict: outcome.verdict || "Неудача" });
+          }
+        } catch (e: any) {
+          appendEntry(`   Результат: Ошибка теста: ${e}`, "fail");
+          counts["Ошибка теста"] = (counts["Ошибка теста"] ?? 0) + 1;
+          failures.push({ name: String(p.name ?? ""), verdict: "Ошибка теста" });
+        }
       }
-      appendLog("=== ТЕСТИРОВАНИЕ ЗАВЕРШЕНО ===");
+      setTestProgress({ total, done: total, current: "" });
+      const totalSecs = ((Date.now() - startTime) / 1000).toFixed(0);
+      appendLog(`=== ТЕСТИРОВАНИЕ ЗАВЕРШЕНО (${totalSecs}с) ===`);
+      const summary = Object.entries(counts).map(([k, v]) => `${k}: ${v}`).join(" · ");
+      appendLog(`Итог: ${summary}`);
+      if (successes.length > 0) {
+        appendEntry(`Успешные профили: ${successes.join(", ")}`, "ok");
+      } else {
+        appendEntry("Успешных профилей нет", "fail");
+      }
+      if (failures.length > 0) {
+        appendEntry(
+          `Неудачные профили: ${failures.map((f) => `${f.name} (${f.verdict})`).join(", ")}`,
+          "fail"
+        );
+      }
     } catch (e: any) {
       appendLog(`[Ошибка]: ${e}`);
     } finally {
+      setTestProgress(null);
       setIsTesting(false);
     }
   };
@@ -74,7 +131,7 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
   const runDnsTest = async () => {
     if (!url || !dnsIp) return;
     setIsTesting(true);
-    setLog([`[Тест DNS] Проверка сайта ${url} через кастомный DNS (${dnsIp})...`]);
+    setLog([{ text: `[Тест DNS] Проверка сайта ${url} через кастомный DNS (${dnsIp})...`, kind: "info" }]);
 
     try {
       const result: string = await invoke("test_dns", { url, dnsIp });
@@ -91,9 +148,9 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
     setIsTesting(true);
     setDiag(null);
     setLog([
-      `[Диагностика] Комплексная проверка соединения для: ${url}...`,
-      "Это займёт до ~1-2 минут: пробы DNS, WinDivert, connect, и прогон desync-техник.",
-      "Если какой-то инструмент не сработает — он будет пропущен, диагностика продолжится."
+      { text: `[Диагностика] Комплексная проверка соединения для: ${url}...`, kind: "info" },
+      { text: "Это займёт до ~1-2 минут: пробы DNS, WinDivert, connect, и прогон desync-техник.", kind: "info" },
+      { text: "Если какой-то инструмент не сработает — он будет пропущен, диагностика продолжится.", kind: "info" }
     ]);
 
     try {
@@ -115,7 +172,7 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
 
   const copyLogs = () => {
     if (log.length === 0) return;
-    navigator.clipboard.writeText(log.join("\n")).then(
+    navigator.clipboard.writeText(log.map((l) => l.text).join("\n")).then(
       () => appendLog("[Лог] Скопировано в буфер обмена."),
       () => appendLog("[Лог] Не удалось скопировать в буфер обмена.")
     );
@@ -186,6 +243,24 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
           </div>
         </div>
       </div>
+
+      {testProgress && (
+        <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+          <div className="flex justify-between items-center text-xs text-gray-600 mb-1">
+            <span className="font-semibold">Тест профилей</span>
+            <span>{testProgress.done}/{testProgress.total}</span>
+          </div>
+          <div className="w-full h-3 bg-gray-200 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-indigo-600 transition-all duration-300"
+              style={{ width: `${testProgress.total > 0 ? (testProgress.done / testProgress.total) * 100 : 0}%` }}
+            ></div>
+          </div>
+          {testProgress.current && (
+            <div className="text-xs text-gray-500 mt-1.5 animate-pulse">Сейчас: {testProgress.current}</div>
+          )}
+        </div>
+      )}
 
       {diag && (
         <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 text-sm">
@@ -261,9 +336,34 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
             <ClipboardCopy size={14} /> Копировать логи
           </button>
         </div>
-        <div className="flex-1 overflow-y-auto text-blue-300 font-mono text-sm break-all space-y-1 whitespace-pre-wrap">
-          {log.length === 0 ? <span className="text-gray-600">Ожидание...</span> : null}
-          {log.map((l, i) => <div key={i}>{l}</div>)}
+        <div className="flex-1 overflow-y-auto font-mono text-sm break-all space-y-1 whitespace-pre-wrap">
+          {log.length === 0 ? (
+            <span className="text-gray-600">Ожидание...</span>
+          ) : (
+            log.map((l, i) => {
+              if (l.kind === "ok") {
+                return (
+                  <div key={i} className="flex items-start gap-1.5 text-green-400">
+                    <CheckCircle2 size={15} className="mt-0.5 shrink-0" />
+                    <span>{l.text}</span>
+                  </div>
+                );
+              }
+              if (l.kind === "fail") {
+                return (
+                  <div key={i} className="flex items-start gap-1.5 text-red-400">
+                    <XCircle size={15} className="mt-0.5 shrink-0" />
+                    <span>{l.text}</span>
+                  </div>
+                );
+              }
+              return (
+                <div key={i} className={l.kind === "sys" ? "text-gray-500" : "text-blue-300"}>
+                  {l.text}
+                </div>
+              );
+            })
+          )}
         </div>
       </div>
     </div>
