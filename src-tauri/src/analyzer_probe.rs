@@ -71,11 +71,17 @@ pub struct Classification {
     pub dns_fail: Vec<String>,
     /// Доступен через обход, ничего не требует.
     pub ok: Vec<String>,
+    /// Недоступен, но причина не установлена (обход был выключен — нельзя
+    /// отличить «заблокирован сам» от «обход его ломает»). Требуется прогон
+    /// с включённым обходом для честного вывода.
+    pub broken: Vec<String>,
 }
 
 /// Разбирает результаты первой пробы (обход как есть). Используется, когда
 /// вторую пробу (без обхода) сделать нельзя (обход был выключен изначально).
-/// В этом случае все обрывы трактуем как кандидатов в исключения — прежнее поведение.
+/// В этом случае обрывы — НЕ «обход ломает домен»: обход просто не работал.
+/// Поэтому недоступные домены складываем в честный слот `broken` (причина не
+/// установлена), а не в `bypass_breaks` (иначе отчёт врёт, что обход ломает сайт).
 pub fn classify_single(
     results: Vec<(String, Probe)>,
     browser_failed: &HashSet<String>,
@@ -85,15 +91,27 @@ pub fn classify_single(
         bypass_breaks: Vec::new(),
         dns_fail: Vec::new(),
         ok: Vec::new(),
+        broken: Vec::new(),
     };
     for (host, probe) in results {
         match probe {
             Probe::Ok => c.ok.push(host),
             Probe::Dns => c.dns_fail.push(host),
-            Probe::Broken(err) => c.bypass_breaks.push((host, err)),
+            Probe::Broken(_) => c.broken.push(host),
         }
     }
-    add_browser_failed(&mut c, browser_failed);
+    // Домены, упавшие в браузере, при выключенном обходе тоже «неизвестны»,
+    // а не «сломаны обходом».
+    for host in browser_failed {
+        let known = c.ok.contains(host)
+            || c.dns_fail.contains(host)
+            || c.broken.contains(host)
+            || c.need_bypass.contains(host)
+            || c.bypass_breaks.iter().any(|(h, _)| h == host);
+        if !known {
+            c.broken.push(host.clone());
+        }
+    }
     finalize(&mut c);
     c
 }
@@ -113,6 +131,7 @@ pub fn classify_dual(
         bypass_breaks: Vec::new(),
         dns_fail: Vec::new(),
         ok: Vec::new(),
+        broken: Vec::new(),
     };
     for (host, probe) in results_on {
         match probe {
@@ -157,4 +176,94 @@ fn finalize(c: &mut Classification) {
     c.dns_fail.dedup();
     c.ok.sort();
     c.ok.dedup();
+    c.broken.sort();
+    c.broken.dedup();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn set(v: &[&str]) -> HashSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn results(v: &[(&str, Probe)]) -> Vec<(String, Probe)> {
+        v.iter().map(|(h, p)| (h.to_string(), p.clone())).collect()
+    }
+
+    #[test]
+    fn single_bypass_off_broken_goes_to_broken_not_bypass_breaks() {
+        let c = classify_single(
+            results(&[
+                ("ok.example", Probe::Ok),
+                ("broken.example", Probe::Broken("err".to_string())),
+                ("dns.example", Probe::Dns),
+            ]),
+            &set(&["br.failed.example"]),
+        );
+        assert_eq!(c.ok, vec!["ok.example"]);
+        assert_eq!(c.dns_fail, vec!["dns.example"]);
+        assert_eq!(c.broken, vec!["br.failed.example", "broken.example"]);
+        assert!(c.bypass_breaks.is_empty(), "обход выключен — не может «ломать»");
+    }
+
+    #[test]
+    fn single_browser_failed_not_duplicated() {
+        let c = classify_single(
+            results(&[("dup.example", Probe::Broken("err".to_string()))]),
+            &set(&["dup.example"]),
+        );
+        assert_eq!(c.broken, vec!["dup.example"]);
+        assert!(c.bypass_breaks.is_empty());
+    }
+
+    #[test]
+    fn dual_broken_both_ways_is_need_bypass() {
+        let c = classify_dual(
+            results(&[("blocked.example", Probe::Broken("err".to_string()))]),
+            &set(&["blocked.example"]),
+            &set(&[]),
+            &HashSet::new(),
+        );
+        assert_eq!(c.need_bypass, vec!["blocked.example"]);
+        assert!(c.broken.is_empty());
+    }
+
+    #[test]
+    fn dual_broken_with_bypass_works_without_is_bypass_breaks() {
+        let c = classify_dual(
+            results(&[("fine.example", Probe::Broken("err".to_string()))]),
+            &set(&[]), // без обхода работает
+            &set(&[]),
+            &HashSet::new(),
+        );
+        assert_eq!(c.bypass_breaks, vec![("fine.example".to_string(), "err".to_string())]);
+        assert!(c.broken.is_empty());
+    }
+
+    #[test]
+    fn dual_dns_broken_both_ways_is_dns_fail() {
+        let c = classify_dual(
+            results(&[("dns.example", Probe::Dns)]),
+            &set(&["dns.example"]),
+            &set(&["dns.example"]),
+            &HashSet::new(),
+        );
+        assert_eq!(c.dns_fail, vec!["dns.example"]);
+    }
+
+    #[test]
+    fn dual_ok_untouched() {
+        let c = classify_dual(
+            results(&[("ok.example", Probe::Ok)]),
+            &set(&[]),
+            &set(&[]),
+            &HashSet::new(),
+        );
+        assert_eq!(c.ok, vec!["ok.example"]);
+        assert!(c.need_bypass.is_empty());
+        assert!(c.bypass_breaks.is_empty());
+    }
 }

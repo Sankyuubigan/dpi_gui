@@ -1,7 +1,7 @@
 import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Search, Globe, Activity, ShieldQuestion, Stethoscope, ClipboardCopy, CheckCircle2, XCircle } from "lucide-react";
+import { Search, Globe, Activity, ShieldQuestion, Stethoscope, ClipboardCopy, CheckCircle2, XCircle, FileEdit, Trash2, FileText } from "lucide-react";
 
 export type LogKind = "info" | "ok" | "fail" | "sys";
 export type LogEntry = { text: string; kind: LogKind };
@@ -18,6 +18,7 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
   setIsTesting: Dispatch<SetStateAction<boolean>>;
 }) {
   const [dnsIp, setDnsIp] = useState("1.1.1.1"); // Cloudflare по умолчанию
+  const [hostsIp, setHostsIp] = useState("");
   const [diag, setDiag] = useState<any>(null);
   const [testProgress, setTestProgress] = useState<{ total: number; done: number; current: string } | null>(null);
 
@@ -170,6 +171,75 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
     }
   };
 
+  const cleanHost = (raw: string) =>
+    raw.trim().replace(/^https?:\/\//i, "").split("/")[0].split(":")[0];
+
+  const applyHosts = async () => {
+    const domain = cleanHost(url);
+    if (!domain || !hostsIp.trim()) {
+      appendEntry("[hosts] Укажите домен и IP-адрес для записи в hosts.", "fail");
+      return;
+    }
+    setIsTesting(true);
+    appendEntry(`[hosts] Запись в hosts: ${hostsIp.trim()} → ${domain}...`, "info");
+    try {
+      const msg: string = await invoke("apply_hosts_entry", {
+        ip: hostsIp.trim(),
+        domain,
+      });
+      appendEntry(msg, "ok");
+
+      appendEntry(`[hosts] Проверка HTTPS: открывается ли ${domain} через ${hostsIp.trim()}...`, "info");
+      try {
+        const verify: string = await invoke("verify_site_via_ip", {
+          host: domain,
+          ip: hostsIp.trim(),
+        });
+        const isOk = verify.includes("✅");
+        const isRst = verify.includes("RST");
+        appendEntry(
+          verify,
+          isOk ? "ok" : isRst ? "fail" : "info"
+        );
+        if (isRst) {
+          appendLog("💡 Напоминание: при RST сброс идёт на уровне SNI/DPI — подмена в hosts не открывает сайт. Используйте обход (winws).");
+        }
+      } catch (err: any) {
+        appendEntry(`[hosts] Ошибка авто-проверки: ${err}`, "fail");
+      }
+    } catch (e: any) {
+      appendEntry(`[hosts] Ошибка записи: ${e}`, "fail");
+    } finally {
+      setIsTesting(false);
+    }
+  };
+
+  const removeHosts = async () => {
+    const domain = cleanHost(url);
+    if (!domain) {
+      appendEntry("[hosts] Укажите домен для удаления из hosts.", "fail");
+      return;
+    }
+    setIsTesting(true);
+    try {
+      const msg: string = await invoke("remove_hosts_entry", { domain });
+      appendEntry(msg, "info");
+    } catch (e: any) {
+      appendEntry(`[hosts] Ошибка удаления: ${e}`, "fail");
+    } finally {
+      setIsTesting(false);
+    }
+  };
+
+  const viewHosts = async () => {
+    try {
+      const content: string = await invoke("read_hosts");
+      appendLog(`=== C:\\Windows\\System32\\drivers\\etc\\hosts ===\n${content}`);
+    } catch (e: any) {
+      appendEntry(`[hosts] Ошибка чтения hosts: ${e}`, "fail");
+    }
+  };
+
   const copyLogs = () => {
     if (log.length === 0) return;
     navigator.clipboard.writeText(log.map((l) => l.text).join("\n")).then(
@@ -235,6 +305,40 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
               className="flex-1 flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-400 text-white py-2 rounded-lg font-bold transition"
             >
               <ShieldQuestion size={18} /> Тест подмены DNS
+            </button>
+          </div>
+
+          <div className="flex gap-2 mt-2 items-center border-t border-gray-100 pt-4">
+            <input
+              type="text"
+              value={hostsIp}
+              onChange={(e) => setHostsIp(e.target.value)}
+              placeholder="IP для hosts (например 185.110.92.48)"
+              className="w-1/3 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 outline-none text-sm"
+              title="IP-адрес, который нужно прописать в hosts для домена выше"
+            />
+            <button
+              onClick={applyHosts}
+              disabled={isTesting}
+              className="flex-1 flex items-center justify-center gap-1.5 bg-cyan-600 hover:bg-cyan-700 disabled:bg-gray-400 text-white py-2 px-3 rounded-lg font-bold text-sm transition"
+              title="Записать строку 'IP домен' в C:\Windows\System32\drivers\etc\hosts и проверить HTTPS"
+            >
+              <FileEdit size={16} /> В hosts + тест
+            </button>
+            <button
+              onClick={removeHosts}
+              disabled={isTesting}
+              className="flex items-center justify-center gap-1.5 bg-gray-200 hover:bg-gray-300 disabled:bg-gray-100 text-gray-700 py-2 px-3 rounded-lg font-semibold text-sm transition"
+              title="Удалить записи DPI_GUI для этого домена из hosts"
+            >
+              <Trash2 size={16} /> Убрать
+            </button>
+            <button
+              onClick={viewHosts}
+              className="flex items-center justify-center gap-1 bg-gray-100 hover:bg-gray-200 text-gray-600 py-2 px-2.5 rounded-lg text-sm transition"
+              title="Показать текущий файл hosts в логе"
+            >
+              <FileText size={16} />
             </button>
           </div>
 

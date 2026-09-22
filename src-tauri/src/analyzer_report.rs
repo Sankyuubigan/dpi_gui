@@ -68,6 +68,9 @@ pub fn build_report(meta: &ReportMeta, c: &Classification) -> String {
     // === Домены, которые ЛОМАЕТ обход (в исключения) ===
     write_bypass_breaks(&mut log, c);
 
+    // === Домены, недоступные при выключенном обходе (причина не установлена) ===
+    write_broken(&mut log, meta, c);
+
     // === Домены сайта, уже внесённые в обход ===
     write_already_in_bypass(&mut log, meta, c);
 
@@ -80,13 +83,13 @@ pub fn build_report(meta: &ReportMeta, c: &Classification) -> String {
         if !meta.dns_fail_sub.is_empty() {
             log.push_str("  Проверка подмены DNS (DoH: xbox-dns.ru, geohide.ru):\n");
             for (h, subs) in &meta.dns_fail_sub {
-                let ok = subs.iter().find(|s| s.working_ip.is_some());
+                let ok = subs.iter().find(|s| s.http_ok);
                 match ok {
                     Some(s) => log.push_str(&format!(
-                        "    {} → подмена через {} РАБОТАЕТ (рабочий IP {})\n",
+                        "    {} → подмена через {} НАШЛА домен (IP {} отвечает на TCP:443)\n",
                         h,
                         s.service,
-                        s.working_ip.as_ref().unwrap()
+                        s.working_ip.as_ref().unwrap_or(&"-".to_string())
                     )),
                     None => log.push_str(&format!(
                         "    {} → подмена IP не нашла (домен реально не резолвится)\n",
@@ -175,11 +178,16 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
     log.push_str(&format!("  IP (www + DoH):     {}\n", alt));
     log.push_str(&format!("  Соединение главного IP:    {}\n", probe.http_note));
     if let Some(ip) = &probe.working_ip {
-        log.push_str(&format!(
-            "  Рабочий IP:          {} (сайт отвечает{})\n",
-            ip,
-            if probe.working_from_alt { ", взят из www/DoH" } else { "" }
-        ));
+        // «Рабочий IP» в probe_domain — это прошедший TCP:443, но это НЕ значит,
+        // что HTTPS открывается. Даём честную формулировку.
+        let status = if probe.http_note.contains("RST") {
+            "TCP:443 жив, но HTTPS RST — блок по SNI/IP, подмена в hosts не поможет"
+        } else if probe.http_note.contains("таймаут") || probe.http_note.contains("timeout") {
+            "TCP:443 жив, HTTPS таймаут"
+        } else {
+            "TCP:443 жив"
+        };
+        log.push_str(&format!("  Рабочий IP:          {} ({})\n", ip, status));
     } else {
         log.push_str("  Рабочий IP:          не найден\n");
     }
@@ -199,23 +207,22 @@ fn write_dns_substitution(log: &mut String, meta: &ReportMeta) {
 
     log.push_str("🔁 ПРОВЕРКА ПОДМЕНЫ DNS (обход отравленного DNS через DoH):\n");
     for sub in &meta.main_dns_sub {
-        match &sub.working_ip {
-            Some(_) => log.push_str(&format!("  ✅ {} — {}\n", sub.service, sub.http_note)),
-            None => {
-                if sub.resolved.is_empty() {
-                    log.push_str(&format!("  ❌ {} — {}\n", sub.service, sub.http_note));
-                } else {
-                    log.push_str(&format!(
-                        "  ❌ {} — {}. IP {} не отвечают\n",
-                        sub.service,
-                        sub.http_note,
-                        sub.resolved.join(", ")
-                    ));
-                }
+        if sub.http_ok {
+            log.push_str(&format!("  ✅ {} — {}\n", sub.service, sub.http_note));
+        } else {
+            if sub.resolved.is_empty() {
+                log.push_str(&format!("  ❌ {} — {}\n", sub.service, sub.http_note));
+            } else {
+                log.push_str(&format!(
+                    "  ❌ {} — {}. IP {} реально не открывают HTTPS (RST/таймаут — блок по SNI, а не DNS)\n",
+                    sub.service,
+                    sub.http_note,
+                    sub.resolved.join(", ")
+                ));
             }
         }
     }
-    if let Some(sub) = meta.main_dns_sub.iter().find(|s| s.working_ip.is_some()) {
+    if let Some(sub) = meta.main_dns_sub.iter().find(|s| s.http_ok) {
         log.push_str("  → ПОДМЕНА DNS РАБОТАЕТ. Сайт открывается через рабочий IP.\n");
         if !host.is_empty() {
             if let Some(ip) = &sub.working_ip {
@@ -226,7 +233,7 @@ fn write_dns_substitution(log: &mut String, meta: &ReportMeta) {
         }
         log.push_str("    Затем выполните: ipconfig /flushdns\n");
     } else {
-        log.push_str("  → Подмена DNS не помогла: сервисы не вернули рабочий IP. Значит, блокировка на уровне IP/DPI или сети — решается обходом (winws), а не сменой DNS.\n");
+        log.push_str("  → Подмена DNS не помогла: даже через «живые» по TCP IP сайт на HTTPS рвётся (RST/страница блокировки). Это блок на уровне IP/SNI, а не DNS — решается обходом (winws), а не сменой DNS. hosts-подмена тут бесполезна.\n");
     }
     log.push('\n');
 }
@@ -306,6 +313,31 @@ fn write_bypass_breaks(log: &mut String, c: &Classification) {
                 parent_suggestions.join(", ")
             ));
         }
+    }
+    log.push('\n');
+}
+
+/// Домены, которые не открылись при ВЫКЛЮЧЕННОМ обходе. Отличить «заблокирован
+/// сам» от «обход его ломает» в этом прогоне нельзя, поэтому не советуем
+/// исключения — а просим прогнать анализ с включённым профилем.
+fn write_broken(log: &mut String, meta: &ReportMeta, c: &Classification) {
+    if c.broken.is_empty() {
+        return;
+    }
+    log.push_str("⛔ НЕДОСТУПНЫЕ ДОМЕНЫ (причина не установлена):\n");
+    for h in &c.broken {
+        let parent = bypass_lists::parent_domain(h);
+        let kind = if parent == h.to_lowercase() {
+            "[корневой домен]".to_string()
+        } else {
+            format!("[субдомен, родитель: {}]", parent)
+        };
+        log.push_str(&format!("  - {}   {}\n", h, kind));
+    }
+    if meta.bypass_on {
+        log.push_str("  ℹ️ Не открываются даже с включённым обходом — но без обхода не проверялись.\n");
+    } else {
+        log.push_str("  ℹ️ Обход был ВЫКЛЮЧЕН, поэтому «ломает обход или домен сам» — непонятно. Включите профиль обхода и запустите анализ снова: тогда станет видно, что чинить (обход или исключения).\n");
     }
     log.push('\n');
 }

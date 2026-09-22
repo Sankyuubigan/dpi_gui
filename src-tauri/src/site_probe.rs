@@ -32,7 +32,6 @@ pub struct DomainProbe {
     pub primary_ips: Vec<String>,
     pub alt_ips: Vec<String>,
     pub working_ip: Option<String>,
-    pub working_from_alt: bool,
     pub http_note: String,
     pub verdict: Verdict,
     pub recommendation: Vec<String>,
@@ -217,16 +216,14 @@ pub fn probe_domain(host: &str) -> DomainProbe {
     }
     let mut http: Option<HttpResult> = None;
     let mut http_note = "ни один IP не ответил на TCP:443".to_string();
-    let mut working_from_alt = false;
 
     if let Some((ip, is_primary)) = &working {
         let r = http_via_ip(host, ip.parse().unwrap());
-        working_from_alt = !*is_primary;
         http = Some(r.clone());
         http_note = format!(
             "HTTPS через {} ({}): {}",
             ip,
-            if working_from_alt { "alt-IP" } else { "primary-IP" },
+            if *is_primary { "primary-IP" } else { "alt-IP" },
             match &r {
                 HttpResult::Ok(code) => format!("HTTP {}", code),
                 HttpResult::Tls => "TLS сломан".to_string(),
@@ -298,7 +295,6 @@ pub fn probe_domain(host: &str) -> DomainProbe {
         primary_ips,
         alt_ips,
         working_ip: working.map(|(i, _)| i),
-        working_from_alt,
         http_note,
         verdict,
         recommendation: rec,
@@ -311,8 +307,19 @@ pub fn probe_domain(host: &str) -> DomainProbe {
 pub struct DnsSubstitution {
     pub service: String,
     pub resolved: Vec<String>,
+    /// Реально «рабочий» IP — HTTPS через него открылся (`http_ok == true`).
+    /// Если `http_ok == false`, тут может лежать кандидат, прошедший только TCP:443.
     pub working_ip: Option<String>,
     pub http_note: String,
+    /// HTTPS-проба через `working_ip` реально вернула OK. От этого зависит,
+    /// можно ли советовать подмену в hosts (иначе RST — hosts бесполезен).
+    pub http_ok: bool,
+}
+
+/// Экспорт HTTPS-пробы по конкретному IP (для hosts-фичи: проверяем, что
+/// сайт реально открывается через выбранный адрес после записи в hosts).
+pub fn probe_https_by_ip(host: &str, ip: IpAddr) -> HttpResult {
+    http_via_ip(host, ip)
 }
 
 /// Проверка «подмены DNS»: резолв домена через DoH-сервисы (xbox-dns.ru,
@@ -331,6 +338,7 @@ pub fn check_dns_substitution(host: &str, probe_http: bool) -> Vec<DnsSubstituti
                 resolved: vec![],
                 working_ip: None,
                 http_note: "не вернул IP-адресов (DoH недоступен или не резолвит)".to_string(),
+                http_ok: false,
             });
             continue;
         }
@@ -344,30 +352,63 @@ pub fn check_dns_substitution(host: &str, probe_http: bool) -> Vec<DnsSubstituti
             }
         }
 
-        let http_note = if let Some(ip) = working {
-            if probe_http {
-                match http_via_ip(host, ip) {
-                    HttpResult::Ok(code) => format!("HTTPS {} через {}", code, ip),
-                    HttpResult::BlockPage => format!("страница блокировки через {}", ip),
-                    HttpResult::Tls => format!("TLS сломан через {}", ip),
-                    HttpResult::BadCert => format!("SSL-сертификат невалиден через {}", ip),
-                    HttpResult::Rst => format!("RST через {}", ip),
-                    HttpResult::Timeout => format!("таймаут через {}", ip),
-                    HttpResult::Dns => format!("DNS-ошибка через {}", ip),
-                    HttpResult::Other(m) => m,
+        let mut http_ok = false;
+        let mut http_note;
+        if let Some(ip) = working {
+            match http_via_ip(host, ip) {
+                HttpResult::Ok(code) => {
+                    http_ok = true;
+                    http_note = format!("HTTPS {} через {}", code, ip);
                 }
-            } else {
-                format!("TCP:443 отвечает ({})", ip)
+                HttpResult::BlockPage => {
+                    http_note = format!("страница блокировки через {}", ip);
+                }
+                HttpResult::Tls => {
+                    http_note = format!("TLS сломан через {}", ip);
+                }
+                HttpResult::BadCert => {
+                    http_note = format!("SSL-сертификат невалиден через {}", ip);
+                }
+                HttpResult::Rst => {
+                    http_note = format!("RST через {} — TCP:443 открыт, но HTTPS рвётся (DPI по SNI)", ip);
+                }
+                HttpResult::Timeout => {
+                    http_note = format!("таймаут через {}", ip);
+                }
+                HttpResult::Dns => {
+                    http_note = format!("DNS-ошибка через {}", ip);
+                }
+                HttpResult::Other(m) => {
+                    http_note = m;
+                }
             }
         } else {
-            "ни один IP из подмены не ответил на TCP:443".to_string()
-        };
+            http_note = "ни один IP из подмены не ответил на TCP:443".to_string();
+        }
+        if !probe_http {
+            // Лёгкий прогон (список dns_fail): HTTPS не гоняем, но и не называем
+            // IP «рабочим» — только кандидатом.
+            let res = working.is_some();
+            http_ok = res;
+            if let Some(ip) = working {
+                http_note = format!("TCP:443 отвечает ({})", ip);
+            }
+            out.push(DnsSubstitution {
+                service: service.to_string(),
+                resolved: display,
+                working_ip: working.map(|i| i.to_string()),
+                http_note,
+                http_ok,
+            });
+            continue;
+        }
 
         out.push(DnsSubstitution {
             service: service.to_string(),
             resolved: display,
             working_ip: working.map(|i| i.to_string()),
             http_note,
+            http_ok,
         });
     }
     out

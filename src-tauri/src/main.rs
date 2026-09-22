@@ -12,6 +12,7 @@ mod diagnostics;
 mod diagnostics_probe;
 mod diagnostics_techniques;
 mod diagnostics_report;
+mod hosts;
 
 use tauri::AppHandle;
 
@@ -84,6 +85,57 @@ async fn run_diagnostics(app: AppHandle, url: String, game_filter: bool) -> Resu
     }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
 }
 
+#[tauri::command]
+fn apply_hosts_entry(ip: String, domain: String) -> Result<String, String> {
+    hosts::apply_hosts_entry(&ip, &domain)
+}
+
+#[tauri::command]
+fn remove_hosts_entry(domain: String) -> Result<String, String> {
+    hosts::remove_hosts_entry(&domain)
+}
+
+#[tauri::command]
+fn read_hosts() -> Result<String, String> {
+    hosts::read_hosts()
+}
+
+/// Авто-проверка после записи в hosts: реально ли сайт открывается через этот IP.
+#[tauri::command]
+fn verify_site_via_ip(host: String, ip: String) -> Result<String, String> {
+    use std::net::IpAddr;
+    use std::str::FromStr;
+    let ip = IpAddr::from_str(ip.trim())
+        .map_err(|_| format!("«{}» — не похоже на IP-адрес", ip))?;
+    let host = hosts::normalize_domain_public(&host)?;
+    match site_probe::probe_https_by_ip(&host, ip) {
+        crate::diagnostics_probe::HttpResult::Ok(code) => {
+            Ok(format!("✅ Сайт {} открывается через {} (HTTP {})", host, ip, code))
+        }
+        crate::diagnostics_probe::HttpResult::BlockPage => {
+            Ok(format!("⚠️ {} через {} — страница блокировки (403/451/заглушка)", ip, host))
+        }
+        crate::diagnostics_probe::HttpResult::Rst => {
+            Ok(format!("🚫 {} — HTTPS сброшен (RST). Блок по SNI/IP: подмена в hosts не поможет, нужен обход (winws).", ip))
+        }
+        crate::diagnostics_probe::HttpResult::Tls => {
+            Ok(format!("🔐 {} — TLS-рукопожатие сломалось", ip))
+        }
+        crate::diagnostics_probe::HttpResult::BadCert => {
+            Ok(format!("⚠️ {} — сертификат невалиден для {}", ip, host))
+        }
+        crate::diagnostics_probe::HttpResult::Timeout => {
+            Ok(format!("⏳ {} — таймаут соединения", ip))
+        }
+        crate::diagnostics_probe::HttpResult::Dns => {
+            Ok(format!("ℹ️ {} — DNS-ошибка", ip))
+        }
+        crate::diagnostics_probe::HttpResult::Other(m) => {
+            Ok(format!("ℹ️ {} — {}", ip, m))
+        }
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -101,7 +153,11 @@ fn main() {
             run_domain_analysis,
             test_profile,
             test_dns,
-            run_diagnostics
+            run_diagnostics,
+            apply_hosts_entry,
+            remove_hosts_entry,
+            read_hosts,
+            verify_site_via_ip
         ])
         .on_window_event(|_window, event| {
             // При закрытии окна гасим обход и выгружаем драйвер WinDivert,
