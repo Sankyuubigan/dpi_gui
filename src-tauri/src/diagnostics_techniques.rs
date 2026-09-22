@@ -94,6 +94,7 @@ pub fn test_technique(app: &AppHandle, spec: &TechniqueSpec, domain: &str, game_
     let passed = matches!(res, HttpResult::Ok(_));
     let detail = match res {
         HttpResult::Ok(s) => format!("OK ({})", s),
+        HttpResult::BadCert => "SSL-сертификат невалиден — desync-техника здесь не поможет".to_string(),
         other => format!("{:?}", other),
     };
     (passed, detail)

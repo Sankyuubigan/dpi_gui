@@ -58,6 +58,7 @@ fn test_profile_against(app: &AppHandle, name: &str, domain: &str, game_filter: 
             let ok = matches!(r, diagnostics_probe::HttpResult::Ok(_));
             let detail = match r {
                 diagnostics_probe::HttpResult::Ok(s) => format!("OK ({})", s),
+                diagnostics_probe::HttpResult::BadCert => "SSL-сертификат невалиден (NET::ERR_CERT_*)".to_string(),
                 other => format!("{:?}", other),
             };
             (ok, detail)

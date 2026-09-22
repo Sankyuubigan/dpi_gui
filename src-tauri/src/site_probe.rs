@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use reqwest::blocking::Client;
 
-use crate::diagnostics_probe::{classify_reqwest_err, dns_multi, tcp_connect, DnsInfo, HttpResult};
+use crate::diagnostics_probe::{
+    classify_reqwest_err, dns_multi, resolve_via_doh, tcp_connect, DnsInfo, HttpResult,
+    DOH_RESOLVERS,
+};
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Verdict {
@@ -12,6 +15,9 @@ pub enum Verdict {
     IpUnreachable,
     IpReset,
     TlsBroken,
+    /// Сайт отвечает по TCP/TLS, но сертификат невалиден для имени домена
+    /// (браузер: NET::ERR_CERT_COMMON_NAME_INVALID и т.п.).
+    BadCert,
     DnsBlocked,
     BlockPage,
     NoPath,
@@ -48,7 +54,6 @@ fn http_via_ip(host: &str, ip: IpAddr) -> HttpResult {
     let client = match Client::builder()
         .resolve(host, SocketAddr::new(ip, 443))
         .timeout(Duration::from_secs(6))
-        .danger_accept_invalid_certs(true)
         .build()
     {
         Ok(c) => c,
@@ -107,6 +112,7 @@ pub fn classify(
             };
         }
         Some(HttpResult::BlockPage) => return Verdict::BlockPage,
+        Some(HttpResult::BadCert) => return Verdict::BadCert,
         Some(HttpResult::Tls) => return Verdict::TlsBroken,
         Some(HttpResult::Rst) => return Verdict::IpReset,
         _ => {}
@@ -224,6 +230,7 @@ pub fn probe_domain(host: &str) -> DomainProbe {
             match &r {
                 HttpResult::Ok(code) => format!("HTTP {}", code),
                 HttpResult::Tls => "TLS сломан".to_string(),
+                HttpResult::BadCert => "SSL-сертификат невалиден".to_string(),
                 HttpResult::Rst => "RST".to_string(),
                 HttpResult::Timeout => "таймаут".to_string(),
                 HttpResult::Dns => "DNS-ошибка".to_string(),
@@ -265,6 +272,13 @@ pub fn probe_domain(host: &str) -> DomainProbe {
         Verdict::TlsBroken => rec.push(
             "TCP-порт открыт, но TLS-рукопожатие рвётся. Если обход активен — его десинк может ломать TLS: добавьте домен в исключения. Если обход выключен — проблема на стороне сервера/CDN.".to_string(),
         ),
+        Verdict::BadCert => {
+            rec.push(format!(
+                "Сайт отвечает по сети, но SSL-сертификат сервера невалиден для «{}» — браузер покажет NET::ERR_CERT_COMMON_NAME_INVALID.",
+                host
+            ));
+            rec.push("Это НЕ блокировка: TCP/TLS работают, обходом тут не помочь. Первое: если ошибка появляется именно при включённом обходе — его десинк сбивает SNI, добавьте домен в исключения и переоткройте. Второе: если и без обхода — кривой сертификат на стороне сервера/CDN (сертификат выдан для другого имени или не продлён), смена DNS/списки не помогут.".to_string());
+        }
         Verdict::DnsBlocked => rec.push(
             "DNS-ответы системного и публичных резолверов расходятся (или не резолвится) — возможна DNS-цензура. Смените DNS на 1.1.1.1/8.8.8.8 или включите DoH.".to_string(),
         ),
@@ -289,6 +303,74 @@ pub fn probe_domain(host: &str) -> DomainProbe {
         verdict,
         recommendation: rec,
     }
+}
+
+/// Результат проверки «подмены DNS» через один DoH-сервис.
+/// Сервис пытается вернуть настоящий рабочий IP в обход отравленного DNS.
+#[derive(Debug)]
+pub struct DnsSubstitution {
+    pub service: String,
+    pub resolved: Vec<String>,
+    pub working_ip: Option<String>,
+    pub http_note: String,
+}
+
+/// Проверка «подмены DNS»: резолв домена через DoH-сервисы (xbox-dns.ru,
+/// geohide.ru) и поиск рабочего IP. Если системный/публичный UDP-DNS отравлен,
+/// эти сервисы могут вернуть настоящий адрес, и сайт откроется через подмену.
+///
+/// * `probe_http` — делать ли полную HTTPS-пробу первого рабочего IP
+///   (для главного домена да/для долгого перебора — нет).
+pub fn check_dns_substitution(host: &str, probe_http: bool) -> Vec<DnsSubstitution> {
+    let mut out = Vec::new();
+    for service in DOH_RESOLVERS {
+        let ips = resolve_via_doh(host, service);
+        if ips.is_empty() {
+            out.push(DnsSubstitution {
+                service: service.to_string(),
+                resolved: vec![],
+                working_ip: None,
+                http_note: "не вернул IP-адресов (DoH недоступен или не резолвит)".to_string(),
+            });
+            continue;
+        }
+        let display: Vec<String> = ips.iter().take(4).map(|i| i.to_string()).collect();
+
+        let mut working: Option<IpAddr> = None;
+        for ip in ips.iter().take(6) {
+            if tcp_connect(*ip, 443) == "Success" {
+                working = Some(*ip);
+                break;
+            }
+        }
+
+        let http_note = if let Some(ip) = working {
+            if probe_http {
+                match http_via_ip(host, ip) {
+                    HttpResult::Ok(code) => format!("HTTPS {} через {}", code, ip),
+                    HttpResult::BlockPage => format!("страница блокировки через {}", ip),
+                    HttpResult::Tls => format!("TLS сломан через {}", ip),
+                    HttpResult::BadCert => format!("SSL-сертификат невалиден через {}", ip),
+                    HttpResult::Rst => format!("RST через {}", ip),
+                    HttpResult::Timeout => format!("таймаут через {}", ip),
+                    HttpResult::Dns => format!("DNS-ошибка через {}", ip),
+                    HttpResult::Other(m) => m,
+                }
+            } else {
+                format!("TCP:443 отвечает ({})", ip)
+            }
+        } else {
+            "ни один IP из подмены не ответил на TCP:443".to_string()
+        };
+
+        out.push(DnsSubstitution {
+            service: service.to_string(),
+            resolved: display,
+            working_ip: working.map(|i| i.to_string()),
+            http_note,
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -362,6 +444,15 @@ mod tests {
         assert_eq!(
             classify(true, true, true, false, Some(&HttpResult::BlockPage)),
             Verdict::BlockPage
+        );
+    }
+
+    #[test]
+    fn bad_cert_verdict() {
+        // Сертификат невалиден, но TCP открыт — это НЕ «сайт открывается».
+        assert_eq!(
+            classify(true, true, true, false, Some(&HttpResult::BadCert)),
+            Verdict::BadCert
         );
     }
 

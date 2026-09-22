@@ -18,6 +18,10 @@ pub struct ReportMeta {
     pub had_browser_failures: bool,
     /// Диагностика главного домена (DNS/рабочий IP/первопричина).
     pub main_probe: Option<site_probe::DomainProbe>,
+    /// Автопроверка «подмены DNS» для главного домена (пусто, если сайт открывается).
+    pub main_dns_sub: Vec<site_probe::DnsSubstitution>,
+    /// Проверка подмены DNS для доменов из списка «не резолвится» (до 5).
+    pub dns_fail_sub: Vec<(String, Vec<site_probe::DnsSubstitution>)>,
 }
 
 /// Путь к пользовательскому general-листу (для подсказок «добавьте в обход»).
@@ -39,6 +43,9 @@ pub fn build_report(meta: &ReportMeta, c: &Classification) -> String {
 
     // Самый важный блок — диагноз главного домена, если сайт не открывается.
     write_main_domain(&mut log, meta);
+
+    // Автопроверка подмены DNS — если обычный DNS отравлен и сайт не открывается.
+    write_dns_substitution(&mut log, meta);
 
     log.push_str(&format!(
         "Обход (winws) активен: {}\n",
@@ -69,6 +76,24 @@ pub fn build_report(meta: &ReportMeta, c: &Classification) -> String {
         log.push_str("⚠️ ВОЗМОЖНО ЗАБЛОКИРОВАНЫ НА УРОВНЕ РФ (ошибка DNS):\n");
         for h in &c.dns_fail {
             log.push_str(&format!("  - {}\n", h));
+        }
+        if !meta.dns_fail_sub.is_empty() {
+            log.push_str("  Проверка подмены DNS (DoH: xbox-dns.ru, geohide.ru):\n");
+            for (h, subs) in &meta.dns_fail_sub {
+                let ok = subs.iter().find(|s| s.working_ip.is_some());
+                match ok {
+                    Some(s) => log.push_str(&format!(
+                        "    {} → подмена через {} РАБОТАЕТ (рабочий IP {})\n",
+                        h,
+                        s.service,
+                        s.working_ip.as_ref().unwrap()
+                    )),
+                    None => log.push_str(&format!(
+                        "    {} → подмена IP не нашла (домен реально не резолвится)\n",
+                        h
+                    )),
+                }
+            }
         }
         log.push('\n');
     }
@@ -116,6 +141,7 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
         SiteVerdict::DnsBlocked => "🔒",
         SiteVerdict::IpReset => "🚫",
         SiteVerdict::TlsBroken => "🔐",
+        SiteVerdict::BadCert => "🔐",
         SiteVerdict::BlockPage => "⛔",
         _ => "⚠️",
     };
@@ -161,6 +187,46 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
     log.push_str("  → РЕКОМЕНДАЦИИ:\n");
     for r in &probe.recommendation {
         log.push_str(&format!("    {}\n", r));
+    }
+    log.push('\n');
+}
+
+fn write_dns_substitution(log: &mut String, meta: &ReportMeta) {
+    if meta.main_dns_sub.is_empty() {
+        return;
+    }
+    let host = meta.main_probe.as_ref().map(|p| p.host.clone()).unwrap_or_default();
+
+    log.push_str("🔁 ПРОВЕРКА ПОДМЕНЫ DNS (обход отравленного DNS через DoH):\n");
+    for sub in &meta.main_dns_sub {
+        match &sub.working_ip {
+            Some(_) => log.push_str(&format!("  ✅ {} — {}\n", sub.service, sub.http_note)),
+            None => {
+                if sub.resolved.is_empty() {
+                    log.push_str(&format!("  ❌ {} — {}\n", sub.service, sub.http_note));
+                } else {
+                    log.push_str(&format!(
+                        "  ❌ {} — {}. IP {} не отвечают\n",
+                        sub.service,
+                        sub.http_note,
+                        sub.resolved.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(sub) = meta.main_dns_sub.iter().find(|s| s.working_ip.is_some()) {
+        log.push_str("  → ПОДМЕНА DNS РАБОТАЕТ. Сайт открывается через рабочий IP.\n");
+        if !host.is_empty() {
+            if let Some(ip) = &sub.working_ip {
+                log.push_str("    Добавьте в hosts (C:\\Windows\\System32\\drivers\\etc\\hosts):\n");
+                log.push_str(&format!("      {} {}\n", ip, host));
+                log.push_str(&format!("      {} www.{}\n", ip, host));
+            }
+        }
+        log.push_str("    Затем выполните: ipconfig /flushdns\n");
+    } else {
+        log.push_str("  → Подмена DNS не помогла: сервисы не вернули рабочий IP. Значит, блокировка на уровне IP/DPI или сети — решается обходом (winws), а не сменой DNS.\n");
     }
     log.push('\n');
 }

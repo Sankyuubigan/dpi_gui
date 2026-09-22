@@ -13,13 +13,14 @@ use crate::process;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /// Результат классификации HTTP-проверки сайта.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HttpResult {
     Ok(u16),
     BlockPage,   // Ответ получен, но это страница-заглушка блокировки
     Dns,         // Не резолвится (DNS-цензура / NXDOMAIN)
     Rst,         // Сброс соединения (RST) — типично для DPI
     Tls,         // Ошибка TLS/рукопожатия
+    BadCert,     // TLS прошёл, но сертификат невалиден для имени (NET::ERR_CERT_*)
     Timeout,     // Таймаут
     Other(String),
 }
@@ -171,6 +172,7 @@ fn resolve_via(domain: &str, ns: &str) -> Vec<IpAddr> {
             protocol: Protocol::Udp,
             tls_dns_name: None,
             trust_negative_responses: false,
+            tls_config: None,
             bind_addr: None,
         });
     }
@@ -247,6 +249,65 @@ pub fn dns_multi(domain: &str) -> DnsInfo {
     info
 }
 
+/// DoH-сервисы для проверки «подмены DNS»: возвращают настоящие IP в обход
+/// отравленного/перехваченного DNS. Используются и в тесте подмены DNS, и в
+/// автоматической проверке при анализе доменов.
+pub const DOH_RESOLVERS: &[&str] = &["xbox-dns.ru", "geohide.ru"];
+
+/// Резолвит хост DoH-сервера (бутстрап): сначала системный DNS, при неудаче —
+/// публичный 1.1.1.1 (UDP). Без него нельзя узнать IP, на который Https-клиент
+/// trust-dns должен идти по 443.
+fn bootstrap_doh_host(host: &str) -> Vec<IpAddr> {
+    let mut ips = resolve_system(host);
+    if ips.is_empty() {
+        ips = resolve_via(host, "1.1.1.1");
+    }
+    ips
+}
+
+/// Резолв домена через DNS-over-HTTPS (RFC 8484, путь `/dns-query`).
+/// `doh_host` — имя DoH-сервиса (например, "geohide.ru"). Бутстрап хоста
+/// делается системным DNS (fallback 1.1.1.1), затем запрос уходит по HTTPS.
+/// Выполняется с жёстким таймаутом внутри потока — зависший DoH не вешает вызов.
+pub fn resolve_via_doh(domain: &str, doh_host: &str) -> Vec<IpAddr> {
+    let bootstrap = bootstrap_doh_host(doh_host);
+    if bootstrap.is_empty() {
+        return vec![];
+    }
+
+    let mut cfg = ResolverConfig::new();
+    for ip in bootstrap {
+        cfg.add_name_server(NameServerConfig {
+            socket_addr: SocketAddr::new(ip, 443),
+            protocol: Protocol::Https,
+            tls_dns_name: Some(doh_host.to_string()),
+            trust_negative_responses: false,
+            tls_config: None,
+            bind_addr: None,
+        });
+    }
+    let mut opts = ResolverOpts::default();
+    opts.timeout = Duration::from_secs(4);
+    opts.attempts = 1;
+
+    let domain = domain.to_string();
+    run_with_timeout(
+        move || {
+            if let Ok(r) = Resolver::new(cfg, opts) {
+                if let Ok(resp) = r.lookup_ip(&domain) {
+                    let ips: Vec<IpAddr> = resp.iter().collect();
+                    if !ips.is_empty() {
+                        return ips;
+                    }
+                }
+            }
+            vec![]
+        },
+        8000,
+    )
+    .unwrap_or_default()
+}
+
 /// Есть ли у пользователя рабочий IPv6 до целевого домена (winws только IPv4).
 pub fn has_ipv6(domain: &str) -> bool {
     let addrs = resolve_via(domain, "2606:4700:4700::1111");
@@ -270,6 +331,12 @@ pub fn classify_reqwest_err(e: &reqwest::Error) -> HttpResult {
         msg.push_str(&s.to_string().to_lowercase());
         src = s.source();
     }
+    classify_err_text(&msg)
+}
+
+/// Классификация по тексту ошибки — чистая функция, покрыта юнит-тестами.
+/// Порядок важен: сертификатные ошибки ловим ДО общих tls/ssl/handshake.
+pub fn classify_err_text(msg: &str) -> HttpResult {
     if msg.contains("dns")
         || msg.contains("resolve")
         || msg.contains("name or service")
@@ -284,17 +351,31 @@ pub fn classify_reqwest_err(e: &reqwest::Error) -> HttpResult {
         || msg.contains("10061")
     {
         HttpResult::Rst
+    } else if msg.contains("certificate")
+        || msg.contains("peer certificate")
+        || msg.contains("not valid for")
+        || msg.contains("issuer")
+        || msg.contains("invalid peer")
+        || msg.contains("x509")
+        || msg.contains("common name")
+        || msg.contains("cert")
+        // Windows schannel отдаёт локализованные тексты и CERT_E_* коды.
+        || msg.contains("сертификат")
+        || msg.contains("не совпадает")
+        || msg.contains("0x800b010")
+        || msg.contains("-21467624")
+    {
+        HttpResult::BadCert
     } else if msg.contains("tls")
         || msg.contains("ssl")
-        || msg.contains("certificate")
         || msg.contains("handshake")
-        || msg.contains("cert")
+        || msg.contains("рукопожатие")
     {
         HttpResult::Tls
     } else if msg.contains("timed out") || msg.contains("timeout") || msg.contains("10060") {
         HttpResult::Timeout
     } else {
-        HttpResult::Other(msg)
+        HttpResult::Other(msg.to_string())
     }
 }
 
@@ -302,7 +383,6 @@ pub fn classify_reqwest_err(e: &reqwest::Error) -> HttpResult {
 pub fn http_classify_with(url: &str, secs: u64) -> HttpResult {
     let client = match Client::builder()
         .timeout(Duration::from_secs(secs))
-        .danger_accept_invalid_certs(true)
         .build()
     {
         Ok(c) => c,
@@ -386,5 +466,48 @@ pub fn normalize_host(input: &str) -> String {
     match url::Url::parse(&u) {
         Ok(p) => p.host_str().unwrap_or(input).to_string(),
         Err(_) => input.trim_end_matches('/').to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dns_errors() {
+        assert_eq!(classify_err_text("dns error"), HttpResult::Dns);
+        assert_eq!(classify_err_text("unable to resolve host"), HttpResult::Dns);
+        assert_eq!(classify_err_text("no address found"), HttpResult::Dns);
+        assert_eq!(classify_err_text("nxdomain"), HttpResult::Dns);
+    }
+
+    #[test]
+    fn rst_errors() {
+        assert_eq!(classify_err_text("connection reset by peer"), HttpResult::Rst);
+        assert_eq!(classify_err_text("connection closed before message completed"), HttpResult::Rst);
+        assert_eq!(classify_err_text("os error 10054"), HttpResult::Rst);
+        assert_eq!(classify_err_text("os error 10061"), HttpResult::Rst);
+    }
+
+    #[test]
+    fn bad_cert_errors() {
+        // Тот самый случай: NET::ERR_CERT_COMMON_NAME_INVALID.
+        assert_eq!(classify_err_text("invalid peer certificate: NotValidForName"), HttpResult::BadCert);
+        assert_eq!(classify_err_text("certificate is not valid for 'pornolab.net'"), HttpResult::BadCert);
+        assert_eq!(classify_err_text("the certificate doesn't match common name"), HttpResult::BadCert);
+        assert_eq!(classify_err_text("unable to get local issuer certificate"), HttpResult::BadCert);
+        assert_eq!(classify_err_text("x509: certificate signed by unknown authority"), HttpResult::BadCert);
+        // Windows schannel: локализованная причина + код CERT_E_CN_NO_MATCH.
+        assert_eq!(classify_err_text("client error (connect) cn-имя сертификата не совпадает с полученным значением. (os error -2146762481)"), HttpResult::BadCert);
+        // Общая TLS-ошибка БЕЗ упоминания сертификата — остаётся Tls.
+        assert_eq!(classify_err_text("tls handshake failure"), HttpResult::Tls);
+        assert_eq!(classify_err_text("ssl protocol error"), HttpResult::Tls);
+    }
+
+    #[test]
+    fn timeout_and_other() {
+        assert_eq!(classify_err_text("operation timed out"), HttpResult::Timeout);
+        assert_eq!(classify_err_text("os error 10060"), HttpResult::Timeout);
+        assert_eq!(classify_err_text("что-то неведомое"), HttpResult::Other("что-то неведомое".to_string()));
     }
 }

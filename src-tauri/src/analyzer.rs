@@ -353,6 +353,25 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
         analyzer_probe::classify_single(results_on, &browser_failed_set)
     };
 
+    // Автопроверка «подмены DNS». Обычный DNS (системный/публичные UDP:53) может
+    // быть отравлен или перехвачен, и тогда сайт не открывается, хотя сам не
+    // заблокирован. Если главный домен не открывается — резолвим его через
+    // DoH-сервисы xbox-dns.ru/geohide.ru и ищем рабочий IP для подмены.
+    let main_dns_sub = if main_probe.verdict != site_probe::Verdict::Open {
+        site_probe::check_dns_substitution(&main_host, true)
+    } else {
+        Vec::new()
+    };
+
+    // Домены, «не резолвящиеся» по классификации, тоже прогоняем через подмену
+    // (до 5 штук, лёгкая проверка — без полного HTTPS-прогона).
+    let dns_fail_sub: Vec<(String, Vec<site_probe::DnsSubstitution>)> = classification
+        .dns_fail
+        .iter()
+        .take(5)
+        .map(|h| (h.clone(), site_probe::check_dns_substitution(h, false)))
+        .collect();
+
     let meta = ReportMeta {
         target_url,
         discovered,
@@ -361,6 +380,8 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
         restore_note,
         had_browser_failures,
         main_probe: Some(main_probe),
+        main_dns_sub,
+        dns_fail_sub,
     };
 
     Ok(analyzer_report::build_report(&meta, &classification))

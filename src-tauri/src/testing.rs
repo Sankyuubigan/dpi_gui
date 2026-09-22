@@ -29,6 +29,7 @@ fn verdict_from_http(r: &diagnostics_probe::HttpResult) -> (bool, String) {
         diagnostics_probe::HttpResult::Dns => (false, "DNS не резолвится (NXDOMAIN / DNS-цензура)".to_string()),
         diagnostics_probe::HttpResult::Rst => (false, "RST — соединение сброшено (типично для DPI)".to_string()),
         diagnostics_probe::HttpResult::Tls => (false, "TLS-рукопожатие рвётся".to_string()),
+        diagnostics_probe::HttpResult::BadCert => (false, "SSL-сертификат сайта невалиден (NET::ERR_CERT_*)".to_string()),
         diagnostics_probe::HttpResult::Timeout => (false, "Таймаут соединения".to_string()),
         diagnostics_probe::HttpResult::Other(msg) => (false, format!("Ошибка: {}", msg)),
     }
@@ -79,6 +80,7 @@ pub fn test_single_profile(app: AppHandle, profile_name: &str, url: &str, game_f
             diagnostics_probe::HttpResult::Dns => "запись домена не найдена системным DNS".to_string(),
             diagnostics_probe::HttpResult::Rst => "соединение оборвано RST при рукопожатии".to_string(),
             diagnostics_probe::HttpResult::Tls => "TLS-хендшейк не завершился за время пробы".to_string(),
+            diagnostics_probe::HttpResult::BadCert => "сервер ответил, но его SSL-сертификат невалиден для домена — обход не починит это".to_string(),
             diagnostics_probe::HttpResult::Timeout => "сервер не ответил за ~5 секунд".to_string(),
             _ => format!("{:?}", result),
         }
@@ -95,26 +97,44 @@ pub fn test_single_profile(app: AppHandle, profile_name: &str, url: &str, game_f
 
 pub fn test_dns(url: &str, dns_ip: &str) -> Result<String, String> {
     let target_url = if !url.starts_with("http") { format!("https://{}", url) } else { url.to_string() };
-    
+
     // Вытаскиваем домен для резолвинга
     let parsed_url = url::Url::parse(&target_url).map_err(|e| format!("Неверный URL: {}", e))?;
     let domain = parsed_url.host_str().ok_or("Не удалось извлечь домен")?.to_string();
 
-    let dns_addr = IpAddr::from_str(dns_ip).map_err(|_| "Неверный IP кастомного DNS сервера")?;
-    
-    let mut config = ResolverConfig::new();
-    config.add_name_server(NameServerConfig {
-        socket_addr: SocketAddr::new(dns_addr, 53),
-        protocol: Protocol::Udp,
-        tls_dns_name: None,
-        trust_negative_responses: false,
-        bind_addr: None,
-    });
+    let dns_label = dns_ip.to_string();
 
-    // Делаем запрос к кастомному DNS (например, 1.1.1.1)
-    let resolver = Resolver::new(config, ResolverOpts::default()).map_err(|e| format!("Ошибка инициализации DNS клиента: {}", e))?;
-    let response = resolver.lookup_ip(&domain).map_err(|e| format!("Сбой резолвинга (возможно DNS недоступен или домен заблокирован на уровне DNS): {}", e))?;
-    let resolved_ip = response.iter().next().ok_or("Кастомный DNS не вернул IP адреса!")?;
+    // Два вида резолверов: привычный IP (UDP:53) и DoH-сервис (https://host/dns-query).
+    let resolved_ip: IpAddr;
+    if dns_ip.trim().starts_with("http") {
+        let doh_url = url::Url::parse(dns_ip.trim())
+            .map_err(|e| format!("Неверный URL DoH-резолвера: {}", e))?;
+        let doh_host = doh_url.host_str()
+            .ok_or("Не удалось извлечь хост из DoH-резолвера")?
+            .to_string();
+        let ips = diagnostics_probe::resolve_via_doh(&domain, &doh_host);
+        resolved_ip = ips.first().copied().ok_or_else(|| {
+            format!("DoH-резолвер {} не вернул IP для {}. Возможно DNS-цензура или сервис недоступен.", doh_host, domain)
+        })?;
+    } else {
+        let dns_addr = IpAddr::from_str(dns_ip.trim()).map_err(|_| "Неверный IP кастомного DNS сервера")?;
+
+        let mut config = ResolverConfig::new();
+        config.add_name_server(NameServerConfig {
+            socket_addr: SocketAddr::new(dns_addr, 53),
+            protocol: Protocol::Udp,
+            tls_dns_name: None,
+            trust_negative_responses: false,
+            tls_config: None,
+            bind_addr: None,
+        });
+
+        // Делаем запрос к кастомному DNS (например, 1.1.1.1)
+        let resolver = Resolver::new(config, ResolverOpts::default()).map_err(|e| format!("Ошибка инициализации DNS клиента: {}", e))?;
+        let response = resolver.lookup_ip(&domain).map_err(|e| format!("Сбой резолвинга (возможно DNS недоступен или домен заблокирован на уровне DNS): {}", e))?;
+        let resolved = response.iter().next().ok_or("Кастомный DNS не вернул IP адреса!")?;
+        resolved_ip = resolved;
+    }
 
     // Подменяем IP в запросе к reqwest (эмитируем Host заголовок)
     let client = Client::builder()
@@ -125,8 +145,8 @@ pub fn test_dns(url: &str, dns_ip: &str) -> Result<String, String> {
         .unwrap();
 
     match client.get(&target_url).send() {
-        Ok(res) if res.status().is_success() => Ok(format!("УСПЕХ (200 OK)\n DNS: {}\n Разрешенный IP: {}", dns_ip, resolved_ip)),
-        Ok(res) => Ok(format!("Доступно, но статус: {}\n DNS: {}\n IP: {}", res.status(), dns_ip, resolved_ip)),
-        Err(e) => Ok(format!("ОШИБКА подключения:\n DNS: {}\n IP: {}\n Причина: {}", dns_ip, resolved_ip, e))
+        Ok(res) if res.status().is_success() => Ok(format!("УСПЕХ (200 OK)\n DNS: {}\n Разрешенный IP: {}", dns_label, resolved_ip)),
+        Ok(res) => Ok(format!("Доступно, но статус: {}\n DNS: {}\n IP: {}", res.status(), dns_label, resolved_ip)),
+        Err(e) => Ok(format!("ОШИБКА подключения:\n DNS: {}\n IP: {}\n Причина: {}", dns_label, resolved_ip, e))
     }
 }

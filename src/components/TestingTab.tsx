@@ -217,12 +217,18 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
           <div className="flex gap-3 mt-2 items-center border-t border-gray-100 pt-4">
             <input
               type="text"
+              list="dns-presets"
               value={dnsIp}
               onChange={(e) => setDnsIp(e.target.value)}
-              placeholder="IP DNS (например 1.1.1.1)"
+              placeholder="IP DNS или DoH (например 1.1.1.1 или https://xbox-dns.ru/dns-query)"
               className="w-1/3 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 outline-none text-sm"
-              title="Введите кастомный IP-адрес DNS-сервера"
+              title="Кастомный DNS-сервер: IP (1.1.1.1) или DoH-сервис подмены DNS (https://xbox-dns.ru/dns-query, https://geohide.ru/dns-query)"
             />
+            <datalist id="dns-presets">
+              <option value="1.1.1.1">Cloudflare</option>
+              <option value="https://xbox-dns.ru/dns-query">xbox-dns.ru (DoH)</option>
+              <option value="https://geohide.ru/dns-query">geohide.ru (DoH)</option>
+            </datalist>
             <button
               onClick={runDnsTest}
               disabled={isTesting}
