@@ -13,7 +13,7 @@ export default function ControlTab({ isRunning, profiles, config, saveConfig }: 
   };
 
   useEffect(() => {
-    logEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    logEndRef.current?.scrollIntoView({ behavior: "auto" });
   }, [logs]);
 
   useEffect(() => {
@@ -60,7 +60,7 @@ export default function ControlTab({ isRunning, profiles, config, saveConfig }: 
         <div>
           <h2 className="text-xl font-bold text-gray-800">Статус работы</h2>
           <div className="flex items-center gap-2 mt-2">
-            <div className={`w-3 h-3 rounded-full ${isRunning ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
+            <div className={`w-3 h-3 rounded-full ${isRunning ? 'bg-green-500' : 'bg-red-500'}`}></div>
             <span className={`font-semibold ${isRunning ? 'text-green-600' : 'text-red-600'}`}>
               {isRunning ? 'ПРОЦЕСС АКТИВЕН' : 'ОСТАНОВЛЕНО'}
             </span>

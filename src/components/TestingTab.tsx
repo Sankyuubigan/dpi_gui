@@ -367,7 +367,7 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
             ></div>
           </div>
           {testProgress.current && (
-            <div className="text-xs text-gray-500 mt-1.5 animate-pulse">Сейчас: {testProgress.current}</div>
+            <div className="text-xs text-gray-500 mt-1.5">Сейчас: {testProgress.current}</div>
           )}
         </div>
       )}
