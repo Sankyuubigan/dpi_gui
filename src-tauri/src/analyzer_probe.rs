@@ -11,6 +11,9 @@ pub enum Probe {
     Ok,
     Dns,
     Broken(String),
+    /// TCP до адреса домена не устанавливается вообще: сервер не отвечает даже на
+    /// SYN. Такой домен обход не спасёт — он не принимает соединения.
+    DeadIp,
 }
 
 /// Проба одного домена: любой HTTP-ответ (даже 403/404) значит, что связь
@@ -31,11 +34,22 @@ pub fn probe_host(host: &str) -> Probe {
                 || m.contains("no address")
             {
                 Probe::Dns
+            } else if is_dead_ip_error(&m) {
+                Probe::DeadIp
             } else {
                 Probe::Broken(e.to_string())
             }
         }
     }
+}
+
+/// Таймаут соединения без RST — типичный признак того, что сервер не слушает
+/// этот адрес (а не DPI: DPI обычно сбрасывает соединение или подменяет ответ).
+pub fn is_dead_ip_error(msg: &str) -> bool {
+    (msg.contains("timed out") || msg.contains("timeout") || msg.contains("10060"))
+        && !msg.contains("reset")
+        && !msg.contains("10061")
+        && !msg.contains("10054")
 }
 
 /// Параллельно (пачками) простукивает список доменов, чтобы не ждать минуты при
@@ -98,6 +112,7 @@ pub fn classify_single(
             Probe::Ok => c.ok.push(host),
             Probe::Dns => c.dns_fail.push(host),
             Probe::Broken(_) => c.broken.push(host),
+            Probe::DeadIp => c.broken.push(host),
         }
     }
     // Домены, упавшие в браузере, при выключенном обходе тоже «неизвестны»,
@@ -120,10 +135,13 @@ pub fn classify_single(
 /// оказались сломаны И без обхода (проба #2). Если домен сломан с обходом, но:
 ///  - сломан и без обхода  -> заблокирован сам -> need_bypass (в обход);
 ///  - работает без обхода   -> обход его ломает -> bypass_breaks (в исключения).
+/// `dead_off` — домены, которые и без обхода не принимают соединение (сервер
+/// не отвечает). Для них обход не поможет, поэтому они никуда не рекомендуются.
 pub fn classify_dual(
     results_on: Vec<(String, Probe)>,
     broken_off: &HashSet<String>,
     dns_off: &HashSet<String>,
+    dead_off: &HashSet<String>,
     browser_failed: &HashSet<String>,
 ) -> Classification {
     let mut c = Classification {
@@ -134,9 +152,17 @@ pub fn classify_dual(
         broken: Vec::new(),
     };
     for (host, probe) in results_on {
+        if dead_off.contains(&host) {
+            // Сервер не отвечает даже без обхода — домен недоступен сам по себе.
+            c.broken.push(host);
+            continue;
+        }
         match probe {
             Probe::Ok => c.ok.push(host),
             Probe::Dns => c.dns_fail.push(host),
+            // Сервер не принимает соединение вообще — ни обход, ни исключения
+            // тут не помогут, домен уходит в «недоступные», а не в обход.
+            Probe::DeadIp => c.broken.push(host),
             Probe::Broken(err) => {
                 if dns_off.contains(&host) {
                     c.dns_fail.push(host);
@@ -226,6 +252,7 @@ mod tests {
             &set(&["blocked.example"]),
             &set(&[]),
             &HashSet::new(),
+            &HashSet::new(),
         );
         assert_eq!(c.need_bypass, vec!["blocked.example"]);
         assert!(c.broken.is_empty());
@@ -237,6 +264,7 @@ mod tests {
             results(&[("fine.example", Probe::Broken("err".to_string()))]),
             &set(&[]), // без обхода работает
             &set(&[]),
+            &HashSet::new(),
             &HashSet::new(),
         );
         assert_eq!(c.bypass_breaks, vec![("fine.example".to_string(), "err".to_string())]);
@@ -250,6 +278,7 @@ mod tests {
             &set(&["dns.example"]),
             &set(&["dns.example"]),
             &HashSet::new(),
+            &HashSet::new(),
         );
         assert_eq!(c.dns_fail, vec!["dns.example"]);
     }
@@ -261,9 +290,41 @@ mod tests {
             &set(&[]),
             &set(&[]),
             &HashSet::new(),
+            &HashSet::new(),
         );
         assert_eq!(c.ok, vec!["ok.example"]);
         assert!(c.need_bypass.is_empty());
         assert!(c.bypass_breaks.is_empty());
+    }
+
+    /// Сервер не отвечает даже без обхода — обход тут бессилен, домен не рекомендуем.
+    #[test]
+    fn dead_ip_never_recommended_for_bypass() {
+        let c = classify_dual(
+            results(&[("dead.example", Probe::DeadIp)]),
+            &set(&["dead.example"]),
+            &set(&[]),
+            &set(&["dead.example"]),
+            &HashSet::new(),
+        );
+        assert_eq!(c.broken, vec!["dead.example"]);
+        assert!(c.need_bypass.is_empty());
+        assert!(c.bypass_breaks.is_empty());
+    }
+
+    #[test]
+    fn dead_ip_without_bypass_pass_goes_to_broken() {
+        let c = classify_single(results(&[("dead.example", Probe::DeadIp)]), &HashSet::new());
+        assert_eq!(c.broken, vec!["dead.example"]);
+        assert!(c.need_bypass.is_empty());
+    }
+
+    #[test]
+    fn timeout_is_dead_ip_but_reset_is_not() {
+        assert!(is_dead_ip_error("error sending request: operation timed out"));
+        assert!(is_dead_ip_error("read tcp: i/o timeout (os error 10060)"));
+        // RST — это DPI, а не мёртвый сервер.
+        assert!(!is_dead_ip_error("connection reset by peer (os error 10054)"));
+        assert!(!is_dead_ip_error("connection refused (os error 10061)"));
     }
 }

@@ -5,6 +5,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::os::windows::process::CommandExt;
 use trust_dns_resolver::config::{ResolverConfig, ResolverOpts, NameServerConfig, Protocol};
+use trust_dns_resolver::error::ResolveErrorKind;
 use trust_dns_resolver::Resolver;
 use reqwest::blocking::Client;
 use tauri::AppHandle;
@@ -145,12 +146,36 @@ pub fn test_windivert(_app: &AppHandle) -> (bool, String) {
     }
 }
 
+/// Итог одного DNS-запроса. Различаем «домен не существует» и «резолвер не
+/// ответил»: в российских сетях UDP:53 до 1.1.1.1/8.8.8.8 часто заблокирован,
+/// и раньше это молча показывалось как «(пусто)», хотя на самом деле адреса
+/// могли существовать — просто резолвер не был достижим.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DnsState {
+    #[default]
+    Ok,
+    /// NXDOMAIN — домен не существует.
+    Nxdomain,
+    /// Резолвер не ответил (таймаут / заблокирован / обрыв).
+    Unreachable,
+}
+
+#[derive(Debug, Default)]
+pub struct DnsLookup {
+    pub ips: Vec<IpAddr>,
+    pub state: DnsState,
+}
+
 #[derive(Debug)]
 pub struct DnsInfo {
     pub system: Vec<IpAddr>,
     pub cloudflare: Vec<IpAddr>,
     pub google: Vec<IpAddr>,
     pub err: String,
+    /// Состояние каждого резолвера, чтобы отчёт не путал NXDOMAIN с блокировкой UDP:53.
+    pub system_state: DnsState,
+    pub cloudflare_state: DnsState,
+    pub google_state: DnsState,
 }
 
 impl DnsInfo {
@@ -160,11 +185,14 @@ impl DnsInfo {
             cloudflare: vec![],
             google: vec![],
             err: String::new(),
+            system_state: DnsState::default(),
+            cloudflare_state: DnsState::default(),
+            google_state: DnsState::default(),
         }
     }
 }
 
-fn resolve_via(domain: &str, ns: &str) -> Vec<IpAddr> {
+fn resolve_via_full(domain: &str, ns: &str) -> DnsLookup {
     let mut cfg = ResolverConfig::new();
     if let Ok(addr) = ns.parse::<IpAddr>() {
         cfg.add_name_server(NameServerConfig {
@@ -179,21 +207,55 @@ fn resolve_via(domain: &str, ns: &str) -> Vec<IpAddr> {
     let mut opts = ResolverOpts::default();
     opts.timeout = Duration::from_secs(3);
     opts.attempts = 2;
-    if let Ok(r) = Resolver::new(cfg, opts) {
-        if let Ok(resp) = r.lookup_ip(domain) {
-            return resp.iter().collect();
-        }
+    match Resolver::new(cfg, opts) {
+        Ok(r) => match r.lookup_ip(domain) {
+            Ok(resp) => DnsLookup {
+                ips: resp.iter().collect(),
+                state: DnsState::Ok,
+            },
+            Err(e) => DnsLookup {
+                ips: vec![],
+                state: match e.kind() {
+                    ResolveErrorKind::NoRecordsFound { .. } => DnsState::Nxdomain,
+                    _ => DnsState::Unreachable,
+                },
+            },
+        },
+        Err(_) => DnsLookup {
+            ips: vec![],
+            state: DnsState::Unreachable,
+        },
     }
-    vec![]
+}
+
+fn resolve_system_full(domain: &str) -> DnsLookup {
+    match Resolver::from_system_conf() {
+        Ok(r) => match r.lookup_ip(domain) {
+            Ok(resp) => DnsLookup {
+                ips: resp.iter().collect(),
+                state: DnsState::Ok,
+            },
+            Err(e) => DnsLookup {
+                ips: vec![],
+                state: match e.kind() {
+                    ResolveErrorKind::NoRecordsFound { .. } => DnsState::Nxdomain,
+                    _ => DnsState::Unreachable,
+                },
+            },
+        },
+        Err(_) => DnsLookup {
+            ips: vec![],
+            state: DnsState::Unreachable,
+        },
+    }
+}
+
+fn resolve_via(domain: &str, ns: &str) -> Vec<IpAddr> {
+    resolve_via_full(domain, ns).ips
 }
 
 fn resolve_system(domain: &str) -> Vec<IpAddr> {
-    if let Ok(r) = Resolver::from_system_conf() {
-        if let Ok(resp) = r.lookup_ip(domain) {
-            return resp.iter().collect();
-        }
-    }
-    vec![]
+    resolve_system_full(domain).ips
 }
 
 /// Резолв заблокированного домена через системный DNS и два публичных.
@@ -208,16 +270,16 @@ pub fn dns_multi(domain: &str) -> DnsInfo {
     let d = domain.to_string();
     let t = tx.clone();
     thread::spawn(move || {
-        let _ = t.send(("sys", resolve_system(&d)));
+        let _ = t.send(("sys", resolve_system_full(&d)));
     });
     let d = domain.to_string();
     let t = tx.clone();
     thread::spawn(move || {
-        let _ = t.send(("cf", resolve_via(&d, "1.1.1.1")));
+        let _ = t.send(("cf", resolve_via_full(&d, "1.1.1.1")));
     });
     let d = domain.to_string();
     thread::spawn(move || {
-        let _ = tx.send(("gg", resolve_via(&d, "8.8.8.8")));
+        let _ = tx.send(("gg", resolve_via_full(&d, "8.8.8.8")));
     });
 
     // Ждём каждый резолв с жёстким таймаутом. Зависший DNS живёт в фоне и не
@@ -230,11 +292,20 @@ pub fn dns_multi(domain: &str) -> DnsInfo {
             break;
         }
         match rx.recv_timeout(deadline - now) {
-            Ok((kind, ips)) => {
+            Ok((kind, res)) => {
                 match kind {
-                    "sys" => info.system = ips,
-                    "cf" => info.cloudflare = ips,
-                    _ => info.google = ips,
+                    "sys" => {
+                        info.system_state = res.state;
+                        info.system = res.ips;
+                    }
+                    "cf" => {
+                        info.cloudflare_state = res.state;
+                        info.cloudflare = res.ips;
+                    }
+                    _ => {
+                        info.google_state = res.state;
+                        info.google = res.ips;
+                    }
                 }
                 got += 1;
             }

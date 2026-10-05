@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::analyzer_probe::Classification;
 use crate::bypass_lists;
+use crate::diagnostics_probe::DnsState;
 use crate::site_probe::{self, Verdict as SiteVerdict};
 
 /// Дополнительная информация для отчёта, не связанная с классификацией доменов.
@@ -41,7 +42,11 @@ pub fn build_report(meta: &ReportMeta, c: &Classification) -> String {
     let mut log = String::new();
     log.push_str(&format!("=== АНАЛИЗ ДОМЕНОВ: {} ===\n\n", meta.target_url));
 
-    // Самый важный блок — диагноз главного домена, если сайт не открывается.
+    // Диагноз идёт ПЕРВЫМ: пользователь должен сразу понять причину, а не
+    // продираться через детали, чтобы её найти.
+    write_diagnosis(&mut log, meta);
+
+    // Факты по главному домену (DNS, IP, матрица проб).
     write_main_domain(&mut log, meta);
 
     // Автопроверка подмены DNS — если обычный DNS отравлен и сайт не открывается.
@@ -125,6 +130,60 @@ pub fn build_report(meta: &ReportMeta, c: &Classification) -> String {
     log
 }
 
+fn write_diagnosis(log: &mut String, meta: &ReportMeta) {
+    let probe = match &meta.main_probe {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Если сайт открыт — короткий подтверждающий блок, без шума.
+    if probe.verdict == SiteVerdict::Open {
+        log.push_str(&format!(
+            "✅ САЙТ «{}» ДОСТУПЕН — домен и сеть в порядке ({}).\n\n",
+            probe.host, probe.http_note
+        ));
+        return;
+    }
+
+    let diag = match &probe.diagnosis {
+        Some(d) => d,
+        None => return,
+    };
+
+    let icon = match probe.verdict {
+        SiteVerdict::WwwOnly => "🌐",
+        SiteVerdict::DnsBlocked => "🔒",
+        SiteVerdict::IpReset => "🚫",
+        SiteVerdict::TlsBroken | SiteVerdict::BadCert => "🔐",
+        SiteVerdict::BlockPage => "⛔",
+        _ => "⚠️",
+    };
+
+    log.push_str(&format!(
+        "{} ВЕРОЯТНАЯ ПРИЧИНА ({}):\n",
+        icon,
+        probe.verdict.verdict_name()
+    ));
+    log.push_str(&format!("  {}\n", diag.probable_cause));
+
+    // Что делать.
+    if !diag.do_this.is_empty() {
+        log.push_str("\n  ✅ ЧТО СДЕЛАТЬ:\n");
+        for a in &diag.do_this {
+            log.push_str(&format!("     • {}\n", a));
+        }
+    }
+
+    // Что НЕ поможет — экономит юзеру время на бесполезные действия.
+    if !diag.wont_help.is_empty() {
+        log.push_str("\n  ❌ ЧТО НЕ ПОМОЖЕТ:\n");
+        for a in &diag.wont_help {
+            log.push_str(&format!("     • {}\n", a));
+        }
+    }
+    log.push('\n');
+}
+
 fn write_main_domain(log: &mut String, meta: &ReportMeta) {
     let probe = match &meta.main_probe {
         Some(p) => p,
@@ -132,15 +191,11 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
     };
 
     if probe.verdict == SiteVerdict::Open {
-        log.push_str(&format!(
-            "🌐 ГЛАВНЫЙ ДОМЕН «{}» ОТКРЫВАЕТСЯ ({}).\n",
-            probe.host, probe.http_note
-        ));
-        log.push('\n');
         return;
     }
 
     let icon = match probe.verdict {
+        SiteVerdict::WwwOnly => "🌐",
         SiteVerdict::DnsBlocked => "🔒",
         SiteVerdict::IpReset => "🚫",
         SiteVerdict::TlsBroken => "🔐",
@@ -153,33 +208,46 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
         icon, probe.host
     ));
 
-    let sys = if probe.dns.system.is_empty() {
-        "(пусто)".to_string()
-    } else {
-        probe.dns.system.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
-    };
-    let cf = if probe.dns.cloudflare.is_empty() {
-        "(пусто)".to_string()
-    } else {
-        probe.dns.cloudflare.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
-    };
-    let gg = if probe.dns.google.is_empty() {
-        "(пусто)".to_string()
-    } else {
-        probe.dns.google.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
-    };
+    // DNS-строка: различаем «NXDOMAIN», «резолвер не ответил» и реальный список IP,
+    // иначе пустой публичный резолвер читается как отсутствие домена.
+    let sys = dns_label(&probe.dns.system, probe.dns.system_state);
+    let cf = dns_label(&probe.dns.cloudflare, probe.dns.cloudflare_state);
+    let gg = dns_label(&probe.dns.google, probe.dns.google_state);
     log.push_str(&format!("  DNS (система):      {}\n", sys));
     log.push_str(&format!("  DNS (1.1.1.1):      {}\n", cf));
     log.push_str(&format!("  DNS (8.8.8.8):      {}\n", gg));
-    log.push_str(&format!("  DNS-цензура:        {}\n", if probe.dns_consistent { "не обнаружена" } else { "ПОДОЗРЕНИЕ НА ЦЕНЗУРУ" }));
-    let prim = if probe.primary_ips.is_empty() { "(пусто)".to_string() } else { probe.primary_ips.join(", ") };
-    let alt = if probe.alt_ips.is_empty() { "(пусто)".to_string() } else { probe.alt_ips.join(", ") };
-    log.push_str(&format!("  IP (системный DNS): {}\n", prim));
-    log.push_str(&format!("  IP (www + DoH):     {}\n", alt));
+    log.push_str(&format!(
+        "  DNS-цензура:        {}\n",
+        if probe.dns_consistent {
+            "не обнаружена"
+        } else {
+            "ПОДОЗРЕНИЕ НА ЦЕНЗУРУ (системный DNS расходится с публичными)"
+        }
+    ));
+
+    // Apex и www — РАЗНЫЕ строки: их различие и есть главная подсказка.
+    let prim = if probe.primary_ips.is_empty() {
+        "(пусто)".to_string()
+    } else {
+        probe.primary_ips.join(", ")
+    };
+    log.push_str(&format!("  IP apex (системный DNS): {}\n", prim));
+    if let Some(wh) = &probe.www_host {
+        let www = if probe.www_ips.is_empty() {
+            "(не резолвится)".to_string()
+        } else {
+            probe.www_ips.join(", ")
+        };
+        let status = match &probe.www_url {
+            Some(u) => format!("ОТКРЫВАЕТСЯ: {}", u),
+            None => "не отвечает".to_string(),
+        };
+        log.push_str(&format!("  IP www (системный DNS):  {} — {}\n", www, status));
+        log.push_str(&format!("  Имя для доступа:        {}\n", wh));
+    }
+
     log.push_str(&format!("  Соединение главного IP:    {}\n", probe.http_note));
     if let Some(ip) = &probe.working_ip {
-        // «Рабочий IP» в probe_domain — это прошедший TCP:443, но это НЕ значит,
-        // что HTTPS открывается. Даём честную формулировку.
         let status = if probe.http_note.contains("RST") {
             "TCP:443 жив, но HTTPS RST — блок по SNI/IP, подмена в hosts не поможет"
         } else if probe.http_note.contains("таймаут") || probe.http_note.contains("timeout") {
@@ -192,11 +260,18 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
         log.push_str("  Рабочий IP:          не найден\n");
     }
 
-    log.push_str("  → РЕКОМЕНДАЦИИ:\n");
-    for r in &probe.recommendation {
-        log.push_str(&format!("    {}\n", r));
-    }
     log.push('\n');
+}
+
+/// Текст состояния DNS-резолвера для отчёта.
+fn dns_label(ips: &[std::net::IpAddr], state: DnsState) -> String {
+    use std::net::IpAddr;
+    match state {
+        DnsState::Nxdomain => "NXDOMAIN — такого домена не существует".to_string(),
+        DnsState::Unreachable => "резолвер не ответил (UDP:53 заблокирован или таймаут)".to_string(),
+        DnsState::Ok if ips.is_empty() => "ответ пустой".to_string(),
+        DnsState::Ok => ips.iter().map(|i: &IpAddr| i.to_string()).collect::<Vec<_>>().join(", "),
+    }
 }
 
 fn write_dns_substitution(log: &mut String, meta: &ReportMeta) {
@@ -233,7 +308,10 @@ fn write_dns_substitution(log: &mut String, meta: &ReportMeta) {
         }
         log.push_str("    Затем выполните: ipconfig /flushdns\n");
     } else {
-        log.push_str("  → Подмена DNS не помогла: даже через «живые» по TCP IP сайт на HTTPS рвётся (RST/страница блокировки). Это блок на уровне IP/SNI, а не DNS — решается обходом (winws), а не сменой DNS. hosts-подмена тут бесполезна.\n");
+        // Не советуем hosts, если ни один IP не дал валидного HTTPS: подсказка
+        // «пропишите IP вручную» без доказанного рабочего адреса бесполезна.
+        log.push_str("  → Подмена DNS не помогла: ни один из найденных IP не отдал валидный HTTPS-ответ для этого имени.\n");
+        log.push_str("    Смена DNS и запись в hosts тут не помогут — ищите причину в блоке «ВЕРОЯТНАЯ ПРИЧИНА» выше.\n");
     }
     log.push('\n');
 }
@@ -339,6 +417,7 @@ fn write_broken(log: &mut String, meta: &ReportMeta, c: &Classification) {
     } else {
         log.push_str("  ℹ️ Обход был ВЫКЛЮЧЕН, поэтому «ломает обход или домен сам» — непонятно. Включите профиль обхода и запустите анализ снова: тогда станет видно, что чинить (обход или исключения).\n");
     }
+    log.push_str("  ℹ️ Если такие домены — поддомены вашего главного домена, сначала посмотрите блок «ВЕРОЯТНАЯ ПРИЧИНА» выше: возможно, у сайта просто не настроены адреса для этих имён.\n");
     log.push('\n');
 }
 
@@ -384,4 +463,141 @@ fn write_already_in_bypass(log: &mut String, meta: &ReportMeta, c: &Classificati
         }
     }
     log.push('\n');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer_probe::Classification;
+    use crate::diagnostics_probe::{DnsInfo, DnsState};
+    use crate::site_probe::{CauseContext, DomainProbe, Verdict};
+
+    fn empty_classification() -> Classification {
+        Classification {
+            need_bypass: Vec::new(),
+            bypass_breaks: Vec::new(),
+            dns_fail: Vec::new(),
+            ok: Vec::new(),
+            broken: Vec::new(),
+        }
+    }
+
+    fn meta_with(probe: DomainProbe) -> ReportMeta {
+        ReportMeta {
+            target_url: "https://cactuscompute.com/blog/whistle".to_string(),
+            discovered: vec!["cactuscompute.com".to_string()],
+            bypass_on: true,
+            bypass_toggled: false,
+            restore_note: None,
+            had_browser_failures: false,
+            main_probe: Some(probe),
+            main_dns_sub: Vec::new(),
+            dns_fail_sub: Vec::new(),
+        }
+    }
+
+    /// Apex DNS points at a dead IP; the site answers only under `www`.
+    fn www_only_probe() -> DomainProbe {
+        let host = "cactuscompute.com";
+        let www_url = "https://www.cactuscompute.com/";
+        let verdict = Verdict::WwwOnly;
+        let diagnosis = crate::site_probe::explain(
+            verdict,
+            &CauseContext {
+                host,
+                www_url: Some(www_url),
+                apex_ip: Some("216.150.1.1"),
+                dns_consistent: true,
+                same_host_alt_ip_works: false,
+            },
+        );
+        let mut dns = DnsInfo::new();
+        dns.system = vec!["216.150.1.1".parse().unwrap()];
+        DomainProbe {
+            host: host.to_string(),
+            dns,
+            dns_consistent: true,
+            primary_ips: vec!["216.150.1.1".to_string()],
+            working_ip: None,
+            http_note: "TCP timeout".to_string(),
+            verdict,
+            www_host: Some("www.cactuscompute.com".to_string()),
+            www_ips: vec!["216.150.16.65".to_string()],
+            www_url: Some(www_url.to_string()),
+            diagnosis: Some(diagnosis),
+        }
+    }
+
+    /// The point of the change: the report must lead with the cause and must
+    /// name the working `www` host instead of burying it.
+    #[test]
+    fn report_leads_with_cause_and_mentions_www() {
+        let log = build_report(&meta_with(www_only_probe()), &empty_classification());
+        let cause_pos = log.find("ВЕРОЯТНАЯ ПРИЧИНА").expect(&log);
+        let domains_pos = log.find("НЕ ОТКРЫВАЕТСЯ").expect(&log);
+        assert!(cause_pos < domains_pos, "{}", log);
+        assert!(log.contains("www.cactuscompute.com"), "{}", log);
+        assert!(log.contains("https://www.cactuscompute.com/"), "{}", log);
+        // The dead IP is named explicitly, so the user understands the cause.
+        assert!(log.contains("216.150.1.1"), "{}", log);
+        assert!(log.contains("ЧТО СДЕЛАТЬ"), "{}", log);
+        assert!(log.contains("ЧТО НЕ ПОМОЖЕТ"), "{}", log);
+    }
+
+    /// The broken hosts advice must not survive anywhere in the report.
+    #[test]
+    fn report_does_not_advise_hosts_for_dead_apex_ip() {
+        let log = build_report(&meta_with(www_only_probe()), &empty_classification());
+        assert!(!log.contains("System32\\drivers\\etc\\hosts"), "{}", log);
+        assert!(!log.contains("ipconfig /flushdns"), "{}", log);
+    }
+
+    #[test]
+    fn dead_domain_is_never_advised_for_bypass() {
+        let c = Classification {
+            broken: vec!["cactuscompute.com".to_string()],
+            ..empty_classification()
+        };
+let log = build_report(&meta_with(www_only_probe()), &c);
+        // The domain must not be pushed into the bypass list.
+        assert!(
+            !log.contains("list-general.txt"),
+            "dead IP must not be advised for bypass: {}",
+            log
+        );
+        assert!(log.contains("НЕДОСТУПНЫЕ ДОМЕНЫ"), "{}", log);
+    }
+
+    /// Unreachable public resolvers must be reported as such, not as "(empty)".
+    #[test]
+    fn unreachable_resolvers_are_not_empty_strings() {
+        let mut p = www_only_probe();
+        p.dns.cloudflare_state = DnsState::Unreachable;
+        p.dns.google_state = DnsState::Unreachable;
+let log = build_report(&meta_with(p), &empty_classification());
+        // The DNS lines must explain the empty answer instead of showing "(пусто)".
+        let line = log
+            .lines()
+            .find(|l| l.contains("DNS (1.1.1.1)"))
+            .expect("no cloudflare DNS line");
+        assert!(line.contains("не ответил"), "{}", line);
+        assert!(!line.contains("(пусто)"), "{}", line);
+    }
+
+    #[test]
+    fn nxdomain_is_reported_as_nxdomain() {
+        let mut p = www_only_probe();
+        p.dns.cloudflare_state = DnsState::Nxdomain;
+        let log = build_report(&meta_with(p), &empty_classification());
+        assert!(log.contains("NXDOMAIN"), "{}", log);
+    }
+
+    #[test]
+    fn open_site_gets_short_confirmation() {
+        let mut p = www_only_probe();
+        p.verdict = Verdict::Open;
+        let log = build_report(&meta_with(p), &empty_classification());
+        assert!(log.contains("ДОСТУПЕН"), "{}", log);
+        assert!(!log.contains("ВЕРОЯТНАЯ ПРИЧИНА"), "{}", log);
+    }
 }

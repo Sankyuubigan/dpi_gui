@@ -292,7 +292,7 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
     let broken_on: Vec<String> = results_on
         .iter()
         .filter_map(|(h, p)| match p {
-            Probe::Broken(_) => Some(h.clone()),
+            Probe::Broken(_) | Probe::DeadIp => Some(h.clone()),
             _ => None,
         })
         .collect();
@@ -313,6 +313,7 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
         let results_off = analyzer_probe::probe_all(&broken_on);
         let mut broken_off: HashSet<String> = HashSet::new();
         let mut dns_off: HashSet<String> = HashSet::new();
+        let mut dead_off: HashSet<String> = HashSet::new();
         for (h, p) in results_off {
             match p {
                 Probe::Broken(_) => {
@@ -320,6 +321,11 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
                 }
                 Probe::Dns => {
                     dns_off.insert(h);
+                }
+                // Без обхода сервер вообще не отвечает: домен недоступен сам по
+                // себе, ни обход, ни исключения тут не при чём.
+                Probe::DeadIp => {
+                    dead_off.insert(h);
                 }
                 Probe::Ok => {}
             }
@@ -347,7 +353,13 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
             );
         }
 
-        analyzer_probe::classify_dual(results_on, &broken_off, &dns_off, &browser_failed_set)
+        analyzer_probe::classify_dual(
+            results_on,
+            &broken_off,
+            &dns_off,
+            &dead_off,
+            &browser_failed_set,
+        )
     } else {
         // Обход был выключен изначально (или обрывов нет) — одиночная классификация.
         analyzer_probe::classify_single(results_on, &browser_failed_set)
@@ -357,7 +369,10 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
     // быть отравлен или перехвачен, и тогда сайт не открывается, хотя сам не
     // заблокирован. Если главный домен не открывается — резолвим его через
     // DoH-сервисы xbox-dns.ru/geohide.ru и ищем рабочий IP для подмены.
-    let main_dns_sub = if main_probe.verdict != site_probe::Verdict::Open {
+    // При WwwOnly проверка бессмысленна: рабочее имя уже найдено.
+    let main_dns_sub = if main_probe.verdict.site_broken()
+        && main_probe.verdict != site_probe::Verdict::WwwOnly
+    {
         site_probe::check_dns_substitution(&main_host, true)
     } else {
         Vec::new()
