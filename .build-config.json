@@ -1,0 +1,24 @@
+{
+  "repo": "Sankyuubigan/dpi_gui",
+  "branch": "main",
+  "appExe": "dpi_gui",
+  "productName": "DPI_GUI",
+  "npmInstallArgs": ["--legacy-peer-deps"],
+  "syncDirs": [],
+  "devWindow": {
+    "title": "DPI GUI",
+    "width": 900,
+    "height": 700,
+    "resizable": true,
+    "fullscreen": false,
+    "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-gpu"
+  },
+  "vcRedist": false,
+  "signing": {
+    "keyPath": "",
+    "passwordFile": "",
+    "password": ""
+  },
+  "syncPackageJsonVersion": false,
+  "releaseNotesTemplate": "Auto release ${product} ${tag}"
+}

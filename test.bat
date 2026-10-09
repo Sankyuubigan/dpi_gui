@@ -45,12 +45,12 @@ set "CARGO_PROFILE_RELEASE_LTO="
 set "CARGO_PROFILE_RELEASE_CODEGEN_UNITS="
 set "CARGO_PROFILE_RELEASE_STRIP="
 
-node "%TOOLKIT%" installer --project "%PROJ%"
+node "%TOOLKIT%" test --project "%PROJ%" %*
 if errorlevel 1 (
-  echo [ERROR] Installer build failed.
+  echo [ERROR] Tests failed.
   pause
   exit /b 1
 )
 
-echo [+DONE] generate_installer.bat finished.
+echo [+DONE] test.bat finished.
 endlocal
