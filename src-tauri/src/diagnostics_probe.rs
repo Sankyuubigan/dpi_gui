@@ -1,4 +1,4 @@
-﻿use std::net::{TcpStream, UdpSocket, SocketAddr, IpAddr};
+use std::net::{TcpStream, UdpSocket, SocketAddr, IpAddr};
 use std::error::Error as StdError;
 use std::time::Duration;
 use std::sync::mpsc;
@@ -13,20 +13,20 @@ use crate::process;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// Р РµР·СѓР»СЊС‚Р°С‚ РєР»Р°СЃСЃРёС„РёРєР°С†РёРё HTTP-РїСЂРѕРІРµСЂРєРё СЃР°Р№С‚Р°.
+/// Результат классификации HTTP-проверки сайта.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HttpResult {
     Ok(u16),
-    BlockPage,   // РћС‚РІРµС‚ РїРѕР»СѓС‡РµРЅ, РЅРѕ СЌС‚Рѕ СЃС‚СЂР°РЅРёС†Р°-Р·Р°РіР»СѓС€РєР° Р±Р»РѕРєРёСЂРѕРІРєРё
-    Dns,         // РќРµ СЂРµР·РѕР»РІРёС‚СЃСЏ (DNS-С†РµРЅР·СѓСЂР° / NXDOMAIN)
-    Rst,         // РЎР±СЂРѕСЃ СЃРѕРµРґРёРЅРµРЅРёСЏ (RST) вЂ” С‚РёРїРёС‡РЅРѕ РґР»СЏ DPI
-    Tls,         // РћС€РёР±РєР° TLS/СЂСѓРєРѕРїРѕР¶Р°С‚РёСЏ
-    BadCert,     // TLS РїСЂРѕС€С‘Р», РЅРѕ СЃРµСЂС‚РёС„РёРєР°С‚ РЅРµРІР°Р»РёРґРµРЅ РґР»СЏ РёРјРµРЅРё (NET::ERR_CERT_*)
-    Timeout,     // РўР°Р№РјР°СѓС‚
+    BlockPage,   // Ответ получен, но это страница-заглушка блокировки
+    Dns,         // Не резолвится (DNS-цензура / NXDOMAIN)
+    Rst,         // Сброс соединения (RST) — типично для DPI
+    Tls,         // Ошибка TLS/рукопожатия
+    BadCert,     // TLS прошёл, но сертификат невалиден для имени (NET::ERR_CERT_*)
+    Timeout,     // Таймаут
     Other(String),
 }
 
-/// Р—Р°РїСѓСЃРє РїРѕС‚РµРЅС†РёР°Р»СЊРЅРѕ Р·Р°РІРёСЃР°СЋС‰РµР№ РѕРїРµСЂР°С†РёРё СЃ С‚Р°Р№РјР°СѓС‚РѕРј.
+/// Запуск потенциально зависающей операции с таймаутом.
 pub fn run_with_timeout<F, T>(f: F, ms: u64) -> Option<T>
 where
     F: FnOnce() -> T + Send + 'static,
@@ -46,7 +46,7 @@ where
     }
 }
 
-/// РџСЂРѕРІРµСЂРєР° РїСЂР°РІ Р°РґРјРёРЅРёСЃС‚СЂР°С‚РѕСЂР° (WinDivert РёС… С‚СЂРµР±СѓРµС‚).
+/// Проверка прав администратора (WinDivert их требует).
 pub fn check_admin() -> bool {
     let res = run_with_timeout(
         || {
@@ -62,24 +62,24 @@ pub fn check_admin() -> bool {
     res.unwrap_or(false)
 }
 
-/// РќР°Р»РёС‡РёРµ winws.exe СЂСЏРґРѕРј СЃ РїСЂРёР»РѕР¶РµРЅРёРµРј.
+/// Наличие winws.exe рядом с приложением.
 pub fn winws_present() -> bool {
     process::get_bin_dir().join("winws.exe").exists()
 }
 
-/// РџСЂРѕРІРµСЂРєР°, С‡С‚Рѕ РґСЂР°Р№РІРµСЂ WinDivert СЂРµР°Р»СЊРЅРѕ Р·Р°РіСЂСѓР¶Р°РµС‚СЃСЏ.
-/// Р—Р°РїСѓСЃРєР°РµРј winws СЃ СЂРµР°Р»СЊРЅС‹Рј С„РёР»СЊС‚СЂРѕРј РЅР° 443 + desync Рё РјСѓСЃРѕСЂРЅС‹Рј hostlist
-/// (С‡С‚РѕР±С‹ РЅРµ С‚СЂРѕРіР°С‚СЊ СЂРµР°Р»СЊРЅС‹Р№ С‚СЂР°С„РёРє), Рё СЃРјРѕС‚СЂРёРј, РѕСЃС‚Р°Р»СЃСЏ Р»Рё РїСЂРѕС†РµСЃСЃ Р¶РёРІ вЂ”
-/// СЌС‚Рѕ Рё РµСЃС‚СЊ РїСЂРёР·РЅР°Рє СѓСЃРїРµС€РЅРѕР№ Р·Р°РіСЂСѓР·РєРё РґСЂР°Р№РІРµСЂР°.
+/// Проверка, что драйвер WinDivert реально загружается.
+/// Запускаем winws с реальным фильтром на 443 + desync и мусорным hostlist
+/// (чтобы не трогать реальный трафик), и смотрим, остался ли процесс жив —
+/// это и есть признак успешной загрузки драйвера.
 pub fn test_windivert(_app: &AppHandle) -> (bool, String) {
     let _ = process::stop_winws();
     let bin = process::get_bin_dir().join("winws.exe");
     if !bin.exists() {
-        return (false, "winws.exe РЅРµ РЅР°Р№РґРµРЅ СЂСЏРґРѕРј СЃ РїСЂРёР»РѕР¶РµРЅРёРµРј".to_string());
+        return (false, "winws.exe не найден рядом с приложением".to_string());
     }
 
-    // Р’СЂРµРјРµРЅРЅС‹Р№ hostlist СЃ РјСѓСЃРѕСЂРЅС‹Рј РґРѕРјРµРЅРѕРј вЂ” С„РёР»СЊС‚СЂ РЅРё Рє С‡РµРјСѓ РЅРµ РїСЂРёРјРµРЅРёС‚СЃСЏ,
-    // РЅРѕ WinDivert РІСЃС‘ СЂР°РІРЅРѕ РґРѕР»Р¶РµРЅ РѕС‚РєСЂС‹С‚СЊСЃСЏ.
+    // Временный hostlist с мусорным доменом — фильтр ни к чему не применится,
+    // но WinDivert всё равно должен открыться.
     let lists_dir = crate::config::get_app_dir().join("lists");
     let _ = std::fs::write(lists_dir.join("diag-windivert.txt"), "nonexistent.invalid\n");
     let lists_str = lists_dir.to_string_lossy().replace("\\", "/");
@@ -98,7 +98,7 @@ pub fn test_windivert(_app: &AppHandle) -> (bool, String) {
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => return (false, format!("РЅРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ: {}", e)),
+        Err(e) => return (false, format!("не удалось запустить: {}", e)),
     };
 
     let stdout = child.stdout.take();
@@ -135,28 +135,28 @@ pub fn test_windivert(_app: &AppHandle) -> (bool, String) {
         || low.contains("cannot open");
 
     if alive && !windivert_error {
-        (true, "РґСЂР°Р№РІРµСЂ Р·Р°РіСЂСѓР·РёР»СЃСЏ, С„РёР»СЊС‚СЂР°С†РёСЏ СЂР°Р±РѕС‚Р°РµС‚".to_string())
+        (true, "драйвер загрузился, фильтрация работает".to_string())
     } else if windivert_error {
         (
             false,
-            format!("РѕС€РёР±РєР° Р·Р°РіСЂСѓР·РєРё WinDivert. Р’С‹РІРѕРґ: {}", captured.trim().lines().next().unwrap_or("")),
+            format!("ошибка загрузки WinDivert. Вывод: {}", captured.trim().lines().next().unwrap_or("")),
         )
     } else {
-        (false, "winws Р·Р°РІРµСЂС€РёР»СЃСЏ СЃСЂР°Р·Сѓ РїСЂРё СЃС‚Р°СЂС‚Рµ (РґСЂР°Р№РІРµСЂ РЅРµ Р·Р°РіСЂСѓР·РёР»СЃСЏ?)".to_string())
+        (false, "winws завершился сразу при старте (драйвер не загрузился?)".to_string())
     }
 }
 
-/// РС‚РѕРі РѕРґРЅРѕРіРѕ DNS-Р·Р°РїСЂРѕСЃР°. Р Р°Р·Р»РёС‡Р°РµРј В«РґРѕРјРµРЅ РЅРµ СЃСѓС‰РµСЃС‚РІСѓРµС‚В» Рё В«СЂРµР·РѕР»РІРµСЂ РЅРµ
-/// РѕС‚РІРµС‚РёР»В»: РІ СЂРѕСЃСЃРёР№СЃРєРёС… СЃРµС‚СЏС… UDP:53 РґРѕ 1.1.1.1/8.8.8.8 С‡Р°СЃС‚Рѕ Р·Р°Р±Р»РѕРєРёСЂРѕРІР°РЅ,
-/// Рё СЂР°РЅСЊС€Рµ СЌС‚Рѕ РјРѕР»С‡Р° РїРѕРєР°Р·С‹РІР°Р»РѕСЃСЊ РєР°Рє В«(РїСѓСЃС‚Рѕ)В», С…РѕС‚СЏ РЅР° СЃР°РјРѕРј РґРµР»Рµ Р°РґСЂРµСЃР°
-/// РјРѕРіР»Рё СЃСѓС‰РµСЃС‚РІРѕРІР°С‚СЊ вЂ” РїСЂРѕСЃС‚Рѕ СЂРµР·РѕР»РІРµСЂ РЅРµ Р±С‹Р» РґРѕСЃС‚РёР¶РёРј.
+/// Итог одного DNS-запроса. Различаем «домен не существует» и «резолвер не
+/// ответил»: в российских сетях UDP:53 до 1.1.1.1/8.8.8.8 часто заблокирован,
+/// и раньше это молча показывалось как «(пусто)», хотя на самом деле адреса
+/// могли существовать — просто резолвер не был достижим.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DnsState {
     #[default]
     Ok,
-    /// NXDOMAIN вЂ” РґРѕРјРµРЅ РЅРµ СЃСѓС‰РµСЃС‚РІСѓРµС‚.
+    /// NXDOMAIN — домен не существует.
     Nxdomain,
-    /// Р РµР·РѕР»РІРµСЂ РЅРµ РѕС‚РІРµС‚РёР» (С‚Р°Р№РјР°СѓС‚ / Р·Р°Р±Р»РѕРєРёСЂРѕРІР°РЅ / РѕР±СЂС‹РІ).
+    /// Резолвер не ответил (таймаут / заблокирован / обрыв).
     Unreachable,
 }
 
@@ -172,7 +172,7 @@ pub struct DnsInfo {
     pub cloudflare: Vec<IpAddr>,
     pub google: Vec<IpAddr>,
     pub err: String,
-    /// РЎРѕСЃС‚РѕСЏРЅРёРµ РєР°Р¶РґРѕРіРѕ СЂРµР·РѕР»РІРµСЂР°, С‡С‚РѕР±С‹ РѕС‚С‡С‘С‚ РЅРµ РїСѓС‚Р°Р» NXDOMAIN СЃ Р±Р»РѕРєРёСЂРѕРІРєРѕР№ UDP:53.
+    /// Состояние каждого резолвера, чтобы отчёт не путал NXDOMAIN с блокировкой UDP:53.
     pub system_state: DnsState,
     pub cloudflare_state: DnsState,
     pub google_state: DnsState,
@@ -258,10 +258,10 @@ fn resolve_system(domain: &str) -> Vec<IpAddr> {
     resolve_system_full(domain).ips
 }
 
-/// Р РµР·РѕР»РІ Р·Р°Р±Р»РѕРєРёСЂРѕРІР°РЅРЅРѕРіРѕ РґРѕРјРµРЅР° С‡РµСЂРµР· СЃРёСЃС‚РµРјРЅС‹Р№ DNS Рё РґРІР° РїСѓР±Р»РёС‡РЅС‹С….
-/// Р Р°Р·РЅРёС†Р° РјРµР¶РґСѓ РЅРёРјРё вЂ” РїСЂРёР·РЅР°Рє DNS-С†РµРЅР·СѓСЂС‹.
-/// Р РµР·РѕР»РІС‹ РІС‹РїРѕР»РЅСЏСЋС‚СЃСЏ РїР°СЂР°Р»Р»РµР»СЊРЅРѕ, РєР°Р¶РґС‹Р№ вЂ” СЃ Р¶С‘СЃС‚РєРёРј С‚Р°Р№РјР°СѓС‚РѕРј, С‡С‚РѕР±С‹
-/// РЅРµРґРѕСЃС‚СѓРїРЅС‹Р№ РїСѓР±Р»РёС‡РЅС‹Р№ DNS РЅРµ РІРµС€Р°Р» РґРёР°РіРЅРѕСЃС‚РёРєСѓ РЅР° РґРµСЃСЏС‚РєРё СЃРµРєСѓРЅРґ.
+/// Резолв заблокированного домена через системный DNS и два публичных.
+/// Разница между ними — признак DNS-цензуры.
+/// Резолвы выполняются параллельно, каждый — с жёстким таймаутом, чтобы
+/// недоступный публичный DNS не вешал диагностику на десятки секунд.
 pub fn dns_multi(domain: &str) -> DnsInfo {
     let mut info = DnsInfo::new();
 
@@ -282,8 +282,8 @@ pub fn dns_multi(domain: &str) -> DnsInfo {
         let _ = tx.send(("gg", resolve_via_full(&d, "8.8.8.8")));
     });
 
-    // Р–РґС‘Рј РєР°Р¶РґС‹Р№ СЂРµР·РѕР»РІ СЃ Р¶С‘СЃС‚РєРёРј С‚Р°Р№РјР°СѓС‚РѕРј. Р—Р°РІРёСЃС€РёР№ DNS Р¶РёРІС‘С‚ РІ С„РѕРЅРµ Рё РЅРµ
-    // Р±Р»РѕРєРёСЂСѓРµС‚ РґРёР°РіРЅРѕСЃС‚РёРєСѓ.
+    // Ждём каждый резолв с жёстким таймаутом. Зависший DNS живёт в фоне и не
+    // блокирует диагностику.
     let mut got = 0;
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     while got < 3 {
@@ -314,20 +314,20 @@ pub fn dns_multi(domain: &str) -> DnsInfo {
     }
 
     if info.system.is_empty() && info.cloudflare.is_empty() && info.google.is_empty() {
-        info.err = "РЅРё СЃРёСЃС‚РµРјРЅС‹Р№, РЅРё РїСѓР±Р»РёС‡РЅС‹Рµ DNS РЅРµ РІРµСЂРЅСѓР»Рё Р°РґСЂРµСЃ".to_string();
+        info.err = "ни системный, ни публичные DNS не вернули адрес".to_string();
     }
 
     info
 }
 
-/// DoH-СЃРµСЂРІРёСЃС‹ РґР»СЏ РїСЂРѕРІРµСЂРєРё В«РїРѕРґРјРµРЅС‹ DNSВ»: РІРѕР·РІСЂР°С‰Р°СЋС‚ РЅР°СЃС‚РѕСЏС‰РёРµ IP РІ РѕР±С…РѕРґ
-/// РѕС‚СЂР°РІР»РµРЅРЅРѕРіРѕ/РїРµСЂРµС…РІР°С‡РµРЅРЅРѕРіРѕ DNS. РСЃРїРѕР»СЊР·СѓСЋС‚СЃСЏ Рё РІ С‚РµСЃС‚Рµ РїРѕРґРјРµРЅС‹ DNS, Рё РІ
-/// Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРѕР№ РїСЂРѕРІРµСЂРєРµ РїСЂРё Р°РЅР°Р»РёР·Рµ РґРѕРјРµРЅРѕРІ.
+/// DoH-сервисы для проверки «подмены DNS»: возвращают настоящие IP в обход
+/// отравленного/перехваченного DNS. Используются и в тесте подмены DNS, и в
+/// автоматической проверке при анализе доменов.
 pub const DOH_RESOLVERS: &[&str] = &["xbox-dns.ru", "geohide.ru"];
 
-/// Р РµР·РѕР»РІРёС‚ С…РѕСЃС‚ DoH-СЃРµСЂРІРµСЂР° (Р±СѓС‚СЃС‚СЂР°Рї): СЃРЅР°С‡Р°Р»Р° СЃРёСЃС‚РµРјРЅС‹Р№ DNS, РїСЂРё РЅРµСѓРґР°С‡Рµ вЂ”
-/// РїСѓР±Р»РёС‡РЅС‹Р№ 1.1.1.1 (UDP). Р‘РµР· РЅРµРіРѕ РЅРµР»СЊР·СЏ СѓР·РЅР°С‚СЊ IP, РЅР° РєРѕС‚РѕСЂС‹Р№ Https-РєР»РёРµРЅС‚
-/// trust-dns РґРѕР»Р¶РµРЅ РёРґС‚Рё РїРѕ 443.
+/// Резолвит хост DoH-сервера (бутстрап): сначала системный DNS, при неудаче —
+/// публичный 1.1.1.1 (UDP). Без него нельзя узнать IP, на который Https-клиент
+/// trust-dns должен идти по 443.
 fn bootstrap_doh_host(host: &str) -> Vec<IpAddr> {
     let mut ips = resolve_system(host);
     if ips.is_empty() {
@@ -336,10 +336,10 @@ fn bootstrap_doh_host(host: &str) -> Vec<IpAddr> {
     ips
 }
 
-/// Р РµР·РѕР»РІ РґРѕРјРµРЅР° С‡РµСЂРµР· DNS-over-HTTPS (RFC 8484, РїСѓС‚СЊ `/dns-query`).
-/// `doh_host` вЂ” РёРјСЏ DoH-СЃРµСЂРІРёСЃР° (РЅР°РїСЂРёРјРµСЂ, "geohide.ru"). Р‘СѓС‚СЃС‚СЂР°Рї С…РѕСЃС‚Р°
-/// РґРµР»Р°РµС‚СЃСЏ СЃРёСЃС‚РµРјРЅС‹Рј DNS (fallback 1.1.1.1), Р·Р°С‚РµРј Р·Р°РїСЂРѕСЃ СѓС…РѕРґРёС‚ РїРѕ HTTPS.
-/// Р’С‹РїРѕР»РЅСЏРµС‚СЃСЏ СЃ Р¶С‘СЃС‚РєРёРј С‚Р°Р№РјР°СѓС‚РѕРј РІРЅСѓС‚СЂРё РїРѕС‚РѕРєР° вЂ” Р·Р°РІРёСЃС€РёР№ DoH РЅРµ РІРµС€Р°РµС‚ РІС‹Р·РѕРІ.
+/// Резолв домена через DNS-over-HTTPS (RFC 8484, путь `/dns-query`).
+/// `doh_host` — имя DoH-сервиса (например, "geohide.ru"). Бутстрап хоста
+/// делается системным DNS (fallback 1.1.1.1), затем запрос уходит по HTTPS.
+/// Выполняется с жёстким таймаутом внутри потока — зависший DoH не вешает вызов.
 pub fn resolve_via_doh(domain: &str, doh_host: &str) -> Vec<IpAddr> {
     let bootstrap = bootstrap_doh_host(doh_host);
     if bootstrap.is_empty() {
@@ -379,7 +379,7 @@ pub fn resolve_via_doh(domain: &str, doh_host: &str) -> Vec<IpAddr> {
     .unwrap_or_default()
 }
 
-/// Р•СЃС‚СЊ Р»Рё Сѓ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ СЂР°Р±РѕС‡РёР№ IPv6 РґРѕ С†РµР»РµРІРѕРіРѕ РґРѕРјРµРЅР° (winws С‚РѕР»СЊРєРѕ IPv4).
+/// Есть ли у пользователя рабочий IPv6 до целевого домена (winws только IPv4).
 pub fn has_ipv6(domain: &str) -> bool {
     let addrs = resolve_via(domain, "2606:4700:4700::1111");
     if let Some(ip) = addrs.iter().find(|ip| ip.is_ipv6()).copied() {
@@ -390,10 +390,10 @@ pub fn has_ipv6(domain: &str) -> bool {
     false
 }
 
-/// РљР»Р°СЃСЃРёС„РёРєР°С†РёСЏ РѕС€РёР±РєРё reqwest РІ РїРѕРЅСЏС‚РЅСѓСЋ РєР°С‚РµРіРѕСЂРёСЋ.
-/// Р’Р°Р¶РЅРѕ: РІРµСЂС…РЅРёР№ С‚РµРєСЃС‚ РѕС€РёР±РєРё reqwest вЂ” СЌС‚Рѕ РїСЂРѕСЃС‚Рѕ "error sending request for url (...)",
-/// Р° РЅР°СЃС‚РѕСЏС‰Р°СЏ РїСЂРёС‡РёРЅР° (RST / timeout / TLS) СЃРїСЂСЏС‚Р°РЅР° РІ e.source(). РџРѕСЌС‚РѕРјСѓ С…РѕРґРёРј
-/// РїРѕ Р’РЎР•Р™ С†РµРїРѕС‡РєРµ РїСЂРёС‡РёРЅ С‡РµСЂРµР· source().
+/// Классификация ошибки reqwest в понятную категорию.
+/// Важно: верхний текст ошибки reqwest — это просто "error sending request for url (...)",
+/// а настоящая причина (RST / timeout / TLS) спрятана в e.source(). Поэтому ходим
+/// по ВСЕЙ цепочке причин через source().
 pub fn classify_reqwest_err(e: &reqwest::Error) -> HttpResult {
     let mut msg = e.to_string().to_lowercase();
     let mut src: Option<&dyn std::error::Error> = e.source();
@@ -405,8 +405,8 @@ pub fn classify_reqwest_err(e: &reqwest::Error) -> HttpResult {
     classify_err_text(&msg)
 }
 
-/// РљР»Р°СЃСЃРёС„РёРєР°С†РёСЏ РїРѕ С‚РµРєСЃС‚Сѓ РѕС€РёР±РєРё вЂ” С‡РёСЃС‚Р°СЏ С„СѓРЅРєС†РёСЏ, РїРѕРєСЂС‹С‚Р° СЋРЅРёС‚-С‚РµСЃС‚Р°РјРё.
-/// РџРѕСЂСЏРґРѕРє РІР°Р¶РµРЅ: СЃРµСЂС‚РёС„РёРєР°С‚РЅС‹Рµ РѕС€РёР±РєРё Р»РѕРІРёРј Р”Рћ РѕР±С‰РёС… tls/ssl/handshake.
+/// Классификация по тексту ошибки — чистая функция, покрыта юнит-тестами.
+/// Порядок важен: сертификатные ошибки ловим ДО общих tls/ssl/handshake.
 pub fn classify_err_text(msg: &str) -> HttpResult {
     if msg.contains("dns")
         || msg.contains("resolve")
@@ -430,9 +430,9 @@ pub fn classify_err_text(msg: &str) -> HttpResult {
         || msg.contains("x509")
         || msg.contains("common name")
         || msg.contains("cert")
-        // Windows schannel РѕС‚РґР°С‘С‚ Р»РѕРєР°Р»РёР·РѕРІР°РЅРЅС‹Рµ С‚РµРєСЃС‚С‹ Рё CERT_E_* РєРѕРґС‹.
-        || msg.contains("СЃРµСЂС‚РёС„РёРєР°С‚")
-        || msg.contains("РЅРµ СЃРѕРІРїР°РґР°РµС‚")
+        // Windows schannel отдаёт локализованные тексты и CERT_E_* коды.
+        || msg.contains("сертификат")
+        || msg.contains("не совпадает")
         || msg.contains("0x800b010")
         || msg.contains("-21467624")
     {
@@ -440,7 +440,7 @@ pub fn classify_err_text(msg: &str) -> HttpResult {
     } else if msg.contains("tls")
         || msg.contains("ssl")
         || msg.contains("handshake")
-        || msg.contains("СЂСѓРєРѕРїРѕР¶Р°С‚РёРµ")
+        || msg.contains("рукопожатие")
     {
         HttpResult::Tls
     } else if msg.contains("timed out") || msg.contains("timeout") || msg.contains("10060") {
@@ -450,14 +450,14 @@ pub fn classify_err_text(msg: &str) -> HttpResult {
     }
 }
 
-/// HTTP/HTTPS-РїСЂРѕРІРµСЂРєР° СЃР°Р№С‚Р° СЃ РєР»Р°СЃСЃРёС„РёРєР°С†РёРµР№ СЂРµР·СѓР»СЊС‚Р°С‚Р°.
+/// HTTP/HTTPS-проверка сайта с классификацией результата.
 pub fn http_classify_with(url: &str, secs: u64) -> HttpResult {
     let client = match Client::builder()
         .timeout(Duration::from_secs(secs))
         .build()
     {
         Ok(c) => c,
-        Err(_) => return HttpResult::Other("РЅРµ СѓРґР°Р»РѕСЃСЊ СЃРѕР·РґР°С‚СЊ HTTP-РєР»РёРµРЅС‚".to_string()),
+        Err(_) => return HttpResult::Other("не удалось создать HTTP-клиент".to_string()),
     };
 
     match client.get(url).send() {
@@ -468,11 +468,11 @@ pub fn http_classify_with(url: &str, secs: u64) -> HttpResult {
             }
             if (200..=399).contains(&status) {
                 let low = resp.text().unwrap_or_default().to_lowercase();
-                if low.contains("СЂРѕСЃРєРѕРјРЅР°РґР·РѕСЂ")
-                    || low.contains("Р·Р°Р±Р»РѕРєРёСЂ")
+                if low.contains("роскомнадзор")
+                    || low.contains("заблокир")
                     || low.contains("this site is blocked")
                     || low.contains("access denied: by order")
-                    || low.contains("СЃС‚СЂР°РЅРёС†Р° РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РѕС‚РѕР±СЂР°Р¶РµРЅР°")
+                    || low.contains("страница не может быть отображена")
                 {
                     HttpResult::BlockPage
                 } else {
@@ -490,7 +490,7 @@ pub fn http_classify(url: &str) -> HttpResult {
     http_classify_with(url, 6)
 }
 
-/// РЎС‹СЂРѕРµ TCP-СЃРѕРµРґРёРЅРµРЅРёРµ Рє IP:port Р±РµР· TLS вЂ” СЂР°Р·Р»РёС‡Р°РµС‚ RST / С‚Р°Р№РјР°СѓС‚ / СѓСЃРїРµС….
+/// Сырое TCP-соединение к IP:port без TLS — различает RST / таймаут / успех.
 pub fn tcp_connect(ip: IpAddr, port: u16) -> String {
     let addr = SocketAddr::new(ip, port);
     match TcpStream::connect_timeout(&addr, Duration::from_millis(3500)) {
@@ -503,15 +503,15 @@ pub fn tcp_connect(ip: IpAddr, port: u16) -> String {
     }
 }
 
-/// Best-effort РїСЂРѕРІРµСЂРєР° С„РёР»СЊС‚СЂР°С†РёРё UDP/QUIC РЅР° РїРѕСЂС‚Сѓ 443.
+/// Best-effort проверка фильтрации UDP/QUIC на порту 443.
 pub fn quic_probe(ip: IpAddr) -> String {
     let sock = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(e) => return format!("send-error: {}", e),
     };
     sock.set_read_timeout(Some(Duration::from_millis(1500))).ok();
-    // РњРёРЅРёРјР°Р»СЊРЅС‹Р№ QUIC Initial (С„Р»Р°Рі 0xC0 + version + DCID) вЂ” С‚РѕР»СЊРєРѕ С‡С‚РѕР±С‹
-    // СЃРїСЂРѕРІРѕС†РёСЂРѕРІР°С‚СЊ РѕС‚РІРµС‚/С„РёР»СЊС‚СЂР°С†РёСЋ, С‚РѕС‡РЅС‹Р№ РїР°СЂСЃРёРЅРі РЅРµ РІР°Р¶РµРЅ.
+    // Минимальный QUIC Initial (флаг 0xC0 + version + DCID) — только чтобы
+    // спровоцировать ответ/фильтрацию, точный парсинг не важен.
     let payload: [u8; 21] = [
         0xc3, 0x00, 0x00, 0x00, 0x01, 0x08, b't', b'e', b's', b't', 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -523,11 +523,11 @@ pub fn quic_probe(ip: IpAddr) -> String {
     let mut buf = [0u8; 1024];
     match sock.recv_from(&mut buf) {
         Ok(_) => "responded".to_string(),
-        Err(_) => "no-response (С„РёР»СЊС‚СЂР°С†РёСЏ UDP/443 РІРѕР·РјРѕР¶РЅР°)".to_string(),
+        Err(_) => "no-response (фильтрация UDP/443 возможна)".to_string(),
     }
 }
 
-/// РќРѕСЂРјР°Р»РёР·Р°С†РёСЏ URL/РґРѕРјРµРЅР° РІ С‡РёСЃС‚С‹Р№ С…РѕСЃС‚.
+/// Нормализация URL/домена в чистый хост.
 pub fn normalize_host(input: &str) -> String {
     let u = if input.starts_with("http") {
         input.to_string()
@@ -562,15 +562,15 @@ mod tests {
 
     #[test]
     fn bad_cert_errors() {
-        // РўРѕС‚ СЃР°РјС‹Р№ СЃР»СѓС‡Р°Р№: NET::ERR_CERT_COMMON_NAME_INVALID.
+        // Тот самый случай: NET::ERR_CERT_COMMON_NAME_INVALID.
         assert_eq!(classify_err_text("invalid peer certificate: NotValidForName"), HttpResult::BadCert);
         assert_eq!(classify_err_text("certificate is not valid for 'pornolab.net'"), HttpResult::BadCert);
         assert_eq!(classify_err_text("the certificate doesn't match common name"), HttpResult::BadCert);
         assert_eq!(classify_err_text("unable to get local issuer certificate"), HttpResult::BadCert);
         assert_eq!(classify_err_text("x509: certificate signed by unknown authority"), HttpResult::BadCert);
-        // Windows schannel: Р»РѕРєР°Р»РёР·РѕРІР°РЅРЅР°СЏ РїСЂРёС‡РёРЅР° + РєРѕРґ CERT_E_CN_NO_MATCH.
-        assert_eq!(classify_err_text("client error (connect) cn-РёРјСЏ СЃРµСЂС‚РёС„РёРєР°С‚Р° РЅРµ СЃРѕРІРїР°РґР°РµС‚ СЃ РїРѕР»СѓС‡РµРЅРЅС‹Рј Р·РЅР°С‡РµРЅРёРµРј. (os error -2146762481)"), HttpResult::BadCert);
-        // РћР±С‰Р°СЏ TLS-РѕС€РёР±РєР° Р‘Р•Р— СѓРїРѕРјРёРЅР°РЅРёСЏ СЃРµСЂС‚РёС„РёРєР°С‚Р° вЂ” РѕСЃС‚Р°С‘С‚СЃСЏ Tls.
+        // Windows schannel: локализованная причина + код CERT_E_CN_NO_MATCH.
+        assert_eq!(classify_err_text("client error (connect) cn-имя сертификата не совпадает с полученным значением. (os error -2146762481)"), HttpResult::BadCert);
+        // Общая TLS-ошибка БЕЗ упоминания сертификата — остаётся Tls.
         assert_eq!(classify_err_text("tls handshake failure"), HttpResult::Tls);
         assert_eq!(classify_err_text("ssl protocol error"), HttpResult::Tls);
     }
@@ -579,6 +579,6 @@ mod tests {
     fn timeout_and_other() {
         assert_eq!(classify_err_text("operation timed out"), HttpResult::Timeout);
         assert_eq!(classify_err_text("os error 10060"), HttpResult::Timeout);
-        assert_eq!(classify_err_text("С‡С‚Рѕ-С‚Рѕ РЅРµРІРµРґРѕРјРѕРµ"), HttpResult::Other("С‡С‚Рѕ-С‚Рѕ РЅРµРІРµРґРѕРјРѕРµ".to_string()));
+        assert_eq!(classify_err_text("что-то неведомое"), HttpResult::Other("что-то неведомое".to_string()));
     }
 }

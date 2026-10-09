@@ -1,18 +1,18 @@
-﻿use std::fs;
+use std::fs;
 use std::thread;
 use std::time::Duration;
 use tauri::AppHandle;
 use crate::{config, process};
 use crate::diagnostics_probe::{http_classify_with, HttpResult, normalize_host};
 
-/// РћРґРЅР° desync-С‚РµС…РЅРёРєР° winws, РёР·РѕР»РёСЂРѕРІР°РЅРЅРѕ РїСЂРѕРІРµСЂСЏРµРјР°СЏ РїСЂРѕС‚РёРІ Р·Р°Р±Р»РѕРєРёСЂРѕРІР°РЅРЅРѕРіРѕ РґРѕРјРµРЅР°.
+/// Одна desync-техника winws, изолированно проверяемая против заблокированного домена.
 pub struct TechniqueSpec {
     pub name: String,
-    /// Р§Р°СЃС‚СЊ Р°СЂРіСѓРјРµРЅС‚РѕРІ РїРѕСЃР»Рµ `--filter-tcp=443 --hostlist=...` (Р±РµР· РїРѕСЂС‚РѕРІ/С…РѕСЃС‚Р»РёСЃС‚Р°).
+    /// Часть аргументов после `--filter-tcp=443 --hostlist=...` (без портов/хостлиста).
     pub desync: String,
 }
 
-/// РќР°Р±РѕСЂ РєР°РЅРґРёРґР°С‚РѕРІ. РџРѕСЂСЏРґРѕРє РІР°Р¶РµРЅ: РїРµСЂРІС‹Р№ РїРѕРґРѕС€РµРґС€РёР№ РёСЃРїРѕР»СЊР·СѓРµС‚СЃСЏ РґР»СЏ Р°РІС‚Рѕ-РїСЂРѕС„РёР»СЏ.
+/// Набор кандидатов. Порядок важен: первый подошедший используется для авто-профиля.
 pub fn all_techniques() -> Vec<TechniqueSpec> {
     vec![
         TechniqueSpec {
@@ -54,8 +54,8 @@ pub fn all_techniques() -> Vec<TechniqueSpec> {
     ]
 }
 
-/// РџСЂРѕРіРѕРЅ РѕРґРЅРѕР№ С‚РµС…РЅРёРєРё: РїРёС€РµРј РІСЂРµРјРµРЅРЅС‹Р№ С…РѕСЃС‚Р»РёСЃС‚ СЃ РґРѕРјРµРЅРѕРј, СЃС‚Р°СЂС‚СѓРµРј winws,
-/// РїСЂРѕРІРµСЂСЏРµРј РґРѕСЃС‚СѓРїРЅРѕСЃС‚СЊ СЃР°Р№С‚Р°, РѕСЃС‚Р°РЅР°РІР»РёРІР°РµРј. Р’РѕР·РІСЂР°С‰Р°РµС‚ (РїСЂРѕС€Р»Р°, РґРµС‚Р°Р»СЊ).
+/// Прогон одной техники: пишем временный хостлист с доменом, стартуем winws,
+/// проверяем доступность сайта, останавливаем. Возвращает (прошла, деталь).
 pub fn test_technique(app: &AppHandle, spec: &TechniqueSpec, domain: &str, game_filter: bool) -> (bool, String) {
     let lists_dir = config::get_app_dir().join("lists");
     let bin_dir = process::get_bin_dir();
@@ -64,7 +64,7 @@ pub fn test_technique(app: &AppHandle, spec: &TechniqueSpec, domain: &str, game_
     let hostlist_path = lists_dir.join(&hostlist_name);
 
     if let Err(e) = fs::write(&hostlist_path, format!("{}\n", domain)) {
-        return (false, format!("РѕС€РёР±РєР° Р·Р°РїРёСЃРё С…РѕСЃС‚Р»РёСЃС‚Р°: {}", e));
+        return (false, format!("ошибка записи хостлиста: {}", e));
     }
 
     let bin_str = bin_dir.to_string_lossy().replace("\\", "/");
@@ -80,10 +80,10 @@ pub fn test_technique(app: &AppHandle, spec: &TechniqueSpec, domain: &str, game_
     );
 
     if let Err(e) = process::start_winws_custom_quiet(app.clone(), &raw_args, game_filter) {
-        return (false, format!("Р·Р°РїСѓСЃРє winws: {}", e));
+        return (false, format!("запуск winws: {}", e));
     }
 
-    // Р”Р°С‘Рј WinDivert РІСЂРµРјСЏ РЅР° РїРµСЂРµС…РІР°С‚
+    // Даём WinDivert время на перехват
     thread::sleep(Duration::from_secs(3));
 
     let target = format!("https://{}/", domain);
@@ -94,13 +94,13 @@ pub fn test_technique(app: &AppHandle, spec: &TechniqueSpec, domain: &str, game_
     let passed = matches!(res, HttpResult::Ok(_));
     let detail = match res {
         HttpResult::Ok(s) => format!("OK ({})", s),
-        HttpResult::BadCert => "SSL-СЃРµСЂС‚РёС„РёРєР°С‚ РЅРµРІР°Р»РёРґРµРЅ вЂ” desync-С‚РµС…РЅРёРєР° Р·РґРµСЃСЊ РЅРµ РїРѕРјРѕР¶РµС‚".to_string(),
+        HttpResult::BadCert => "SSL-сертификат невалиден — desync-техника здесь не поможет".to_string(),
         other => format!("{:?}", other),
     };
     (passed, detail)
 }
 
-/// Р’СЃРїРѕРјРѕРіР°С‚РµР»СЊРЅР°СЏ РЅРѕСЂРјР°Р»РёР·Р°С†РёСЏ (С‡С‚РѕР±С‹ РґРёР°РіРЅРѕСЃС‚РёРєР° РЅРµ РґСѓР±Р»РёСЂРѕРІР°Р»Р° Р»РѕРіРёРєСѓ).
+/// Вспомогательная нормализация (чтобы диагностика не дублировала логику).
 pub fn norm(input: &str) -> String {
     normalize_host(input)
 }

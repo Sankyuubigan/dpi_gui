@@ -1,4 +1,4 @@
-﻿use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -15,12 +15,12 @@ use crate::analyzer_probe::{self, Probe};
 use crate::analyzer_report::{self, ReportMeta};
 use crate::site_probe;
 
-// РЎРєСЂС‹РІР°РµС‚ РљРћРќРЎРћР›Р¬РќР«Р• РѕРєРЅР°, РєРѕС‚РѕСЂС‹Рµ РїРѕСЂРѕР¶РґР°РµС‚ headless Chrome РЅР° Windows.
-// headless_chrome СЃС‚Р°РІРёС‚ CREATE_NO_WINDOW РіР»Р°РІРЅРѕРјСѓ РїСЂРѕС†РµСЃСЃСѓ, РЅРѕ Chrome СЃР°Рј РІРЅСѓС‚СЂРё
-// СЃРїР°РІРЅРёС‚ РґРѕС‡РµСЂРЅРёРµ РїСЂРѕС†РµСЃСЃС‹ (renderer/GPU/crashpad) Р±РµР· СЌС‚РѕРіРѕ С„Р»Р°РіР°, Рё Сѓ РЅРёС…
-// РїРѕСЏРІР»СЏРµС‚СЃСЏ С‡С‘СЂРЅРѕРµ РєРѕРЅСЃРѕР»СЊРЅРѕРµ РѕРєРЅРѕ. РџРµСЂРµР±РёСЂР°РµРј РѕРєРЅР° РЅР°РїСЂСЏРјСѓСЋ С‡РµСЂРµР· Win32 API
-// (Р±С‹СЃС‚СЂРѕ, Р±РµР· С‚СЏР¶С‘Р»РѕРіРѕ РѕРїСЂРѕСЃР° РїСЂРѕС†РµСЃСЃРѕРІ) Рё РїСЂСЏС‡РµРј РёРјРµРЅРЅРѕ РєРѕРЅСЃРѕР»СЊРЅС‹Рµ РѕРєРЅР° Chrome,
-// РЅРµ С‚СЂРѕРіР°СЏ СЂРµР°Р»СЊРЅС‹Р№ Р±СЂР°СѓР·РµСЂ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ (Сѓ РЅРµРіРѕ РѕРєРЅР° РєР»Р°СЃСЃР° Chrome_WidgetWin_*).
+// Скрывает КОНСОЛЬНЫЕ окна, которые порождает headless Chrome на Windows.
+// headless_chrome ставит CREATE_NO_WINDOW главному процессу, но Chrome сам внутри
+// спавнит дочерние процессы (renderer/GPU/crashpad) без этого флага, и у них
+// появляется чёрное консольное окно. Перебираем окна напрямую через Win32 API
+// (быстро, без тяжёлого опроса процессов) и прячем именно консольные окна Chrome,
+// не трогая реальный браузер пользователя (у него окна класса Chrome_WidgetWin_*).
 #[cfg(windows)]
 mod win_hide {
     use std::collections::HashSet;
@@ -41,17 +41,17 @@ mod win_hide {
     unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: isize) -> BOOL {
         let ctx = &*(lparam as *const Ctx);
 
-        // РќРµ С‚СЂРѕРіР°РµРј РѕРєРЅР° СѓР¶Рµ Р·Р°РїСѓС‰РµРЅРЅРѕРіРѕ Р±СЂР°СѓР·РµСЂР° РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ (РµРіРѕ РІРєР»Р°РґРєРё).
+        // Не трогаем окна уже запущенного браузера пользователя (его вкладки).
         let mut pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, &mut pid);
         if ctx.known.lock().unwrap().contains(&pid) {
             return TRUE;
         }
 
-        // РџСЂРѕРІРµСЂСЏРµРј, С‡С‚Рѕ РѕРєРЅРѕ РїСЂРёРЅР°РґР»РµР¶РёС‚ chrome.exe. РСЃРїРѕР»СЊР·СѓРµРј С‚РѕР»СЊРєРѕ
-        // PROCESS_QUERY_INFORMATION вЂ” PROCESS_VM_READ РјРѕР¶РµС‚ РЅРµ РїСЂРѕР№С‚Рё РґР»СЏ
-        // РґРѕС‡РµСЂРЅРёС… РїСЂРѕС†РµСЃСЃРѕРІ Chrome (crashpad-handler Рё С‚.Рї.), Рё С‚РѕРіРґР° РѕРєРЅРѕ
-        // РѕСЃС‚Р°РЅРµС‚СЃСЏ РІРёРґРёРјС‹Рј.
+        // Проверяем, что окно принадлежит chrome.exe. Используем только
+        // PROCESS_QUERY_INFORMATION — PROCESS_VM_READ может не пройти для
+        // дочерних процессов Chrome (crashpad-handler и т.е.), и тогда окно
+        // останется видимым.
         let handle = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
         let mut is_chrome = false;
         if handle != 0 {
@@ -65,15 +65,15 @@ mod win_hide {
             windows_sys::Win32::Foundation::CloseHandle(handle);
         }
         if is_chrome {
-            // РџСЂСЏС‡РµРј Р›Р®Р‘РћР• РѕРєРЅРѕ РґРѕС‡РµСЂРЅРµРіРѕ РїСЂРѕС†РµСЃСЃР° Chrome (РІ С‚.С‡. С‡С‘СЂРЅСѓСЋ
-            // РєРѕРЅСЃРѕР»СЊ), С‡С‚РѕР±С‹ СЋР·РµСЂ РЅРµ РІРёРґРµР» РЅРё РјРіРЅРѕРІРµРЅРЅРѕРіРѕ РјРµР»СЊРєР°РЅРёСЏ.
+            // Прячем ЛЮБОЕ окно дочернего процесса Chrome (в т.С‡. чёрную
+            // консоль), чтобы юзер не видел ни мгновенного мелькания.
             ShowWindow(hwnd, SW_HIDE);
         }
 
         TRUE
     }
 
-    // РћРґРёРЅ Р±С‹СЃС‚СЂС‹Р№ РїСЂРѕС…РѕРґ: РїСЂСЏС‡РµС‚ РІСЃРµ РєРѕРЅСЃРѕР»СЊРЅС‹Рµ РѕРєРЅР° Chrome, РєСЂРѕРјРµ РёР·РІРµСЃС‚РЅС‹С… PID СЋР·РµСЂР°.
+    // Один быстрый проход: прячет все консольные окна Chrome, кроме известных PID юзера.
     pub fn hide_chrome_consoles(known: &Arc<Mutex<HashSet<u32>>>) {
         let ctx = Ctx { known: known.clone() };
         unsafe {
@@ -92,10 +92,10 @@ fn chrome_pids() -> Vec<u32> {
         .collect()
 }
 
-// РџР°СЂСЃРёРЅРі Р·РЅР°С‡РµРЅРёСЏ РёР· РѕС‚Р»Р°РґРѕС‡РЅРѕР№ СЃС‚СЂРѕРєРё СЃРѕР±С‹С‚РёСЏ CDP.
-// РС‰РµРј ` key: "..."` (РЎ Р’Р•Р”РЈР©РРњ РџР РћР‘Р•Р›РћРњ), С‡С‚РѕР±С‹ РЅРµ РїРµСЂРµРїСѓС‚Р°С‚СЊ document_url СЃ СЂРµР°Р»СЊРЅС‹Рј request.url.
-// Р‘РµР· РІРµРґСѓС‰РµРіРѕ РїСЂРѕР±РµР»Р° РїРѕРґСЃС‚СЂРѕРєР° "url: " СЃРѕРІРїР°РґР°РµС‚ СЃ "document_url: " вЂ” Рё С‚РѕРіРґР° РІСЃРµ
-// РїРѕРґ-СЂРµСЃСѓСЂСЃС‹ (CDN/API/СЃРєСЂРёРїС‚С‹) Р·Р°РїРёСЃС‹РІР°Р»РёСЃСЊ Р±С‹ РєР°Рє РіР»Р°РІРЅС‹Р№ РґРѕРјРµРЅ СЃС‚СЂР°РЅРёС†С‹.
+// Парсинг значения из отладочной строки события CDP.
+// Ищем ` key: "..."` (С ВЕДУЩИМ ПРОБЕЛОМ), чтобы не перепутать document_url с реальным request.url.
+// Без ведущего пробела подстрока "url: " совпадает с "document_url: " — и тогда все
+// под-ресурсы (CDN/API/скрипты) записывались бы как главный домен страницы.
 fn extract_value(s: &str, key: &str) -> Option<String> {
     let search = format!(" {}: ", key);
     let idx = s.find(&search)?;
@@ -131,32 +131,32 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
         .to_string();
     let main_probe = site_probe::probe_domain(&main_host);
 
-    // РСЃРїРѕР»СЊР·СѓРµРј РќРћР’Р«Р™ headless-СЂРµР¶РёРј (--headless=new). Р’ РѕС‚Р»РёС‡РёРµ РѕС‚ СЃС‚Р°СЂРѕРіРѕ
-    // --headless, РІ РЅРѕРІРѕРј СЂРµР¶РёРјРµ Chrome РЅРµ СЃРїР°РІРЅРёС‚ РѕС‚РґРµР»СЊРЅС‹Рµ РєРѕРЅСЃРѕР»СЊРЅС‹Рµ РґРѕС‡РµСЂРЅРёРµ
-    // РїСЂРѕС†РµСЃСЃС‹ (renderer/GPU/crashpad), РїРѕСЌС‚РѕРјСѓ С‡С‘СЂРЅРѕРµ РєРѕРЅСЃРѕР»СЊРЅРѕРµ РѕРєРЅРѕ РІРѕРѕР±С‰Рµ
-    // РЅРµ РїРѕСЏРІР»СЏРµС‚СЃСЏ. headless_chrome СЃР°Рј РґРѕР±Р°РІР»СЏРµС‚ СЃС‚Р°СЂС‹Р№ --headless, РїРѕСЌС‚РѕРјСѓ
-    // СЃС‚Р°РІРёРј headless=false Рё РїРµСЂРµРґР°С‘Рј --headless=new СЏРІРЅРѕ С‡РµСЂРµР· args.
+    // Используем НОВЫЙ headless-режим (--headless=new). В отличие от старого
+    // --headless, в новом режиме Chrome не спавнит отдельные консольные дочерние
+    // процессы (renderer/GPU/crashpad), поэтому чёрное консольное окно вообще
+    // не появляется. headless_chrome сам добавляет старый --headless, поэтому
+    // ставим headless=false и передаём --headless=new явно через args.
     let options = LaunchOptions::default_builder()
         .headless(false)
         .args(vec![std::ffi::OsStr::new("--headless=new")])
         .build()
-        .map_err(|e| format!("РћС€РёР±РєР° РѕРїС†РёР№ Р·Р°РїСѓСЃРєР° Chrome: {}", e))?;
+        .map_err(|e| format!("Ошибка опций запуска Chrome: {}", e))?;
 
-    // Р—Р°РїРѕРјРёРЅР°РµРј СѓР¶Рµ Р·Р°РїСѓС‰РµРЅРЅС‹Рµ chrome-С‹ (СЃРІРѕРё РІРєР»Р°РґРєРё СЋР·РµСЂР°), С‡С‚РѕР±С‹ РЅРµ С‚СЂРѕРіР°С‚СЊ РёС… РѕРєРЅР°.
+    // Запоминаем уже запущенные chrome-С‹ (свои вкладки юзера), чтобы не трогать их окна.
     let known_chrome: Arc<Mutex<HashSet<u32>>> =
         Arc::new(Mutex::new(chrome_pids().into_iter().collect()));
 
-    // Р¤РѕРЅРѕРІС‹Р№ РїРѕС‚РѕРє РЎРљР Р«РўРРЇ РѕРєРѕРЅ. Р—Р°РїСѓСЃРєР°РµРј Р•Р“Рћ Р”Рћ СЃС‚Р°СЂС‚Р° Chrome, РёРЅР°С‡Рµ РєРѕРЅСЃРѕР»СЊРЅС‹Рµ
-    // РѕРєРЅР° РґРѕС‡РµСЂРЅРёС… РїСЂРѕС†РµСЃСЃРѕРІ Chrome (renderer/GPU/crashpad) СѓСЃРїРµРІР°СЋС‚ РЅР°СЂРёСЃРѕРІР°С‚СЊСЃСЏ
-    // РІРѕ РІСЂРµРјСЏ Browser::new Рё РјРµР»СЊРєР°СЋС‚ РїРµСЂРµРґ СЋР·РµСЂРѕРј. РџСЂСЏС‡РµРј РёС… РїРѕ PID РІ СЂРµР°Р»СЊРЅРѕРј РІСЂРµРјРµРЅРё.
+    // Фоновый поток СКРЫТИЯ окон. Запускаем ЕГО ДО старта Chrome, иначе консольные
+    // окна дочерних процессов Chrome (renderer/GPU/crashpad) успевают нарисоваться
+    // во время Browser::new и мелькают перед юзером. Прячем их по PID в реальном времени.
     #[cfg(windows)]
     let hide_stop = Arc::new(AtomicBool::new(false));
     #[cfg(windows)]
     let hide_handle = {
         let known = known_chrome.clone();
         let stop = hide_stop.clone();
-        // Р‘С‹СЃС‚СЂС‹Р№ С†РёРєР»: РїСЂСЏС‡РµРј РєРѕРЅСЃРѕР»СЊРЅС‹Рµ РѕРєРЅР° Chrome РєР°Р¶РґС‹Рµ ~10 РјСЃ, РЅР°С‡РёРЅР°СЏ Р”Рћ
-        // СЃС‚Р°СЂС‚Р° Р±СЂР°СѓР·РµСЂР°, С‡С‚РѕР±С‹ СЋР·РµСЂ РЅРµ РІРёРґРµР» РґР°Р¶Рµ РјРіРЅРѕРІРµРЅРЅРѕРіРѕ РјРµР»СЊРєР°РЅРёСЏ.
+        // Быстрый цикл: прячем консольные окна Chrome каждые ~10 мс, начиная ДО
+        // старта браузера, чтобы юзер не видел даже мгновенного мелькания.
         thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 win_hide::hide_chrome_consoles(&known);
@@ -165,11 +165,11 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
         })
     };
 
-    let browser = Browser::new(options).map_err(|e| format!("РћС€РёР±РєР° Р·Р°РїСѓСЃРєР° Chrome (СѓСЃС‚Р°РЅРѕРІР»РµРЅ Р»Рё РѕРЅ?): {}", e))?;
-    let tab = browser.new_tab().map_err(|e| format!("РћС€РёР±РєР° СЃРѕР·РґР°РЅРёСЏ РІРєР»Р°РґРєРё: {}", e))?;
+    let browser = Browser::new(options).map_err(|e| format!("Ошибка запуска Chrome (установлен ли он?): {}", e))?;
+    let tab = browser.new_tab().map_err(|e| format!("Ошибка создания вкладки: {}", e))?;
 
-    // Р’РђР–РќРћ: Р±РµР· СЏРІРЅРѕРіРѕ РІРєР»СЋС‡РµРЅРёСЏ Network-РґРѕРјРµРЅР° СЃРѕР±С‹С‚РёСЏ RequestWillBeSent/LoadingFailed
-    // РІРѕРѕР±С‰Рµ РЅРµ РїСЂРёС…РѕРґСЏС‚ (navigate_to РёС… РЅРµ РІРєР»СЋС‡Р°РµС‚).
+    // ВАЖНО: без явного включения Network-домена события RequestWillBeSent/LoadingFailed
+    // вообще не приходят (navigate_to их не включает).
     let _ = tab.call_method(Network::Enable {
         max_total_buffer_size: None,
         max_resource_buffer_size: None,
@@ -178,15 +178,15 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
         enable_durable_messages: None,
     });
 
-    // Р’СЃРµ РґРѕРјРµРЅС‹, РєРѕС‚РѕСЂС‹Рµ СЃР°Р№С‚ СЂРµР°Р»СЊРЅРѕ Р·Р°РїСЂР°С€РёРІР°РµС‚ (РІРєР»СЋС‡Р°СЏ РїРѕРґ-СЂРµСЃСѓСЂСЃС‹: CDN, API, СЃРєСЂРёРїС‚С‹, С€СЂРёС„С‚С‹)
+    // Все домены, которые сайт реально запрашивает (включая под-ресурсы: CDN, API, скрипты, шрифты)
     let discovered_domains: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-    // request_id -> url, С‡С‚РѕР±С‹ РїРѕ СЃРѕР±С‹С‚РёСЋ РѕС€РёР±РєРё РїРѕРЅСЏС‚СЊ, РєР°РєРѕР№ РґРѕРјРµРЅ СЃР»РѕРјР°Р»СЃСЏ
+    // request_id -> url, чтобы по событию ошибки понять, какой домен сломался
     let request_map: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-    // Р”РѕРјРµРЅС‹, СѓРїР°РІС€РёРµ РїСЂСЏРјРѕ РІ Р±СЂР°СѓР·РµСЂРµ (РѕР±СЂС‹РІ СЃРѕРµРґРёРЅРµРЅРёСЏ)
+    // Домены, упавшие прямо в браузере (обрыв соединения)
     let browser_failed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
-    // РЎС‡С‘С‚С‡РёРє С‡РёСЃР»Р° Р·Р°РїСЂРѕСЃРѕРІ вЂ” СЂР°СЃС‚С‘С‚ РїСЂРё РєР°Р¶РґРѕРј РЅРѕРІРѕРј RequestWillBeSent.
-    // РџРѕ РµРіРѕ В«Р·Р°РјРёСЂР°РЅРёСЋВ» РѕРїСЂРµРґРµР»СЏРµРј network-idle (СЃС‚СЂР°РЅРёС†Р° РґРѕРіСЂСѓР·РёР»Р°СЃСЊ).
+    // Счётчик числа запросов — растёт при каждом новом RequestWillBeSent.
+    // По его «замиранию» определяем network-idle (страница догрузилась).
     let req_counter: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
     let dd = discovered_domains.clone();
@@ -213,7 +213,7 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
             }
         } else if debug_str.contains("LoadingFailed") {
             let err_text = extract_value(&debug_str, "error_text").unwrap_or_default();
-            // РќР°СЃ РёРЅС‚РµСЂРµСЃСѓСЋС‚ С‚РѕР»СЊРєРѕ СЂРµР°Р»СЊРЅС‹Рµ РѕР±СЂС‹РІС‹ СЃРѕРµРґРёРЅРµРЅРёСЏ (С‚Рѕ, С‡С‚Рѕ Р»РѕРјР°РµС‚ РѕР±С…РѕРґ)
+            // Нас интересуют только реальные обрывы соединения (то, что ломает обход)
             let is_conn_error = err_text.contains("ERR_CONNECTION")
                 || err_text.contains("RESET")
                 || err_text.contains("CLOSED")
@@ -235,10 +235,10 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
 
     let _ = tab.navigate_to(&target_url);
 
-    // РЈРЅРёРІРµСЂСЃР°Р»СЊРЅРѕРµ РѕР¶РёРґР°РЅРёРµ РїРѕ В«network idleВ»: Р¶РґС‘Рј, РїРѕРєР° РЅРѕРІС‹Рµ Р·Р°РїСЂРѕСЃС‹ РїРµСЂРµСЃС‚Р°РЅСѓС‚
-    // РїРѕСЏРІР»СЏС‚СЊСЃСЏ (РѕРєРЅРѕ С‚РёС€РёРЅС‹ IDLE_WINDOW), СЃ РѕР±С‰РёРј РїРѕС‚РѕР»РєРѕРј MAX_WAIT. Р­С‚Рѕ Р»РѕРІРёС‚
-    // РїРѕР·РґРЅРёРµ РґРѕРјРµРЅС‹ SPA / lazy-load / СЂРµРґРёСЂРµРєС‚РѕРІ РґР»СЏ Р»СЋР±РѕРіРѕ СЃР°Р№С‚Р°, Р° РЅРµ С„РёРєСЃРёСЂРѕРІР°РЅРЅС‹Рµ 15 СЃ.
-    // РЎРєСЂС‹С‚РёРµ РѕРєРѕРЅ/РєРѕРЅСЃРѕР»РµР№ Chrome РІС‹РїРѕР»РЅСЏРµС‚ С„РѕРЅРѕРІС‹Р№ РїРѕС‚РѕРє (Р·Р°РїСѓС‰РµРЅ РґРѕ СЃС‚Р°СЂС‚Р° Р±СЂР°СѓР·РµСЂР°).
+    // Универсальное ожидание по «network idle»: ждём, пока новые запросы перестанут
+    // появляться (окно тишины IDLE_WINDOW), с общим потолком MAX_WAIT. Это ловит
+    // поздние домены SPA / lazy-load / редиректов для любого сайта, а не фиксированные 15 с.
+    // Скрытие окон/консолей Chrome выполняет фоновый поток (запущен до старта браузера).
     {
         const IDLE_WINDOW: Duration = Duration::from_secs(3);
         const MAX_WAIT: Duration = Duration::from_secs(30);
@@ -263,7 +263,7 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
         }
     }
 
-    // РћСЃС‚Р°РЅР°РІР»РёРІР°РµРј С„РѕРЅРѕРІС‹Р№ РїРѕС‚РѕРє СЃРєСЂС‹С‚РёСЏ РѕРєРѕРЅ.
+    // Останавливаем фоновый поток скрытия окон.
     #[cfg(windows)]
     {
         hide_stop.store(true, Ordering::Relaxed);

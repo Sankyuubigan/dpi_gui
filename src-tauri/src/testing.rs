@@ -1,4 +1,4 @@
-﻿use crate::{process, diagnostics_probe};
+use crate::{process, diagnostics_probe};
 use std::thread;
 use std::time::{Duration, Instant};
 use reqwest::blocking::Client;
@@ -9,29 +9,29 @@ use trust_dns_resolver::Resolver;
 use std::net::{SocketAddr, IpAddr};
 use std::str::FromStr;
 
-/// Р РµР·СѓР»СЊС‚Р°С‚ С‚РµСЃС‚Р° РѕРґРЅРѕРіРѕ РїСЂРѕС„РёР»СЏ вЂ” РІРѕР·РІСЂР°С‰Р°РµС‚СЃСЏ РЅР° С„СЂРѕРЅС‚РµРЅРґ.
+/// Результат теста одного профиля — возвращается на фронтенд.
 #[derive(Serialize, Debug)]
 pub struct ProfileTestOutcome {
     pub name: String,
     pub ok: bool,
-    /// Р§РµР»РѕРІРµРєРѕ-С‡РёС‚Р°РµРјС‹Р№ РІРµСЂРґРёРєС‚: В«РЈРЎРџР•РҐ (200 OK)В», В«РўР°Р№РјР°СѓС‚ СЃРѕРµРґРёРЅРµРЅРёСЏВ», В«RST вЂ” СЃР±СЂРѕСЃ (DPI)В» Рё С‚.Рї.
+    /// Человеко-читаемый вердикт: «УСПЕХ (200 OK)», «Таймаут соединения», «RST — сброс (DPI)» и т.п.
     pub verdict: String,
-    /// Р”РѕРїРѕР»РЅРёС‚РµР»СЊРЅР°СЏ РґРµС‚Р°Р»СЊ (РґР»СЏ РїСЂРѕРІР°Р»Р°).
+    /// Дополнительная деталь (для провала).
     pub detail: String,
     pub elapsed_ms: u64,
 }
 
-/// Р§РµР»РѕРІРµРєРѕ-С‡РёС‚Р°РµРјРѕРµ РѕРїРёСЃР°РЅРёРµ РєР»Р°СЃСЃРёС„РёС†РёСЂРѕРІР°РЅРЅРѕРіРѕ СЂРµР·СѓР»СЊС‚Р°С‚Р° HTTP-РїСЂРѕР±С‹.
+/// Человеко-читаемое описание классифицированного результата HTTP-пробы.
 fn verdict_from_http(r: &diagnostics_probe::HttpResult) -> (bool, String) {
     match r {
-        diagnostics_probe::HttpResult::Ok(s) => (true, format!("РЈРЎРџР•РҐ (HTTP {})", s)),
-        diagnostics_probe::HttpResult::BlockPage => (false, "РЎС‚СЂР°РЅРёС†Р° Р±Р»РѕРєРёСЂРѕРІРєРё (403/451/Р·Р°РіР»СѓС€РєР°)".to_string()),
-        diagnostics_probe::HttpResult::Dns => (false, "DNS РЅРµ СЂРµР·РѕР»РІРёС‚СЃСЏ (NXDOMAIN / DNS-С†РµРЅР·СѓСЂР°)".to_string()),
-        diagnostics_probe::HttpResult::Rst => (false, "RST вЂ” СЃРѕРµРґРёРЅРµРЅРёРµ СЃР±СЂРѕС€РµРЅРѕ (С‚РёРїРёС‡РЅРѕ РґР»СЏ DPI)".to_string()),
-        diagnostics_probe::HttpResult::Tls => (false, "TLS-СЂСѓРєРѕРїРѕР¶Р°С‚РёРµ СЂРІС‘С‚СЃСЏ".to_string()),
-        diagnostics_probe::HttpResult::BadCert => (false, "SSL-СЃРµСЂС‚РёС„РёРєР°С‚ СЃР°Р№С‚Р° РЅРµРІР°Р»РёРґРµРЅ (NET::ERR_CERT_*)".to_string()),
-        diagnostics_probe::HttpResult::Timeout => (false, "РўР°Р№РјР°СѓС‚ СЃРѕРµРґРёРЅРµРЅРёСЏ".to_string()),
-        diagnostics_probe::HttpResult::Other(msg) => (false, format!("РћС€РёР±РєР°: {}", msg)),
+        diagnostics_probe::HttpResult::Ok(s) => (true, format!("УСПЕХ (HTTP {})", s)),
+        diagnostics_probe::HttpResult::BlockPage => (false, "Страница блокировки (403/451/заглушка)".to_string()),
+        diagnostics_probe::HttpResult::Dns => (false, "DNS не резолвится (NXDOMAIN / DNS-цензура)".to_string()),
+        diagnostics_probe::HttpResult::Rst => (false, "RST — соединение сброшено (типично для DPI)".to_string()),
+        diagnostics_probe::HttpResult::Tls => (false, "TLS-рукопожатие рвётся".to_string()),
+        diagnostics_probe::HttpResult::BadCert => (false, "SSL-сертификат сайта невалиден (NET::ERR_CERT_*)".to_string()),
+        diagnostics_probe::HttpResult::Timeout => (false, "Таймаут соединения".to_string()),
+        diagnostics_probe::HttpResult::Other(msg) => (false, format!("Ошибка: {}", msg)),
     }
 }
 
@@ -43,17 +43,17 @@ pub fn test_single_profile(app: AppHandle, profile_name: &str, url: &str, game_f
         return Ok(ProfileTestOutcome {
             name: profile_name.to_string(),
             ok: false,
-            verdict: "РћС€РёР±РєР° Р·Р°РїСѓСЃРєР°".to_string(),
+            verdict: "Ошибка запуска".to_string(),
             detail: e,
             elapsed_ms: started.elapsed().as_millis() as u64,
         });
     }
 
-    // Р”Р°РµРј WinDivert РІСЂРµРјСЏ РЅР° РїРµСЂРµС…РІР°С‚ С‚СЂР°С„РёРєР°
+    // Даем WinDivert время на перехват трафика
     thread::sleep(Duration::from_secs(2));
 
-    // Р”РµСЃРёРЅРє-РїСЂРѕС„РёР»Рё С‡Р°СЃС‚Рѕ РїСЂРѕР±РёРІР°СЋС‚ С‚РѕР»СЊРєРѕ СЃРѕ РІС‚РѕСЂРѕР№/С‚СЂРµС‚СЊРµР№ РїРѕРїС‹С‚РєРё
-    // (РїРµСЂРІС‹Р№ РєРѕРЅРЅРµРєС‚ СЃСЉРµРґР°РµС‚СЃСЏ DPI, winws РїРµСЂРµСЃС‹Р»Р°РµС‚ РјРѕРґРёС„РёС†РёСЂРѕРІР°РЅРЅС‹Рµ РїР°РєРµС‚С‹).
+    // Десинк-профили часто пробивают только со второй/третьей попытки
+    // (первый коннект съедается DPI, winws пересылает модифицированные пакеты).
     let mut result: diagnostics_probe::HttpResult = diagnostics_probe::HttpResult::Timeout;
     for attempt in 1..=2 {
         let r = diagnostics_probe::http_classify_with(&target_url, 5);
@@ -76,12 +76,12 @@ pub fn test_single_profile(app: AppHandle, profile_name: &str, url: &str, game_f
     } else {
         match &result {
             diagnostics_probe::HttpResult::Other(m) => m.clone(),
-            diagnostics_probe::HttpResult::BlockPage => "РїРѕР»СѓС‡РµРЅР° СЃС‚СЂР°РЅРёС†Р°-Р·Р°РіР»СѓС€РєР° РІРјРµСЃС‚Рѕ СЃР°Р№С‚Р°".to_string(),
-            diagnostics_probe::HttpResult::Dns => "Р·Р°РїРёСЃСЊ РґРѕРјРµРЅР° РЅРµ РЅР°Р№РґРµРЅР° СЃРёСЃС‚РµРјРЅС‹Рј DNS".to_string(),
-            diagnostics_probe::HttpResult::Rst => "СЃРѕРµРґРёРЅРµРЅРёРµ РѕР±РѕСЂРІР°РЅРѕ RST РїСЂРё СЂСѓРєРѕРїРѕР¶Р°С‚РёРё".to_string(),
-            diagnostics_probe::HttpResult::Tls => "TLS-С…РµРЅРґС€РµР№Рє РЅРµ Р·Р°РІРµСЂС€РёР»СЃСЏ Р·Р° РІСЂРµРјСЏ РїСЂРѕР±С‹".to_string(),
-            diagnostics_probe::HttpResult::BadCert => "СЃРµСЂРІРµСЂ РѕС‚РІРµС‚РёР», РЅРѕ РµРіРѕ SSL-СЃРµСЂС‚РёС„РёРєР°С‚ РЅРµРІР°Р»РёРґРµРЅ РґР»СЏ РґРѕРјРµРЅР° вЂ” РѕР±С…РѕРґ РЅРµ РїРѕС‡РёРЅРёС‚ СЌС‚Рѕ".to_string(),
-            diagnostics_probe::HttpResult::Timeout => "СЃРµСЂРІРµСЂ РЅРµ РѕС‚РІРµС‚РёР» Р·Р° ~5 СЃРµРєСѓРЅРґ".to_string(),
+            diagnostics_probe::HttpResult::BlockPage => "получена страница-заглушка вместо сайта".to_string(),
+            diagnostics_probe::HttpResult::Dns => "запись домена не найдена системным DNS".to_string(),
+            diagnostics_probe::HttpResult::Rst => "соединение оборвано RST при рукопожатии".to_string(),
+            diagnostics_probe::HttpResult::Tls => "TLS-хендшейк не завершился за время пробы".to_string(),
+            diagnostics_probe::HttpResult::BadCert => "сервер ответил, но его SSL-сертификат невалиден для домена — обход не починит это".to_string(),
+            diagnostics_probe::HttpResult::Timeout => "сервер не ответил за ~5 секунд".to_string(),
             _ => format!("{:?}", result),
         }
     };
@@ -98,26 +98,26 @@ pub fn test_single_profile(app: AppHandle, profile_name: &str, url: &str, game_f
 pub fn test_dns(url: &str, dns_ip: &str) -> Result<String, String> {
     let target_url = if !url.starts_with("http") { format!("https://{}", url) } else { url.to_string() };
 
-    // Р’С‹С‚Р°СЃРєРёРІР°РµРј РґРѕРјРµРЅ РґР»СЏ СЂРµР·РѕР»РІРёРЅРіР°
-    let parsed_url = url::Url::parse(&target_url).map_err(|e| format!("РќРµРІРµСЂРЅС‹Р№ URL: {}", e))?;
-    let domain = parsed_url.host_str().ok_or("РќРµ СѓРґР°Р»РѕСЃСЊ РёР·РІР»РµС‡СЊ РґРѕРјРµРЅ")?.to_string();
+    // Вытаскиваем домен для резолвинга
+    let parsed_url = url::Url::parse(&target_url).map_err(|e| format!("Неверный URL: {}", e))?;
+    let domain = parsed_url.host_str().ok_or("Не удалось извлечь домен")?.to_string();
 
     let dns_label = dns_ip.to_string();
 
-    // Р”РІР° РІРёРґР° СЂРµР·РѕР»РІРµСЂРѕРІ: РїСЂРёРІС‹С‡РЅС‹Р№ IP (UDP:53) Рё DoH-СЃРµСЂРІРёСЃ (https://host/dns-query).
+    // Два вида резолверов: привычный IP (UDP:53) и DoH-сервис (https://host/dns-query).
     let resolved_ip: IpAddr;
     if dns_ip.trim().starts_with("http") {
         let doh_url = url::Url::parse(dns_ip.trim())
-            .map_err(|e| format!("РќРµРІРµСЂРЅС‹Р№ URL DoH-СЂРµР·РѕР»РІРµСЂР°: {}", e))?;
+            .map_err(|e| format!("Неверный URL DoH-резолвера: {}", e))?;
         let doh_host = doh_url.host_str()
-            .ok_or("РќРµ СѓРґР°Р»РѕСЃСЊ РёР·РІР»РµС‡СЊ С…РѕСЃС‚ РёР· DoH-СЂРµР·РѕР»РІРµСЂР°")?
+            .ok_or("Не удалось извлечь хост из DoH-резолвера")?
             .to_string();
         let ips = diagnostics_probe::resolve_via_doh(&domain, &doh_host);
         resolved_ip = ips.first().copied().ok_or_else(|| {
-            format!("DoH-СЂРµР·РѕР»РІРµСЂ {} РЅРµ РІРµСЂРЅСѓР» IP РґР»СЏ {}. Р’РѕР·РјРѕР¶РЅРѕ DNS-С†РµРЅР·СѓСЂР° РёР»Рё СЃРµСЂРІРёСЃ РЅРµРґРѕСЃС‚СѓРїРµРЅ.", doh_host, domain)
+            format!("DoH-резолвер {} не вернул IP для {}. Возможно DNS-цензура или сервис недоступен.", doh_host, domain)
         })?;
     } else {
-        let dns_addr = IpAddr::from_str(dns_ip.trim()).map_err(|_| "РќРµРІРµСЂРЅС‹Р№ IP РєР°СЃС‚РѕРјРЅРѕРіРѕ DNS СЃРµСЂРІРµСЂР°")?;
+        let dns_addr = IpAddr::from_str(dns_ip.trim()).map_err(|_| "Неверный IP кастомного DNS сервера")?;
 
         let mut config = ResolverConfig::new();
         config.add_name_server(NameServerConfig {
@@ -129,14 +129,14 @@ pub fn test_dns(url: &str, dns_ip: &str) -> Result<String, String> {
             bind_addr: None,
         });
 
-        // Р”РµР»Р°РµРј Р·Р°РїСЂРѕСЃ Рє РєР°СЃС‚РѕРјРЅРѕРјСѓ DNS (РЅР°РїСЂРёРјРµСЂ, 1.1.1.1)
-        let resolver = Resolver::new(config, ResolverOpts::default()).map_err(|e| format!("РћС€РёР±РєР° РёРЅРёС†РёР°Р»РёР·Р°С†РёРё DNS РєР»РёРµРЅС‚Р°: {}", e))?;
-        let response = resolver.lookup_ip(&domain).map_err(|e| format!("РЎР±РѕР№ СЂРµР·РѕР»РІРёРЅРіР° (РІРѕР·РјРѕР¶РЅРѕ DNS РЅРµРґРѕСЃС‚СѓРїРµРЅ РёР»Рё РґРѕРјРµРЅ Р·Р°Р±Р»РѕРєРёСЂРѕРІР°РЅ РЅР° СѓСЂРѕРІРЅРµ DNS): {}", e))?;
-        let resolved = response.iter().next().ok_or("РљР°СЃС‚РѕРјРЅС‹Р№ DNS РЅРµ РІРµСЂРЅСѓР» IP Р°РґСЂРµСЃР°!")?;
+        // Делаем запрос к кастомному DNS (например, 1.1.1.1)
+        let resolver = Resolver::new(config, ResolverOpts::default()).map_err(|e| format!("Ошибка инициализации DNS клиента: {}", e))?;
+        let response = resolver.lookup_ip(&domain).map_err(|e| format!("Сбой резолвинга (возможно DNS недоступен или домен заблокирован на уровне DNS): {}", e))?;
+        let resolved = response.iter().next().ok_or("Кастомный DNS не вернул IP адреса!")?;
         resolved_ip = resolved;
     }
 
-    // РџРѕРґРјРµРЅСЏРµРј IP РІ Р·Р°РїСЂРѕСЃРµ Рє reqwest (СЌРјРёС‚РёСЂСѓРµРј Host Р·Р°РіРѕР»РѕРІРѕРє)
+    // Подменяем IP в запросе к reqwest (эмитируем Host заголовок)
     let client = Client::builder()
         .resolve(&domain, SocketAddr::new(resolved_ip, 443))
         .resolve(&domain, SocketAddr::new(resolved_ip, 80))
@@ -145,8 +145,8 @@ pub fn test_dns(url: &str, dns_ip: &str) -> Result<String, String> {
         .unwrap();
 
     match client.get(&target_url).send() {
-        Ok(res) if res.status().is_success() => Ok(format!("РЈРЎРџР•РҐ (200 OK)\n DNS: {}\n Р Р°Р·СЂРµС€РµРЅРЅС‹Р№ IP: {}", dns_label, resolved_ip)),
-        Ok(res) => Ok(format!("Р”РѕСЃС‚СѓРїРЅРѕ, РЅРѕ СЃС‚Р°С‚СѓСЃ: {}\n DNS: {}\n IP: {}", res.status(), dns_label, resolved_ip)),
-        Err(e) => Ok(format!("РћРЁРР‘РљРђ РїРѕРґРєР»СЋС‡РµРЅРёСЏ:\n DNS: {}\n IP: {}\n РџСЂРёС‡РёРЅР°: {}", dns_label, resolved_ip, e))
+        Ok(res) if res.status().is_success() => Ok(format!("УСПЕХ (200 OK)\n DNS: {}\n Разрешенный IP: {}", dns_label, resolved_ip)),
+        Ok(res) => Ok(format!("Доступно, но статус: {}\n DNS: {}\n IP: {}", res.status(), dns_label, resolved_ip)),
+        Err(e) => Ok(format!("ОШИБКА подключения:\n DNS: {}\n IP: {}\n Причина: {}", dns_label, resolved_ip, e))
     }
 }
