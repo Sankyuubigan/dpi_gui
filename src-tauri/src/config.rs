@@ -1,4 +1,4 @@
-use std::fs;
+﻿use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -30,7 +30,7 @@ pub fn ensure_directories_and_files() -> Result<(), std::io::Error> {
         fs::write(&config_path, serde_json::to_string_pretty(&default_config).unwrap())?;
     }
 
-    // Генерация базовых списков. IPSet списки убраны за ненадобностью.
+    // Р“РµРЅРµСЂР°С†РёСЏ Р±Р°Р·РѕРІС‹С… СЃРїРёСЃРєРѕРІ. IPSet СЃРїРёСЃРєРё СѓР±СЂР°РЅС‹ Р·Р° РЅРµРЅР°РґРѕР±РЅРѕСЃС‚СЊСЋ.
     let files_to_create = vec![
         ("list-general.txt", "# General domains to bypass\n"),
         ("list-google.txt", "# Google domains to bypass\n"),
@@ -44,11 +44,11 @@ pub fn ensure_directories_and_files() -> Result<(), std::io::Error> {
         }
     }
 
-    // Дефолтный список исключений — встроен в бинарник, перезаписывается при каждом запуске
+    // Р”РµС„РѕР»С‚РЅС‹Р№ СЃРїРёСЃРѕРє РёСЃРєР»СЋС‡РµРЅРёР№ вЂ” РІСЃС‚СЂРѕРµРЅ РІ Р±РёРЅР°СЂРЅРёРє, РїРµСЂРµР·Р°РїРёСЃС‹РІР°РµС‚СЃСЏ РїСЂРё РєР°Р¶РґРѕРј Р·Р°РїСѓСЃРєРµ
     let default_exclude = include_str!("../default-exclude.txt");
     fs::write(lists_dir.join("default-exclude.txt"), default_exclude)?;
 
-    // Дефолтные списки обхода — встроены в бинарник, перезаписываются при каждом запуске
+    // Р”РµС„РѕР»С‚РЅС‹Рµ СЃРїРёСЃРєРё РѕР±С…РѕРґР° вЂ” РІСЃС‚СЂРѕРµРЅС‹ РІ Р±РёРЅР°СЂРЅРёРє, РїРµСЂРµР·Р°РїРёСЃС‹РІР°СЋС‚СЃСЏ РїСЂРё РєР°Р¶РґРѕРј Р·Р°РїСѓСЃРєРµ
     let default_bypass_dir = lists_dir.join("default-bypass");
     if !default_bypass_dir.exists() {
         fs::create_dir_all(&default_bypass_dir)?;
@@ -61,7 +61,7 @@ pub fn ensure_directories_and_files() -> Result<(), std::io::Error> {
         fs::write(default_bypass_dir.join(filename), content)?;
     }
 
-    // Проверка и инициализация профилей вынесена в read_profiles() для надежности
+    // РџСЂРѕРІРµСЂРєР° Рё РёРЅРёС†РёР°Р»РёР·Р°С†РёСЏ РїСЂРѕС„РёР»РµР№ РІС‹РЅРµСЃРµРЅР° РІ read_profiles() РґР»СЏ РЅР°РґРµР¶РЅРѕСЃС‚Рё
     let _ = read_profiles(); 
 
     Ok(())
@@ -81,29 +81,29 @@ pub fn write_config(config: &serde_json::Value) -> Result<(), std::io::Error> {
 pub fn read_profiles() -> Result<Vec<serde_json::Value>, std::io::Error> {
     let path = get_app_dir().join("profiles.json");
     
-    // Пытаемся прочесть текущий файл
+    // РџС‹С‚Р°РµРјСЃСЏ РїСЂРѕС‡РµСЃС‚СЊ С‚РµРєСѓС‰РёР№ С„Р°Р№Р»
     if let Ok(data) = fs::read_to_string(&path) {
         if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(&data) {
-            // Защита от бага: если файл пустой массив - восстанавливаем
+            // Р—Р°С‰РёС‚Р° РѕС‚ Р±Р°РіР°: РµСЃР»Рё С„Р°Р№Р» РїСѓСЃС‚РѕР№ РјР°СЃСЃРёРІ - РІРѕСЃСЃС‚Р°РЅР°РІР»РёРІР°РµРј
             if !parsed.is_empty() {
                 return Ok(parsed);
             }
         }
     }
     
-    // Если файла нет или он поврежден (пустой/невалидный), восстанавливаем из дефолтных
+    // Р•СЃР»Рё С„Р°Р№Р»Р° РЅРµС‚ РёР»Рё РѕРЅ РїРѕРІСЂРµР¶РґРµРЅ (РїСѓСЃС‚РѕР№/РЅРµРІР°Р»РёРґРЅС‹Р№), РІРѕСЃСЃС‚Р°РЅР°РІР»РёРІР°РµРј РёР· РґРµС„РѕР»С‚РЅС‹С…
     let default_profiles_str = include_str!("../profiles_default.json");
     let parsed_profiles: Vec<serde_json::Value> = serde_json::from_str(default_profiles_str)
         .expect("Invalid default profiles JSON schema!");
         
-    // Сохраняем восстановленный профиль
+    // РЎРѕС…СЂР°РЅСЏРµРј РІРѕСЃСЃС‚Р°РЅРѕРІР»РµРЅРЅС‹Р№ РїСЂРѕС„РёР»СЊ
     let _ = fs::write(&path, serde_json::to_string_pretty(&parsed_profiles).unwrap());
     
     Ok(parsed_profiles)
 }
 
-/// Добавляет (или заменяет, если имя совпадает) профиль в profiles.json.
-/// Используется диагностикой для сохранения авто-сгенерированного профиля.
+/// Р”РѕР±Р°РІР»СЏРµС‚ (РёР»Рё Р·Р°РјРµРЅСЏРµС‚, РµСЃР»Рё РёРјСЏ СЃРѕРІРїР°РґР°РµС‚) РїСЂРѕС„РёР»СЊ РІ profiles.json.
+/// РСЃРїРѕР»СЊР·СѓРµС‚СЃСЏ РґРёР°РіРЅРѕСЃС‚РёРєРѕР№ РґР»СЏ СЃРѕС…СЂР°РЅРµРЅРёСЏ Р°РІС‚Рѕ-СЃРіРµРЅРµСЂРёСЂРѕРІР°РЅРЅРѕРіРѕ РїСЂРѕС„РёР»СЏ.
 pub fn append_profile(profile: serde_json::Value) -> Result<(), String> {
     let mut profiles = read_profiles().map_err(|e| e.to_string())?;
 

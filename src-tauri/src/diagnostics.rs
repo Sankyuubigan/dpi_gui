@@ -1,4 +1,4 @@
-use std::thread;
+﻿use std::thread;
 use std::time::Duration;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -7,7 +7,7 @@ use crate::diagnostics_probe::{self, DnsInfo, HttpResult};
 use crate::diagnostics_techniques::{self, TechniqueSpec};
 use crate::diagnostics_report;
 
-/// Результат одной техники для фронтенда.
+/// Р РµР·СѓР»СЊС‚Р°С‚ РѕРґРЅРѕР№ С‚РµС…РЅРёРєРё РґР»СЏ С„СЂРѕРЅС‚РµРЅРґР°.
 #[derive(Serialize)]
 pub struct TechniqueOutcome {
     pub name: String,
@@ -15,7 +15,7 @@ pub struct TechniqueOutcome {
     pub detail: String,
 }
 
-/// Итоговый отчёт диагностики (возвращается на фронтенд).
+/// РС‚РѕРіРѕРІС‹Р№ РѕС‚С‡С‘С‚ РґРёР°РіРЅРѕСЃС‚РёРєРё (РІРѕР·РІСЂР°С‰Р°РµС‚СЃСЏ РЅР° С„СЂРѕРЅС‚РµРЅРґ).
 #[derive(Serialize)]
 pub struct DiagnosticsReport {
     pub admin_ok: bool,
@@ -36,19 +36,19 @@ pub struct DiagnosticsReport {
     pub generated_profile_verified: Option<bool>,
 }
 
-/// Универсальный перехват паники: если проба упала — логируем и возвращаем None,
-/// диагностика продолжается дальше (отказоустойчивость).
+/// РЈРЅРёРІРµСЂСЃР°Р»СЊРЅС‹Р№ РїРµСЂРµС…РІР°С‚ РїР°РЅРёРєРё: РµСЃР»Рё РїСЂРѕР±Р° СѓРїР°Р»Р° вЂ” Р»РѕРіРёСЂСѓРµРј Рё РІРѕР·РІСЂР°С‰Р°РµРј None,
+/// РґРёР°РіРЅРѕСЃС‚РёРєР° РїСЂРѕРґРѕР»Р¶Р°РµС‚СЃСЏ РґР°Р»СЊС€Рµ (РѕС‚РєР°Р·РѕСѓСЃС‚РѕР№С‡РёРІРѕСЃС‚СЊ).
 fn try_catch<T>(label: &str, app: &AppHandle, f: impl FnOnce() -> T) -> Option<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(v) => Some(v),
         Err(_) => {
-            let _ = app.emit("log", format!("[Диагностика] Инструмент '{}' не сработал, пропускаем.", label));
+            let _ = app.emit("log", format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] РРЅСЃС‚СЂСѓРјРµРЅС‚ '{}' РЅРµ СЃСЂР°Р±РѕС‚Р°Р», РїСЂРѕРїСѓСЃРєР°РµРј.", label));
             None
         }
     }
 }
 
-/// Проверка конкретного профиля (по имени) против тестового домена.
+/// РџСЂРѕРІРµСЂРєР° РєРѕРЅРєСЂРµС‚РЅРѕРіРѕ РїСЂРѕС„РёР»СЏ (РїРѕ РёРјРµРЅРё) РїСЂРѕС‚РёРІ С‚РµСЃС‚РѕРІРѕРіРѕ РґРѕРјРµРЅР°.
 fn test_profile_against(app: &AppHandle, name: &str, domain: &str, game_filter: bool) -> (bool, String) {
     match process::start_winws_quiet(app.clone(), name, game_filter) {
         Ok(_) => {
@@ -58,67 +58,67 @@ fn test_profile_against(app: &AppHandle, name: &str, domain: &str, game_filter: 
             let ok = matches!(r, diagnostics_probe::HttpResult::Ok(_));
             let detail = match r {
                 diagnostics_probe::HttpResult::Ok(s) => format!("OK ({})", s),
-                diagnostics_probe::HttpResult::BadCert => "SSL-сертификат невалиден (NET::ERR_CERT_*)".to_string(),
+                diagnostics_probe::HttpResult::BadCert => "SSL-СЃРµСЂС‚РёС„РёРєР°С‚ РЅРµРІР°Р»РёРґРµРЅ (NET::ERR_CERT_*)".to_string(),
                 other => format!("{:?}", other),
             };
             (ok, detail)
         }
-        Err(e) => (false, format!("запуск: {}", e)),
+        Err(e) => (false, format!("Р·Р°РїСѓСЃРє: {}", e)),
     }
 }
 
-/// Основная диагностика соединения + подбор и проверка авто-профиля.
+/// РћСЃРЅРѕРІРЅР°СЏ РґРёР°РіРЅРѕСЃС‚РёРєР° СЃРѕРµРґРёРЅРµРЅРёСЏ + РїРѕРґР±РѕСЂ Рё РїСЂРѕРІРµСЂРєР° Р°РІС‚Рѕ-РїСЂРѕС„РёР»СЏ.
 pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -> Result<DiagnosticsReport, String> {
     let log = |msg: String| {
         let _ = app.emit("log", msg);
     };
 
     let domain = diagnostics_techniques::norm(&blocked_url);
-    log(format!("[Диагностика] === Запуск диагностики для: {} ===", domain));
+    log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] === Р—Р°РїСѓСЃРє РґРёР°РіРЅРѕСЃС‚РёРєРё РґР»СЏ: {} ===", domain));
 
-    // Останавливаем активный обход, чтобы пробы были чистыми
+    // РћСЃС‚Р°РЅР°РІР»РёРІР°РµРј Р°РєС‚РёРІРЅС‹Р№ РѕР±С…РѕРґ, С‡С‚РѕР±С‹ РїСЂРѕР±С‹ Р±С‹Р»Рё С‡РёСЃС‚С‹РјРё
     let _ = process::stop_winws();
     thread::sleep(Duration::from_millis(500));
 
-    // 1. Права администратора (точное значение доопределим после проверки WinDivert)
+    // 1. РџСЂР°РІР° Р°РґРјРёРЅРёСЃС‚СЂР°С‚РѕСЂР° (С‚РѕС‡РЅРѕРµ Р·РЅР°С‡РµРЅРёРµ РґРѕРѕРїСЂРµРґРµР»РёРј РїРѕСЃР»Рµ РїСЂРѕРІРµСЂРєРё WinDivert)
     let admin_check = try_catch("admin", &app, || diagnostics_probe::check_admin()).unwrap_or_else(|| {
-        log("[Диагностика] проверка прав администратора не удалась".into());
+        log("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] РїСЂРѕРІРµСЂРєР° РїСЂР°РІ Р°РґРјРёРЅРёСЃС‚СЂР°С‚РѕСЂР° РЅРµ СѓРґР°Р»Р°СЃСЊ".into());
         false
     });
     let mut admin = admin_check;
-    log(format!("[Диагностика] Права администратора (предв.): {}", if admin { "ДА" } else { "НЕТ" }));
+    log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] РџСЂР°РІР° Р°РґРјРёРЅРёСЃС‚СЂР°С‚РѕСЂР° (РїСЂРµРґРІ.): {}", if admin { "Р”Рђ" } else { "РќР•Рў" }));
 
-    // 2. Наличие winws
+    // 2. РќР°Р»РёС‡РёРµ winws
     let present = try_catch("winws_present", &app, || diagnostics_probe::winws_present()).unwrap_or(false);
-    log(format!("[Диагностика] winws.exe найден: {}", if present { "ДА" } else { "НЕТ" }));
+    log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] winws.exe РЅР°Р№РґРµРЅ: {}", if present { "Р”Рђ" } else { "РќР•Рў" }));
 
     // 3. WinDivert
     let (windivert_ok, windivert_detail) =
         try_catch("windivert", &app, || diagnostics_probe::test_windivert(&app)).unwrap_or_else(|| {
-            (false, "проверка WinDivert не удалась".to_string())
+            (false, "РїСЂРѕРІРµСЂРєР° WinDivert РЅРµ СѓРґР°Р»Р°СЃСЊ".to_string())
         });
-    // WinDivert требует прав администратора — если он поднялся, прав точно хватает
+    // WinDivert С‚СЂРµР±СѓРµС‚ РїСЂР°РІ Р°РґРјРёРЅРёСЃС‚СЂР°С‚РѕСЂР° вЂ” РµСЃР»Рё РѕРЅ РїРѕРґРЅСЏР»СЃСЏ, РїСЂР°РІ С‚РѕС‡РЅРѕ С…РІР°С‚Р°РµС‚
     if windivert_ok {
         admin = true;
     }
     log(format!(
-        "[Диагностика] WinDivert: {} ({})",
+        "[Р”РёР°РіРЅРѕСЃС‚РёРєР°] WinDivert: {} ({})",
         if windivert_ok { "OK" } else { "FAIL" },
         windivert_detail
     ));
 
-    // 4. DNS (системный + публичные)
+    // 4. DNS (СЃРёСЃС‚РµРјРЅС‹Р№ + РїСѓР±Р»РёС‡РЅС‹Рµ)
     let dns: DnsInfo = try_catch("dns", &app, || diagnostics_probe::dns_multi(&domain)).unwrap_or_else(DnsInfo::new);
     let dns_summary = format!(
-        "Системный: [{}]\nCloudflare 1.1.1.1: [{}]\nGoogle 8.8.8.8: [{}]{}",
+        "РЎРёСЃС‚РµРјРЅС‹Р№: [{}]\nCloudflare 1.1.1.1: [{}]\nGoogle 8.8.8.8: [{}]{}",
         dns.system.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", "),
         dns.cloudflare.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", "),
         dns.google.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", "),
-        if dns.err.is_empty() { String::new() } else { format!("\nОшибка: {}", dns.err) }
+        if dns.err.is_empty() { String::new() } else { format!("\nРћС€РёР±РєР°: {}", dns.err) }
     );
-    log(format!("[Диагностика] DNS:\n{}", dns_summary));
+    log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] DNS:\n{}", dns_summary));
 
-    // Выбираем IP для connect/UDP-проб (публичный DNS надёжнее при цензуре)
+    // Р’С‹Р±РёСЂР°РµРј IP РґР»СЏ connect/UDP-РїСЂРѕР± (РїСѓР±Р»РёС‡РЅС‹Р№ DNS РЅР°РґС‘Р¶РЅРµРµ РїСЂРё С†РµРЅР·СѓСЂРµ)
     let target_ip = dns
         .cloudflare
         .first()
@@ -128,45 +128,45 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
 
     // 5. IPv6
     let ipv6 = try_catch("ipv6", &app, || diagnostics_probe::has_ipv6(&domain)).unwrap_or(false);
-    log(format!("[Диагностика] IPv6 до сайта: {}", if ipv6 { "есть" } else { "нет" }));
+    log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] IPv6 РґРѕ СЃР°Р№С‚Р°: {}", if ipv6 { "РµСЃС‚СЊ" } else { "РЅРµС‚" }));
 
-    // 6. Сырое TCP-соединение к 443 (без обхода)
+    // 6. РЎС‹СЂРѕРµ TCP-СЃРѕРµРґРёРЅРµРЅРёРµ Рє 443 (Р±РµР· РѕР±С…РѕРґР°)
     let connect = match target_ip {
-        Some(ip) => try_catch("tcp_connect", &app, || diagnostics_probe::tcp_connect(ip, 443)).unwrap_or_else(|| "ошибка".into()),
+        Some(ip) => try_catch("tcp_connect", &app, || diagnostics_probe::tcp_connect(ip, 443)).unwrap_or_else(|| "РѕС€РёР±РєР°".into()),
         None => "no-ip".to_string(),
     };
-    log(format!("[Диагностика] CONNECT 443 (без обхода): {}", connect));
+    log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] CONNECT 443 (Р±РµР· РѕР±С…РѕРґР°): {}", connect));
 
-    // 7. HTTPS к заблокированному сайту (без обхода) — классификация блока
+    // 7. HTTPS Рє Р·Р°Р±Р»РѕРєРёСЂРѕРІР°РЅРЅРѕРјСѓ СЃР°Р№С‚Сѓ (Р±РµР· РѕР±С…РѕРґР°) вЂ” РєР»Р°СЃСЃРёС„РёРєР°С†РёСЏ Р±Р»РѕРєР°
     let tls = try_catch("http_block", &app, || {
         let r = diagnostics_probe::http_classify(&format!("https://{}/", domain));
         format!("{:?}", r)
     })
-    .unwrap_or_else(|| "ошибка".into());
-    log(format!("[Диагностика] HTTPS (без обхода): {}", tls));
+    .unwrap_or_else(|| "РѕС€РёР±РєР°".into());
+    log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] HTTPS (Р±РµР· РѕР±С…РѕРґР°): {}", tls));
 
-    // 8. UDP/QUIC зонд
+    // 8. UDP/QUIC Р·РѕРЅРґ
     let quic = match target_ip {
-        Some(ip) => try_catch("quic", &app, || diagnostics_probe::quic_probe(ip)).unwrap_or_else(|| "ошибка".into()),
+        Some(ip) => try_catch("quic", &app, || diagnostics_probe::quic_probe(ip)).unwrap_or_else(|| "РѕС€РёР±РєР°".into()),
         None => "no-ip".to_string(),
     };
-    log(format!("[Диагностика] QUIC/UDP 443: {}", quic));
+    log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] QUIC/UDP 443: {}", quic));
 
-    // 9. Прогон desync-техник (каждая изолированно)
+    // 9. РџСЂРѕРіРѕРЅ desync-С‚РµС…РЅРёРє (РєР°Р¶РґР°СЏ РёР·РѕР»РёСЂРѕРІР°РЅРЅРѕ)
     let techniques: Vec<TechniqueSpec> = diagnostics_techniques::all_techniques();
     let mut outcomes: Vec<TechniqueOutcome> = Vec::new();
     let mut passed: Vec<String> = Vec::new();
 
     for spec in &techniques {
-        log(format!("[Диагностика] -> Тест техники: {}", spec.name));
+        log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] -> РўРµСЃС‚ С‚РµС…РЅРёРєРё: {}", spec.name));
         let (p, d) = try_catch("technique", &app, || {
             diagnostics_techniques::test_technique(&app, spec, &domain, game_filter)
         })
-        .unwrap_or_else(|| (false, "проба упала".into()));
+        .unwrap_or_else(|| (false, "РїСЂРѕР±Р° СѓРїР°Р»Р°".into()));
         log(format!(
             "   {}: {}",
             spec.name,
-            if p { "ПРОХОДИТ".to_string() } else { d.clone() }
+            if p { "РџР РћРҐРћР”РРў".to_string() } else { d.clone() }
         ));
         outcomes.push(TechniqueOutcome {
             name: spec.name.clone(),
@@ -178,24 +178,24 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
         }
     }
 
-    // 9b. Проверка СУЩЕСТВУЮЩИХ профилей пользователя (чтобы не говорить
-    // "ни одна техника не работает", когда у пользователя уже есть рабочий).
+    // 9b. РџСЂРѕРІРµСЂРєР° РЎРЈР©Р•РЎРўР’РЈР®Р©РРҐ РїСЂРѕС„РёР»РµР№ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ (С‡С‚РѕР±С‹ РЅРµ РіРѕРІРѕСЂРёС‚СЊ
+    // "РЅРё РѕРґРЅР° С‚РµС…РЅРёРєР° РЅРµ СЂР°Р±РѕС‚Р°РµС‚", РєРѕРіРґР° Сѓ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ СѓР¶Рµ РµСЃС‚СЊ СЂР°Р±РѕС‡РёР№).
     let user_profiles = config::read_profiles().unwrap_or_default();
     let mut existing_outcomes: Vec<TechniqueOutcome> = Vec::new();
     for p in &user_profiles {
         let pname = p["name"].as_str().unwrap_or("").to_string();
-        if pname.is_empty() || pname.starts_with("Авто-профиль") {
+        if pname.is_empty() || pname.starts_with("РђРІС‚Рѕ-РїСЂРѕС„РёР»СЊ") {
             continue;
         }
-        log(format!("[Диагностика] -> Тест существующего профиля: {}", pname));
+        log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] -> РўРµСЃС‚ СЃСѓС‰РµСЃС‚РІСѓСЋС‰РµРіРѕ РїСЂРѕС„РёР»СЏ: {}", pname));
         let (ok, detail) = try_catch("existing_profile", &app, || {
             test_profile_against(&app, &pname, &domain, game_filter)
         })
-        .unwrap_or_else(|| (false, "проба упала".into()));
+        .unwrap_or_else(|| (false, "РїСЂРѕР±Р° СѓРїР°Р»Р°".into()));
         log(format!(
             "   {}: {}",
             pname,
-            if ok { "ПРОХОДИТ".to_string() } else { detail.clone() }
+            if ok { "РџР РћРҐРћР”РРў".to_string() } else { detail.clone() }
         ));
         existing_outcomes.push(TechniqueOutcome {
             name: pname,
@@ -204,7 +204,7 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
         });
     }
 
-    // 10. Генерация и проверка авто-профиля
+    // 10. Р“РµРЅРµСЂР°С†РёСЏ Рё РїСЂРѕРІРµСЂРєР° Р°РІС‚Рѕ-РїСЂРѕС„РёР»СЏ
     let app_dir = config::get_app_dir();
     let lists_dir = app_dir.join("lists").to_string_lossy().replace("\\", "/");
     let bin_dir = process::get_bin_dir().to_string_lossy().replace("\\", "/");
@@ -217,20 +217,20 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
     if let Some((name, args)) =
         diagnostics_report::generate_profile(&domain, &techniques, &passed, &lists_dir, &bin_dir)
     {
-        // Пишем доменно-специфичный хостлист, на который ссылается профиль
+        // РџРёС€РµРј РґРѕРјРµРЅРЅРѕ-СЃРїРµС†РёС„РёС‡РЅС‹Р№ С…РѕСЃС‚Р»РёСЃС‚, РЅР° РєРѕС‚РѕСЂС‹Р№ СЃСЃС‹Р»Р°РµС‚СЃСЏ РїСЂРѕС„РёР»СЊ
         let _ = std::fs::write(app_dir.join("lists").join("diag-autoprofile.txt"), format!("{}\n", domain));
 
         match config::append_profile(serde_json::json!({ "name": name, "args": args })) {
             Ok(_) => {
                 profile_saved = true;
-                log(format!("[Диагностика] Авто-профиль '{}' сохранён.", name));
+                log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] РђРІС‚Рѕ-РїСЂРѕС„РёР»СЊ '{}' СЃРѕС…СЂР°РЅС‘РЅ.", name));
             }
             Err(e) => {
-                log(format!("[Диагностика] Не удалось сохранить профиль: {}", e));
+                log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] РќРµ СѓРґР°Р»РѕСЃСЊ СЃРѕС…СЂР°РЅРёС‚СЊ РїСЂРѕС„РёР»СЊ: {}", e));
             }
         }
 
-        // Проверяем сохранённый профиль по факту
+        // РџСЂРѕРІРµСЂСЏРµРј СЃРѕС…СЂР°РЅС‘РЅРЅС‹Р№ РїСЂРѕС„РёР»СЊ РїРѕ С„Р°РєС‚Сѓ
         let _ = process::stop_winws();
         thread::sleep(Duration::from_millis(500));
         verified = try_catch("verify_profile", &app, || {
@@ -241,13 +241,13 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
                     let ok = matches!(r, HttpResult::Ok(_));
                     let _ = process::stop_winws();
                     log(format!(
-                        "[Диагностика] Проверка авто-профиля: {}",
-                        if ok { "РАБОТАЕТ" } else { "не прошла" }
+                        "[Р”РёР°РіРЅРѕСЃС‚РёРєР°] РџСЂРѕРІРµСЂРєР° Р°РІС‚Рѕ-РїСЂРѕС„РёР»СЏ: {}",
+                        if ok { "Р РђР‘РћРўРђР•Рў" } else { "РЅРµ РїСЂРѕС€Р»Р°" }
                     ));
                     ok
                 }
                 Err(e) => {
-                    log(format!("[Диагностика] Не удалось запустить авто-профиль: {}", e));
+                    log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ Р°РІС‚Рѕ-РїСЂРѕС„РёР»СЊ: {}", e));
                     false
                 }
             }
@@ -256,8 +256,8 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
         gen_name = Some(name);
         gen_args = Some(args);
     } else if let Some(work) = existing_outcomes.iter().find(|o| o.passed) {
-        // Ни одна изолированная техника не прошла, но у пользователя есть
-        // рабочий профиль — клонируем его как авто-профиль.
+        // РќРё РѕРґРЅР° РёР·РѕР»РёСЂРѕРІР°РЅРЅР°СЏ С‚РµС…РЅРёРєР° РЅРµ РїСЂРѕС€Р»Р°, РЅРѕ Сѓ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ РµСЃС‚СЊ
+        // СЂР°Р±РѕС‡РёР№ РїСЂРѕС„РёР»СЊ вЂ” РєР»РѕРЅРёСЂСѓРµРј РµРіРѕ РєР°Рє Р°РІС‚Рѕ-РїСЂРѕС„РёР»СЊ.
         let src = user_profiles.iter().find(|p| p["name"] == work.name);
         if let Some(src) = src {
             let src_args = src["args"].as_str().unwrap_or("").to_string();
@@ -270,7 +270,7 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
                 );
                 if config::append_profile(serde_json::json!({ "name": cname, "args": cargs })).is_ok() {
                     profile_saved = true;
-                    log(format!("[Диагностика] Авто-профиль (клон '{}') сохранён.", work.name));
+                    log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] РђРІС‚Рѕ-РїСЂРѕС„РёР»СЊ (РєР»РѕРЅ '{}') СЃРѕС…СЂР°РЅС‘РЅ.", work.name));
                 }
                 let _ = process::stop_winws();
                 thread::sleep(Duration::from_millis(500));
@@ -282,13 +282,13 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
                             let ok = matches!(r, HttpResult::Ok(_));
                             let _ = process::stop_winws();
                             log(format!(
-                                "[Диагностика] Проверка клона: {}",
-                                if ok { "РАБОТАЕТ" } else { "не прошла" }
+                                "[Р”РёР°РіРЅРѕСЃС‚РёРєР°] РџСЂРѕРІРµСЂРєР° РєР»РѕРЅР°: {}",
+                                if ok { "Р РђР‘РћРўРђР•Рў" } else { "РЅРµ РїСЂРѕС€Р»Р°" }
                             ));
                             ok
                         }
                         Err(e) => {
-                            log(format!("[Диагностика] Не удалось запустить клон: {}", e));
+                            log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ РєР»РѕРЅ: {}", e));
                             false
                         }
                     }
@@ -298,13 +298,13 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
             }
         }
     } else {
-        log("[Диагностика] Рабочих техник и профилей не найдено — авто-профиль не создаётся.".into());
+        log("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] Р Р°Р±РѕС‡РёС… С‚РµС…РЅРёРє Рё РїСЂРѕС„РёР»РµР№ РЅРµ РЅР°Р№РґРµРЅРѕ вЂ” Р°РІС‚Рѕ-РїСЂРѕС„РёР»СЊ РЅРµ СЃРѕР·РґР°С‘С‚СЃСЏ.".into());
     }
 
-    // На всякий случай глушим обход в конце
+    // РќР° РІСЃСЏРєРёР№ СЃР»СѓС‡Р°Р№ РіР»СѓС€РёРј РѕР±С…РѕРґ РІ РєРѕРЅС†Рµ
     let _ = process::stop_winws();
 
-    // 11. Отпечаток и рекомендация
+    // 11. РћС‚РїРµС‡Р°С‚РѕРє Рё СЂРµРєРѕРјРµРЅРґР°С†РёСЏ
     let fingerprint = diagnostics_report::build_fingerprint(
         admin, windivert_ok, ipv6, &dns, &connect, &tls, &quic, &passed,
     );
@@ -322,9 +322,9 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
         verified,
     );
 
-    log("[Диагностика] === ОТЧЁТ ===".into());
-    log(format!("[Диагностика] Отпечаток: {}", fingerprint));
-    log(format!("[Диагностика] Рекомендация:\n{}", recommendation));
+    log("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] === РћРўР§РЃРў ===".into());
+    log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] РћС‚РїРµС‡Р°С‚РѕРє: {}", fingerprint));
+    log(format!("[Р”РёР°РіРЅРѕСЃС‚РёРєР°] Р РµРєРѕРјРµРЅРґР°С†РёСЏ:\n{}", recommendation));
 
     Ok(DiagnosticsReport {
         admin_ok: admin,

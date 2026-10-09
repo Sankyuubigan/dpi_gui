@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
 mod process;
@@ -56,33 +56,33 @@ fn check_status() -> bool {
     process::is_winws_running()
 }
 
-// Оборачиваем долгие команды в асинхронные таски, чтобы не вешать UI-поток
+// РћР±РѕСЂР°С‡РёРІР°РµРј РґРѕР»РіРёРµ РєРѕРјР°РЅРґС‹ РІ Р°СЃРёРЅС…СЂРѕРЅРЅС‹Рµ С‚Р°СЃРєРё, С‡С‚РѕР±С‹ РЅРµ РІРµС€Р°С‚СЊ UI-РїРѕС‚РѕРє
 #[tauri::command]
 async fn run_domain_analysis(app: AppHandle, url: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         analyzer::analyze_url(&app, &url)
-    }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
+    }).await.unwrap_or_else(|e| Err(format!("РћС€РёР±РєР° РїРѕС‚РѕРєР°: {}", e)))
 }
 
 #[tauri::command]
 async fn test_profile(app: AppHandle, profile_name: String, url: String, game_filter: bool) -> Result<testing::ProfileTestOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
         testing::test_single_profile(app, &profile_name, &url, game_filter)
-    }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
+    }).await.unwrap_or_else(|e| Err(format!("РћС€РёР±РєР° РїРѕС‚РѕРєР°: {}", e)))
 }
 
 #[tauri::command]
 async fn test_dns(url: String, dns_ip: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         testing::test_dns(&url, &dns_ip)
-    }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
+    }).await.unwrap_or_else(|e| Err(format!("РћС€РёР±РєР° РїРѕС‚РѕРєР°: {}", e)))
 }
 
 #[tauri::command]
 async fn run_diagnostics(app: AppHandle, url: String, game_filter: bool) -> Result<diagnostics::DiagnosticsReport, String> {
     tauri::async_runtime::spawn_blocking(move || {
         diagnostics::run_diagnostics(app, url, game_filter)
-    }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
+    }).await.unwrap_or_else(|e| Err(format!("РћС€РёР±РєР° РїРѕС‚РѕРєР°: {}", e)))
 }
 
 #[tauri::command]
@@ -100,38 +100,38 @@ fn read_hosts() -> Result<String, String> {
     hosts::read_hosts()
 }
 
-/// Авто-проверка после записи в hosts: реально ли сайт открывается через этот IP.
+/// РђРІС‚Рѕ-РїСЂРѕРІРµСЂРєР° РїРѕСЃР»Рµ Р·Р°РїРёСЃРё РІ hosts: СЂРµР°Р»СЊРЅРѕ Р»Рё СЃР°Р№С‚ РѕС‚РєСЂС‹РІР°РµС‚СЃСЏ С‡РµСЂРµР· СЌС‚РѕС‚ IP.
 #[tauri::command]
 fn verify_site_via_ip(host: String, ip: String) -> Result<String, String> {
     use std::net::IpAddr;
     use std::str::FromStr;
     let ip = IpAddr::from_str(ip.trim())
-        .map_err(|_| format!("«{}» — не похоже на IP-адрес", ip))?;
+        .map_err(|_| format!("В«{}В» вЂ” РЅРµ РїРѕС…РѕР¶Рµ РЅР° IP-Р°РґСЂРµСЃ", ip))?;
     let host = hosts::normalize_domain_public(&host)?;
     match site_probe::probe_https_by_ip(&host, ip) {
         crate::diagnostics_probe::HttpResult::Ok(code) => {
-            Ok(format!("✅ Сайт {} открывается через {} (HTTP {})", host, ip, code))
+            Ok(format!("вњ… РЎР°Р№С‚ {} РѕС‚РєСЂС‹РІР°РµС‚СЃСЏ С‡РµСЂРµР· {} (HTTP {})", host, ip, code))
         }
         crate::diagnostics_probe::HttpResult::BlockPage => {
-            Ok(format!("⚠️ {} через {} — страница блокировки (403/451/заглушка)", ip, host))
+            Ok(format!("вљ пёЏ {} С‡РµСЂРµР· {} вЂ” СЃС‚СЂР°РЅРёС†Р° Р±Р»РѕРєРёСЂРѕРІРєРё (403/451/Р·Р°РіР»СѓС€РєР°)", ip, host))
         }
         crate::diagnostics_probe::HttpResult::Rst => {
-            Ok(format!("🚫 {} — HTTPS сброшен (RST). Блок по SNI/IP: подмена в hosts не поможет, нужен обход (winws).", ip))
+            Ok(format!("рџљ« {} вЂ” HTTPS СЃР±СЂРѕС€РµРЅ (RST). Р‘Р»РѕРє РїРѕ SNI/IP: РїРѕРґРјРµРЅР° РІ hosts РЅРµ РїРѕРјРѕР¶РµС‚, РЅСѓР¶РµРЅ РѕР±С…РѕРґ (winws).", ip))
         }
         crate::diagnostics_probe::HttpResult::Tls => {
-            Ok(format!("🔐 {} — TLS-рукопожатие сломалось", ip))
+            Ok(format!("рџ”ђ {} вЂ” TLS-СЂСѓРєРѕРїРѕР¶Р°С‚РёРµ СЃР»РѕРјР°Р»РѕСЃСЊ", ip))
         }
         crate::diagnostics_probe::HttpResult::BadCert => {
-            Ok(format!("⚠️ {} — сертификат невалиден для {}", ip, host))
+            Ok(format!("вљ пёЏ {} вЂ” СЃРµСЂС‚РёС„РёРєР°С‚ РЅРµРІР°Р»РёРґРµРЅ РґР»СЏ {}", ip, host))
         }
         crate::diagnostics_probe::HttpResult::Timeout => {
-            Ok(format!("⏳ {} — таймаут соединения", ip))
+            Ok(format!("вЏі {} вЂ” С‚Р°Р№РјР°СѓС‚ СЃРѕРµРґРёРЅРµРЅРёСЏ", ip))
         }
         crate::diagnostics_probe::HttpResult::Dns => {
-            Ok(format!("ℹ️ {} — DNS-ошибка", ip))
+            Ok(format!("в„№пёЏ {} вЂ” DNS-РѕС€РёР±РєР°", ip))
         }
         crate::diagnostics_probe::HttpResult::Other(m) => {
-            Ok(format!("ℹ️ {} — {}", ip, m))
+            Ok(format!("в„№пёЏ {} вЂ” {}", ip, m))
         }
     }
 }
@@ -160,8 +160,8 @@ fn main() {
             verify_site_via_ip
         ])
         .on_window_event(|_window, event| {
-            // При закрытии окна гасим обход и выгружаем драйвер WinDivert,
-            // чтобы он не оставался в памяти и не блокировал файлы при обновлении.
+            // РџСЂРё Р·Р°РєСЂС‹С‚РёРё РѕРєРЅР° РіР°СЃРёРј РѕР±С…РѕРґ Рё РІС‹РіСЂСѓР¶Р°РµРј РґСЂР°Р№РІРµСЂ WinDivert,
+            // С‡С‚РѕР±С‹ РѕРЅ РЅРµ РѕСЃС‚Р°РІР°Р»СЃСЏ РІ РїР°РјСЏС‚Рё Рё РЅРµ Р±Р»РѕРєРёСЂРѕРІР°Р» С„Р°Р№Р»С‹ РїСЂРё РѕР±РЅРѕРІР»РµРЅРёРё.
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 let _ = process::stop_winws();
             }
