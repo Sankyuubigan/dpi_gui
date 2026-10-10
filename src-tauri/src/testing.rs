@@ -112,7 +112,8 @@ pub fn test_dns(url: &str, dns_ip: &str) -> Result<String, String> {
         let doh_host = doh_url.host_str()
             .ok_or("Не удалось извлечь хост из DoH-резолвера")?
             .to_string();
-        let ips = diagnostics_probe::resolve_via_doh(&domain, &doh_host);
+        let ips = diagnostics_probe::resolve_via_doh(&domain, &doh_host)
+            .map_err(|e| format!("DoH-резолвер {}: {}", doh_host, e))?;
         resolved_ip = ips.first().copied().ok_or_else(|| {
             format!("DoH-резолвер {} не вернул IP для {}. Возможно DNS-цензура или сервис недоступен.", doh_host, domain)
         })?;

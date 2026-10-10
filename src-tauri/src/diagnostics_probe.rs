@@ -323,28 +323,34 @@ pub fn dns_multi(domain: &str) -> DnsInfo {
 /// DoH-сервисы для проверки «подмены DNS»: возвращают настоящие IP в обход
 /// отравленного/перехваченного DNS. Используются и в тесте подмены DNS, и в
 /// автоматической проверке при анализе доменов.
-pub const DOH_RESOLVERS: &[&str] = &["xbox-dns.ru", "geohide.ru"];
+pub const DOH_RESOLVERS: &[&str] = &["xbox-dns.ru", "geohide.ru", "dns.comss.one"];
 
 /// Резолвит хост DoH-сервера (бутстрап): сначала системный DNS, при неудаче —
 /// публичный 1.1.1.1 (UDP). Без него нельзя узнать IP, на который Https-клиент
 /// trust-dns должен идти по 443.
-fn bootstrap_doh_host(host: &str) -> Vec<IpAddr> {
+fn bootstrap_doh_host(host: &str) -> Result<Vec<IpAddr>, String> {
     let mut ips = resolve_system(host);
     if ips.is_empty() {
         ips = resolve_via(host, "1.1.1.1");
     }
-    ips
+    if ips.is_empty() {
+        return Err(format!(
+            "не удалось разрешить имя DoH-сервера {} ни системным DNS, ни 1.1.1.1",
+            host
+        ));
+    }
+    Ok(ips)
 }
 
 /// Резолв домена через DNS-over-HTTPS (RFC 8484, путь `/dns-query`).
 /// `doh_host` — имя DoH-сервиса (например, "geohide.ru"). Бутстрап хоста
 /// делается системным DNS (fallback 1.1.1.1), затем запрос уходит по HTTPS.
-/// Выполняется с жёстким таймаутом внутри потока — зависший DoH не вешает вызов.
-pub fn resolve_via_doh(domain: &str, doh_host: &str) -> Vec<IpAddr> {
-    let bootstrap = bootstrap_doh_host(doh_host);
-    if bootstrap.is_empty() {
-        return vec![];
-    }
+///
+/// Возвращает `Err` с реальной причиной при любом сбое. Пустой список «без
+/// объяснения» невозможен: отчёт обязан отличать «сервис недоступен» от
+/// «сервис не вернул адресов» (core rules §2.2 — запрет молчаливых ошибок).
+pub fn resolve_via_doh(domain: &str, doh_host: &str) -> Result<Vec<IpAddr>, String> {
+    let bootstrap = bootstrap_doh_host(doh_host)?;
 
     let mut cfg = ResolverConfig::new();
     for ip in bootstrap {
@@ -362,21 +368,23 @@ pub fn resolve_via_doh(domain: &str, doh_host: &str) -> Vec<IpAddr> {
     opts.attempts = 1;
 
     let domain = domain.to_string();
+    let svc = doh_host.to_string();
     run_with_timeout(
         move || {
-            if let Ok(r) = Resolver::new(cfg, opts) {
-                if let Ok(resp) = r.lookup_ip(&domain) {
-                    let ips: Vec<IpAddr> = resp.iter().collect();
-                    if !ips.is_empty() {
-                        return ips;
-                    }
-                }
+            let resolver = Resolver::new(cfg, opts)
+                .map_err(|e| format!("не удалось создать DoH-клиент: {}", e))?;
+            let resp = resolver
+                .lookup_ip(&domain)
+                .map_err(|e| format!("запрос не выполнен: {}", e))?;
+            let ips: Vec<IpAddr> = resp.iter().collect();
+            if ips.is_empty() {
+                return Err("сервис вернул пустой ответ".to_string());
             }
-            vec![]
+            Ok(ips)
         },
         8000,
     )
-    .unwrap_or_default()
+    .unwrap_or_else(|| Err(format!("сервис {} не ответил за 8 с (таймаут)", svc)))
 }
 
 /// Есть ли у пользователя рабочий IPv6 до целевого домена (winws только IPv4).

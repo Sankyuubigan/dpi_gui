@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::analyzer_probe::Classification;
@@ -216,14 +215,25 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
     log.push_str(&format!("  DNS (система):      {}\n", sys));
     log.push_str(&format!("  DNS (1.1.1.1):      {}\n", cf));
     log.push_str(&format!("  DNS (8.8.8.8):      {}\n", gg));
-    log.push_str(&format!(
-        "  DNS-цензура:        {}\n",
-        if probe.dns_consistent {
-            "не обнаружена"
-        } else {
-            "ПОДОЗРЕНИЕ НА ЦЕНЗУРУ (системный DNS расходится с публичными)"
-        }
-    ));
+    // DNS-цензура. Раньше здесь стояло «не обнаружена», если системный DNS
+    // что-то вернул, — но подменённый ответ неотличим от настоящего по форме,
+    // и подмена проходила как норма. Теперь вывод опирается на сверку UDP:53
+    // с DoH (probe.dns_spoofed), а если сверка невозможна — так и пишем.
+    let dns_state = match (&probe.dns_spoofed, probe.dns_consistent) {
+        (Some(_), _) => "ОБНАРУЖЕНА ПОДМЕНА DNS (см. строку ниже)".to_string(),
+        (None, false) => "ПОДОЗРЕНИЕ НА ЦЕНЗУРУ (системный DNS расходится с публичными)".to_string(),
+        (None, true) => "расхождений системного DNS с DoH не найдено".to_string(),
+    };
+    log.push_str(&format!("  DNS-цензура:        {}\n", dns_state));
+    if let Some(spoof) = &probe.dns_spoofed {
+        log.push_str(&format!("  ⚠️ UDP:53 перехвачен: {}\n", spoof));
+        log.push_str("     адреса из строки «DNS (система)» и из «IP apex» недостоверны\n");
+    }
+
+    // Подмена редиректа провайдером — самый точный признак блокировки.
+    if let Some(isp) = &probe.isp_redirect {
+        log.push_str(&format!("  🚫 Подмена ответа оператором: {}\n", isp));
+    }
 
     // Apex и www — РАЗНЫЕ строки: их различие и есть главная подсказка.
     let prim = if probe.primary_ips.is_empty() {
@@ -247,15 +257,23 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
     }
 
     log.push_str(&format!("  Соединение главного IP:    {}\n", probe.http_note));
+    // Раньше строка называлась «Рабочий IP» и печаталась всегда, даже когда
+    // через адрес ничего не открывается. Название обязано соответствовать
+    // факту: адрес с живым TCP:443, но рвущимся HTTPS не является рабочим.
     if let Some(ip) = &probe.working_ip {
-        let status = if probe.http_note.contains("RST") {
-            "TCP:443 жив, но HTTPS RST — блок по SNI/IP, подмена в hosts не поможет"
+        if probe.http_note.contains("RST") {
+            log.push_str(&format!(
+                "  IP с открытым TCP:443: {} (HTTPS рвётся — через него сайт НЕ открывается)\n",
+                ip
+            ));
         } else if probe.http_note.contains("таймаут") || probe.http_note.contains("timeout") {
-            "TCP:443 жив, HTTPS таймаут"
+            log.push_str(&format!(
+                "  IP с открытым TCP:443: {} (HTTPS таймаут — сайт не проверен)\n",
+                ip
+            ));
         } else {
-            "TCP:443 жив"
-        };
-        log.push_str(&format!("  Рабочий IP:          {} ({})\n", ip, status));
+            log.push_str(&format!("  Рабочий IP:          {} ({})\n", ip, "сайт открывается"));
+        }
     } else {
         log.push_str("  Рабочий IP:          не найден\n");
     }
@@ -421,17 +439,48 @@ fn write_broken(log: &mut String, meta: &ReportMeta, c: &Classification) {
     log.push('\n');
 }
 
+/// Статус домена из списка обхода — строго по результатам проб.
+///
+/// Раньше здесь стояла константа «работает, трогать не обязательно»: она
+/// печаталась всегда, стоило домену просто лежать в списке, и домены, которые
+/// в момент анализа не открывались, отчитывались как исправные. Теперь
+/// формулировка выводится из корзин реальной классификации, а непроверенный
+/// домен честно помечается как непроверенный.
+fn bypass_entry_verdict(domain: &str, c: &Classification) -> String {
+    let broken = c
+        .bypass_breaks
+        .iter()
+        .any(|(h, _)| h == domain)
+        || c.broken.iter().any(|h| h == domain);
+    let ok = c.ok.iter().any(|h| h == domain);
+    let dns = c.dns_fail.iter().any(|h| h == domain);
+    let need = c.need_bypass.iter().any(|h| h == domain);
+
+    // Порядок важен: сначала «ломал сайт», потом «не открылся», и только
+    // потом «работает» — иначе домен, сломанный обходом, был бы помечен
+    // исправным.
+    if broken {
+        "ЛОМАЕТ САЙТ, проверьте обход для этого домена".to_string()
+    } else if ok {
+        "проверен, сайт открывается".to_string()
+    } else if dns {
+        "не резолвится (проверено, домен в обходе не поможет)".to_string()
+    } else if need {
+        "не открывается, остаётся в обходе".to_string()
+    } else {
+        "этим прогоном не проверялся".to_string()
+    }
+}
+
 fn write_already_in_bypass(log: &mut String, meta: &ReportMeta, c: &Classification) {
     let bypass_map = bypass_lists::load_bypass_domains();
     let bypass_matches = bypass_lists::find_bypass_matches(&meta.discovered, &bypass_map);
-    let broken_set: HashSet<String> = c.bypass_breaks.iter().map(|(h, _)| h.clone()).collect();
 
     log.push_str("🗑️ ДОМЕНЫ САЙТА, УЖЕ ВНЕСЁННЫЕ В ОБХОД (проверьте, не ломают ли они сайт):\n");
     if bypass_matches.is_empty() {
         log.push_str("  - (пусто) ни один домен сайта не найден в списках обхода\n");
     } else {
         for (domain, files) in &bypass_matches {
-            let also_broken = broken_set.contains(domain);
             let mut labels: Vec<String> = Vec::new();
             for f in files {
                 let path = f.to_string_lossy().replace("\\", "/");
@@ -441,25 +490,15 @@ fn write_already_in_bypass(log: &mut String, meta: &ReportMeta, c: &Classificati
                     labels.push(format!("список обхода {}", path));
                 }
             }
-            if also_broken {
-                log.push_str(&format!(
-                    "  - {}   (в {} — ЛОМАЕТ САЙТ, удалите из обхода в приоритете!)\n",
-                    domain,
-                    labels.join(", ")
-                ));
-            } else if is_builtin(files.first().unwrap()) {
-                log.push_str(&format!(
-                    "  - {}   (в {} — встроенный, перезаписывается при запуске; работает, трогать не обязательно)\n",
-                    domain,
-                    labels.join(", ")
-                ));
+            let builtin = if files.first().map(is_builtin).unwrap_or(false) {
+                " (встроенный, перезаписывается при запуске)"
             } else {
-                log.push_str(&format!(
-                    "  - {}   (в {} — работает, трогать не обязательно)\n",
-                    domain,
-                    labels.join(", ")
-                ));
-            }
+                ""
+            };
+            let where_ = format!("{}{}", labels.join(", "), builtin);
+            let verdict = bypass_entry_verdict(domain, c);
+
+            log.push_str(&format!("  - {}   (в {} — {})\n", domain, where_, verdict));
         }
     }
     log.push('\n');
@@ -509,6 +548,7 @@ mod tests {
                 apex_ip: Some("216.150.1.1"),
                 dns_consistent: true,
                 same_host_alt_ip_works: false,
+                isp_redirect: None,
             },
         );
         let mut dns = DnsInfo::new();
@@ -524,6 +564,8 @@ mod tests {
             www_host: Some("www.cactuscompute.com".to_string()),
             www_ips: vec!["216.150.16.65".to_string()],
             www_url: Some(www_url.to_string()),
+            isp_redirect: None,
+            dns_spoofed: None,
             diagnosis: Some(diagnosis),
         }
     }
@@ -599,5 +641,85 @@ let log = build_report(&meta_with(p), &empty_classification());
         let log = build_report(&meta_with(p), &empty_classification());
         assert!(log.contains("ДОСТУПЕН"), "{}", log);
         assert!(!log.contains("ВЕРОЯТНАЯ ПРИЧИНА"), "{}", log);
+    }
+
+    // --- Regression: the report must not claim "no censorship" when the
+    //     system answer was proven to disagree with DoH. ---
+
+    #[test]
+    fn spoofed_dns_is_never_reported_as_clean() {
+        let mut p = www_only_probe();
+        p.dns_consistent = true;
+        p.dns_spoofed = Some("системный DNS вернул 188.186.154.88, DoH-резолверы — 104.21.95.93, 172.67.144.20 (пересечений нет)".to_string());
+        let log = build_report(&meta_with(p), &empty_classification());
+        assert!(log.contains("ОБНАРУЖЕНА ПОДМЕНА DNS"), "{}", log);
+        assert!(!log.contains("не обнаружена"), "{}", log);
+        assert!(log.contains("UDP:53 перехвачен"), "{}", log);
+        // The untrusted addresses must be called out as untrusted.
+        assert!(log.contains("недостоверны"), "{}", log);
+    }
+
+    #[test]
+    fn clean_dns_says_no_discrepancy_found() {
+        let log = build_report(&meta_with(www_only_probe()), &empty_classification());
+        assert!(log.contains("не найдено"), "{}", log);
+        assert!(!log.contains("не обнаружена"), "{}", log);
+    }
+
+    #[test]
+    fn isp_redirect_is_shown_in_report() {
+        let mut p = www_only_probe();
+        p.verdict = Verdict::IspBlockRedirect;
+        p.isp_redirect = Some("cactuscompute.com -> lawfilter.ertelecom.ru".to_string());
+        let log = build_report(&meta_with(p), &empty_classification());
+        assert!(log.contains("lawfilter.ertelecom.ru"), "{}", log);
+        assert!(log.contains("Подмена ответа оператором"), "{}", log);
+    }
+
+    /// Regression: "работает, трогать не обязательно" was printed unconditionally.
+    /// A domain that did not open must never carry that verdict.
+    #[test]
+    fn broken_domain_in_bypass_is_not_called_working() {
+        let mut c = empty_classification();
+        c.broken = vec!["site.example".to_string()];
+        let v = bypass_entry_verdict("site.example", &c);
+        assert!(v.contains("ЛОМАЕТ САЙТ"), "{}", v);
+        assert!(!v.contains("работает"), "{}", v);
+    }
+
+    #[test]
+    fn bypass_breaks_domain_is_not_called_working() {
+        let mut c = empty_classification();
+        c.bypass_breaks = vec![("site.example".to_string(), "сломан обходом".to_string())];
+        let v = bypass_entry_verdict("site.example", &c);
+        assert!(v.contains("ЛОМАЕТ САЙТ"), "{}", v);
+    }
+
+    /// Broken wins over ok: if the same domain landed in both baskets, saying
+    /// "works" would hide a real breakage.
+    #[test]
+    fn broken_wins_over_ok() {
+        let mut c = empty_classification();
+        c.ok = vec!["site.example".to_string()];
+        c.broken = vec!["site.example".to_string()];
+        let v = bypass_entry_verdict("site.example", &c);
+        assert!(v.contains("ЛОМАЕТ САЙТ"), "{}", v);
+    }
+
+    #[test]
+    fn probed_working_domain_is_reported_working() {
+        let mut c = empty_classification();
+        c.ok = vec!["site.example".to_string()];
+        let v = bypass_entry_verdict("site.example", &c);
+        assert!(v.contains("открывается"), "{}", v);
+    }
+
+    #[test]
+    fn unverified_domain_in_bypass_is_not_called_working() {
+        // Nothing was probed for this domain, so the report must not claim it
+        // works — "не проверялся" is the only honest wording.
+        let v = bypass_entry_verdict("site.example", &empty_classification());
+        assert!(v.contains("не проверялся"), "{}", v);
+        assert!(!v.contains("работает"), "{}", v);
     }
 }

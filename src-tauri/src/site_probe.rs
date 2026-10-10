@@ -22,6 +22,10 @@ pub enum Verdict {
     BadCert,
     DnsBlocked,
     BlockPage,
+    /// Оператор связи подменил ответ редиректом на страницу блокировки (РКН).
+    /// Виден только на порту 80: запрос уходит, но ответ приходит не от
+    /// сервера, а от провайдера. По HTTPS провайдер рвёт соединение.
+    IspBlockRedirect,
     NoPath,
     Unknown,
 }
@@ -43,6 +47,7 @@ impl Verdict {
             Verdict::BadCert => "НЕВАЛИДНЫЙ СЕРТИФИКАТ",
             Verdict::DnsBlocked => "DNS-ПОДМЕНА",
             Verdict::BlockPage => "СТРАНИЦА БЛОКИРОВКИ",
+            Verdict::IspBlockRedirect => "БЛОКИРОВКА ОПЕРАТОРОМ (РКН)",
             Verdict::NoPath => "НЕТ ПУТИ",
             Verdict::Unknown => "ПРИЧИНА НЕ ЯСНА",
         }
@@ -63,6 +68,13 @@ pub struct DomainProbe {
     pub www_ips: Vec<String>,
     /// Готовый URL, который точно открывается (только при `Verdict::WwwOnly`).
     pub www_url: Option<String>,
+    /// Хост, на который провайдер подменил редирект вместо ответа сервера.
+    /// Заполняется только при `Verdict::IspBlockRedirect`.
+    pub isp_redirect: Option<String>,
+    /// Доказательства перехвата UDP:53 (расхождение системного DNS с DoH).
+    /// `None` означает «перехват не обнаружен» либо «DoH недоступен и
+    /// сравнивать не с чем» — в обоих случаях отчёт обязан это оговорить.
+    pub dns_spoofed: Option<String>,
     /// Разбор причины и подсказки; `None`, если сайт доступен.
     pub diagnosis: Option<Diagnosis>,
 }
@@ -77,6 +89,96 @@ fn dedup_ips(addrs: impl Iterator<Item = IpAddr>) -> Vec<String> {
         }
     }
     out
+}
+
+/// Регистрируемый домен: последние две метки (`example.co.uk` схлопывается
+/// частично, но для сравнения «свой домен vs чужой» этого достаточно).
+fn registrable_domain(host: &str) -> String {
+    let labels: Vec<&str> = host.trim_end_matches('.').split('.').collect();
+    if labels.len() <= 2 {
+        return host.to_ascii_lowercase();
+    }
+    labels[labels.len() - 2..]
+        .join(".")
+        .to_ascii_lowercase()
+}
+
+/// Хост редиректа, на который провайдер подменил ответ вместо ответа сервера.
+///
+/// Операторы блокировки отвечают на порт 80 раньше, чем запрос дойдёт до
+/// сервера: подставляют `302` на страницу РКН (`lawfilter.ertelecom.ru` и
+/// подобные). По HTTPS такого ответа нет — там соединение просто рвут, поэтому
+/// без этой пробы причина блокировки остаётся нераспознанной.
+///
+/// Легальный редирект `apex -> www` остаётся внутри того же регистрируемого
+/// домена и подменой не считается.
+fn probe_isp_redirect(host: &str, ip: IpAddr) -> Option<String> {
+    let client = Client::builder()
+        // Редирект не следуем: нам нужен сам заголовок Location.
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(host, SocketAddr::new(ip, 80))
+        .timeout(Duration::from_secs(6))
+        .build()
+        .ok()?;
+
+    let resp = client.get(format!("http://{}/", host)).send().ok()?;
+    let status = resp.status().as_u16();
+    if !(300..=399).contains(&status) {
+        return None;
+    }
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)?
+        .to_str()
+        .ok()?;
+    let target = url::Url::parse(location).ok()?;
+    let target_host = target.host_str()?.to_string();
+
+    if registrable_domain(&target_host) == registrable_domain(host) {
+        return None;
+    }
+    Some(format!("{} -> {}", host, target_host))
+}
+
+/// Сверка системного DNS (UDP:53) с DoH: доказательство перехвата UDP:53.
+///
+/// UDP:53 перехватывается по дороге, и подменённый ответ ничем не отличается от
+/// настоящего по форме — единственный способ это заметить: сравнить с ответом
+/// по защищённому каналу. Возвращает `None`, если перехвата не видно **или**
+/// DoH недоступен; во втором случае отчёт обязан сказать, что сравнение не
+/// проводилось, а не «цензуры нет».
+fn detect_udp_spoofing(host: &str, dns: &DnsInfo) -> Option<String> {
+    let mut doh: HashSet<IpAddr> = HashSet::new();
+    for service in DOH_RESOLVERS {
+        if let Ok(ips) = resolve_via_doh(host, service) {
+            doh.extend(ips);
+        }
+    }
+    if doh.is_empty() {
+        return None;
+    }
+    let sys: HashSet<IpAddr> = dns.system.iter().copied().collect();
+
+    let list = |set: &HashSet<IpAddr>| {
+        let mut v: Vec<String> = set.iter().map(|i| i.to_string()).collect();
+        v.sort();
+        v.join(", ")
+    };
+
+    if sys.is_empty() {
+        return Some(format!(
+            "системный DNS не вернул адрес, а DoH-резолверы вернули: {}",
+            list(&doh)
+        ));
+    }
+    if doh.is_disjoint(&sys) {
+        return Some(format!(
+            "системный DNS вернул {}, DoH-резолверы — {} (пересечений нет)",
+            list(&sys),
+            list(&doh)
+        ));
+    }
+    None
 }
 
 fn http_via_ip(host: &str, ip: IpAddr) -> HttpResult {
@@ -122,6 +224,7 @@ fn http_via_ip(host: &str, ip: IpAddr) -> HttpResult {
 /// * `alt_ok` — хотя бы один «альтернативный» IP (www + DoH) ответил на TCP:443.
 /// * `any_reset` — среди всех попыток было RST.
 /// * `http` — результат HTTPS-запроса через первый рабочий IP.
+/// * `www_ok` — домен открывается только под именем с префиксом `www.`.
 pub fn classify(
     dns_consistent: bool,
     primary_ok: bool,
@@ -132,7 +235,7 @@ pub fn classify(
 ) -> Verdict {
     // Сначала — фактическая работоспособность сайта. Даже если DNS-списки
     // разных резолверов отличаются (нормальный anycast у крупных CDN), сайт
-/// * `www_ok` — домен открывается только под именем с префиксом `www.`.
+    // может открываться — это не цензура.
     match http {
         Some(HttpResult::Ok(_)) => {
             return if primary_ok {
@@ -148,9 +251,9 @@ pub fn classify(
         _ => {}
     }
 
-/// Сначала — фактическая работоспособность сайта. Даже если DNS-списки
-/// разных резолверов отличаются (нормальный anycast у крупных CDN), сайт
-/// может открываться — это не цензура.
+// Сначала — фактическая работоспособность сайта. Даже если DNS-списки
+    // разных резолверов отличаются (нормальный anycast у крупных CDN), сайт
+    // может открываться — это не цензура.
     if www_ok {
         return Verdict::WwwOnly;
     }
@@ -245,7 +348,7 @@ pub fn probe_domain(host: &str) -> DomainProbe {
         http_note = format!("HTTPS через {} не прошёл: {}", www_host, http_result_note(&http.as_ref().unwrap()));
     }
 
-    let verdict = classify(
+    let base_verdict = classify(
         dns_consistent,
         primary_tcp_ok,
         alt_tcp_ok,
@@ -253,6 +356,22 @@ pub fn probe_domain(host: &str) -> DomainProbe {
         http.as_ref(),
         www_ok,
     );
+
+    // Проба порта 80: ловим подмену редиректа провайдером. Запускаем только
+    // когда HTTPS не дал рабочего ответа — при живом сайте она ничего не скажет
+    // и лишь замедлит проверку.
+    let isp_redirect: Option<String> = if base_verdict != Verdict::Open {
+        primary_ips
+            .iter()
+            .chain(doh_ips.iter())
+            .filter_map(|ip| ip.parse::<IpAddr>().ok())
+            .take(4)
+            .find_map(|ip| probe_isp_redirect(host, ip))
+    } else {
+        None
+    };
+
+    let verdict = refine_with_isp_redirect(base_verdict, isp_redirect.as_deref());
 
     let apex_ip = primary_ips.first().cloned();
     let diagnosis = explain(
@@ -263,8 +382,14 @@ pub fn probe_domain(host: &str) -> DomainProbe {
             apex_ip: apex_ip.as_deref(),
             dns_consistent,
             same_host_alt_ip_works,
+            isp_redirect: isp_redirect.as_deref(),
         },
     );
+
+    // Сверка UDP:53 с DoH — единственный способ увидеть подмену DNS. Делаем
+    // всегда, даже когда сайт открылся: «цензуры не найдено» должно означать
+    // «проверили», а не «не догадались».
+    let dns_spoofed = detect_udp_spoofing(host, &dns);
 
     DomainProbe {
         host: host.to_string(),
@@ -277,6 +402,8 @@ pub fn probe_domain(host: &str) -> DomainProbe {
         www_host: if is_www { None } else { Some(www_host) },
         www_ips,
         www_url,
+        isp_redirect,
+        dns_spoofed,
         diagnosis: Some(diagnosis),
     }
 }
@@ -311,17 +438,19 @@ pub fn probe_https_by_ip(host: &str, ip: IpAddr) -> HttpResult {
 pub fn check_dns_substitution(host: &str, probe_http: bool) -> Vec<DnsSubstitution> {
     let mut out = Vec::new();
     for service in DOH_RESOLVERS {
-        let ips = resolve_via_doh(host, service);
-        if ips.is_empty() {
-            out.push(DnsSubstitution {
-                service: service.to_string(),
-                resolved: vec![],
-                working_ip: None,
-                http_note: "не вернул IP-адресов (DoH недоступен или не резолвит)".to_string(),
-                http_ok: false,
-            });
-            continue;
-        }
+        let ips = match resolve_via_doh(host, service) {
+            Ok(ips) => ips,
+            Err(e) => {
+                out.push(DnsSubstitution {
+                    service: service.to_string(),
+                    resolved: vec![],
+                    working_ip: None,
+                    http_note: format!("ошибка DoH: {}", e),
+                    http_ok: false,
+                });
+                continue;
+            }
+        };
         let display: Vec<String> = ips.iter().take(4).map(|i| i.to_string()).collect();
 
         let mut working: Option<IpAddr> = None;
@@ -413,6 +542,7 @@ mod tests {
             apex_ip,
             dns_consistent: true,
             same_host_alt_ip_works: false,
+            isp_redirect: None,
         }
     }
 
@@ -461,6 +591,67 @@ mod tests {
         assert_eq!(
             classify(true, false, false, true, None, false),
             Verdict::IpReset
+        );
+    }
+
+    // --- ISP redirect on port 80: the cause RST alone cannot name. ---
+
+    #[test]
+    fn isp_redirect_upgrades_rst_to_named_block() {
+        assert_eq!(
+            refine_with_isp_redirect(Verdict::IpReset, Some("host -> lawfilter.example")),
+            Verdict::IspBlockRedirect
+        );
+    }
+
+    #[test]
+    fn rst_without_redirect_stays_generic() {
+        assert_eq!(
+            refine_with_isp_redirect(Verdict::IpReset, None),
+            Verdict::IpReset
+        );
+    }
+
+    #[test]
+    fn isp_redirect_does_not_touch_working_site() {
+        // A site that opens over HTTPS must never be reported as blocked just
+        // because an operator also answers on port 80.
+        assert_eq!(
+            refine_with_isp_redirect(Verdict::Open, Some("host -> lawfilter.example")),
+            Verdict::Open
+        );
+    }
+
+    #[test]
+    fn isp_block_redirect_says_hosts_wont_help_and_asks_for_bypass() {
+        let mut c = ctx("example.com", None, Some("1.2.3.4"));
+        c.isp_redirect = Some("example.com -> lawfilter.ertelecom.ru");
+        let d = explain(Verdict::IspBlockRedirect, &c);
+        assert!(
+            d.probable_cause.contains("lawfilter.ertelecom.ru"),
+            "{}",
+            d.probable_cause
+        );
+        assert!(
+            d.wont_help.iter().any(|a| a.contains("hosts")),
+            "{:?}",
+            d.wont_help
+        );
+        assert!(
+            d.do_this.iter().any(|a| a.contains("обход")),
+            "{:?}",
+            d.do_this
+        );
+    }
+
+    #[test]
+    fn registrable_domain_ignores_www_and_case() {
+        assert_eq!(registrable_domain("www.nnmclub.to"), "nnmclub.to");
+        assert_eq!(registrable_domain("NNMClub.TO"), "nnmclub.to");
+        // A block page lives in a different registrable domain — that is the signal.
+        assert_ne!(
+            registrable_domain("nnmclub.to"),
+            registrable_domain("lawfilter.ertelecom.ru")
         );
     }
 
@@ -656,6 +847,8 @@ pub struct CauseContext<'a> {
     pub dns_consistent: bool,
     /// Для того же домена нашёлся рабочий IP через DoH.
     pub same_host_alt_ip_works: bool,
+    /// Хост, на который провайдер подменил редирект вместо ответа сервера.
+    pub isp_redirect: Option<&'a str>,
 }
 
 /// Разбор причины: что, скорее всего, произошло и что с этим делать.
@@ -725,6 +918,20 @@ fn probe_host_at(
     }
 }
 
+/// Уточнение вердикта по данным пробы порта 80. Чистая функция —
+///
+/// RST сам по себе означает «соединение рвут», и причину не называет. Если
+/// при этом на 80-м порту приходит редирект на чужой домен, то причина
+/// установлена точно: блокирует оператор связи, а не сеть в целом. Это и
+/// более специфичный вердикт, и другое лечение — hosts и смена DNS тут
+/// бесполезны, помогает только обход.
+fn refine_with_isp_redirect(verdict: Verdict, isp_redirect: Option<&str>) -> Verdict {
+    match (verdict, isp_redirect) {
+        (Verdict::IpReset, Some(_)) => Verdict::IspBlockRedirect,
+        _ => verdict,
+    }
+}
+
 /// Разбор первопричины по вердикту. Только логика, без обращения к сети.
 pub fn explain(verdict: Verdict, ctx: &CauseContext) -> Diagnosis {
     let mut do_this = Vec::new();
@@ -778,6 +985,19 @@ pub fn explain(verdict: Verdict, ctx: &CauseContext) -> Diagnosis {
         Verdict::DnsBlocked => {
             "Системный DNS отдаёт для домена не те адреса, что публичные резолверы — такое расхождение бывает при подмене DNS."
                 .to_string()
+        }
+
+        Verdict::IspBlockRedirect => {
+            wont_help.push(
+                "Правка hosts и смена DNS не помогут: запрос вообще не доходит до сервера, ответ подставляет оператор связи.".to_string(),
+            );
+            match ctx.isp_redirect {
+                Some(r) => format!(
+                    "Домен «{}» в списке блокировок: оператор связи отвечает редиректом на {} вместо сайта. Ответ приходит не от сервера — это подмена на стороне провайдера, а не проблема домена.",
+                    ctx.host, r
+                ),
+                None => "Домен заблокирован оператором связи: вместо сайта приходит подставленный ответ.".to_string(),
+            }
         }
 
         Verdict::BlockPage => {
@@ -849,6 +1069,15 @@ pub fn explain(verdict: Verdict, ctx: &CauseContext) -> Diagnosis {
         );
         wont_help.push(
             "Смена DNS не поможет: страницу блокировки отдаёт сам провайдер, и адрес у неё тот же."
+                .to_string(),
+        );
+    } else if verdict == Verdict::IspBlockRedirect {
+        do_this.insert(
+            0,
+            "Включите профиль обхода DPI_GUI и откройте сайт снова.".to_string(),
+        );
+        do_this.push(
+            "Если обход уже включён — перезапустите его: блокировка в силе, а профиль не спас."
                 .to_string(),
         );
     } else if do_this.is_empty() && verdict != Verdict::WwwOnly {
