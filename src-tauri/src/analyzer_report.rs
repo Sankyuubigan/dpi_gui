@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use crate::analyzer_probe::Classification;
 use crate::bypass_lists;
-use crate::diagnostics_probe::DnsState;
-use crate::site_probe::{self, Verdict as SiteVerdict};
+use crate::diagnostics_probe::{DnsState, HttpResult};
+use crate::site_probe::{self, IpSource};
+use crate::site_verdict::Verdict as SiteVerdict;
 
 /// Дополнительная информация для отчёта, не связанная с классификацией доменов.
 pub struct ReportMeta {
@@ -209,20 +210,29 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
 
     // DNS-строка: различаем «NXDOMAIN», «резолвер не ответил» и реальный список IP,
     // иначе пустой публичный резолвер читается как отсутствие домена.
+    //
+    // Строки 1.1.1.1 / 8.8.8.8 идут ТОЖЕ по UDP:53, что и системный DNS, то есть
+    // по тому же перехватываемому каналу. При доказанной подмене их ответ —
+    // такой же подменённый, и показывать его без пометки значит выдать его за
+    // ответ Cloudflare/Google.
+    let untrusted = if probe.dns_spoofed.is_some() {
+        "  (UDP:53 перехвачен — ответ недостоверен)"
+    } else {
+        ""
+    };
     let sys = dns_label(&probe.dns.system, probe.dns.system_state);
     let cf = dns_label(&probe.dns.cloudflare, probe.dns.cloudflare_state);
     let gg = dns_label(&probe.dns.google, probe.dns.google_state);
-    log.push_str(&format!("  DNS (система):      {}\n", sys));
-    log.push_str(&format!("  DNS (1.1.1.1):      {}\n", cf));
-    log.push_str(&format!("  DNS (8.8.8.8):      {}\n", gg));
+    log.push_str(&format!("  DNS (система):      {}{}\n", sys, untrusted));
+    log.push_str(&format!("  DNS (1.1.1.1):      {}{}\n", cf, untrusted));
+    log.push_str(&format!("  DNS (8.8.8.8):      {}{}\n", gg, untrusted));
     // DNS-цензура. Раньше здесь стояло «не обнаружена», если системный DNS
     // что-то вернул, — но подменённый ответ неотличим от настоящего по форме,
     // и подмена проходила как норма. Теперь вывод опирается на сверку UDP:53
     // с DoH (probe.dns_spoofed), а если сверка невозможна — так и пишем.
-    let dns_state = match (&probe.dns_spoofed, probe.dns_consistent) {
-        (Some(_), _) => "ОБНАРУЖЕНА ПОДМЕНА DNS (см. строку ниже)".to_string(),
-        (None, false) => "ПОДОЗРЕНИЕ НА ЦЕНЗУРУ (системный DNS расходится с публичными)".to_string(),
-        (None, true) => "расхождений системного DNS с DoH не найдено".to_string(),
+    let dns_state = match &probe.dns_spoofed {
+        Some(_) => "ОБНАРУЖЕНА ПОДМЕНА DNS (см. строку ниже)".to_string(),
+        None => "расхождений системного DNS с DoH не найдено".to_string(),
     };
     log.push_str(&format!("  DNS-цензура:        {}\n", dns_state));
     if let Some(spoof) = &probe.dns_spoofed {
@@ -242,6 +252,12 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
         probe.primary_ips.join(", ")
     };
     log.push_str(&format!("  IP apex (системный DNS): {}\n", prim));
+    // Проверенные адреса из защищённого канала — именно их имеет смысл
+    // прописывать в hosts, и именно они отличают «подменённый адрес» от
+    // настоящего.
+    if !probe.doh_ips.is_empty() {
+        log.push_str(&format!("  IP через DoH (проверенные): {}\n", probe.doh_ips.join(", ")));
+    }
     if let Some(wh) = &probe.www_host {
         let www = if probe.www_ips.is_empty() {
             "(не резолвится)".to_string()
@@ -257,28 +273,74 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
     }
 
     log.push_str(&format!("  Соединение главного IP:    {}\n", probe.http_note));
-    // Раньше строка называлась «Рабочий IP» и печаталась всегда, даже когда
-    // через адрес ничего не открывается. Название обязано соответствовать
-    // факту: адрес с живым TCP:443, но рвущимся HTTPS не является рабочим.
-    if let Some(ip) = &probe.working_ip {
-        if probe.http_note.contains("RST") {
-            log.push_str(&format!(
-                "  IP с открытым TCP:443: {} (HTTPS рвётся — через него сайт НЕ открывается)\n",
-                ip
-            ));
-        } else if probe.http_note.contains("таймаут") || probe.http_note.contains("timeout") {
-            log.push_str(&format!(
-                "  IP с открытым TCP:443: {} (HTTPS таймаут — сайт не проверен)\n",
-                ip
-            ));
-        } else {
-            log.push_str(&format!("  Рабочий IP:          {} ({})\n", ip, "сайт открывается"));
-        }
-    } else {
-        log.push_str("  Рабочий IP:          не найден\n");
+    log.push_str(&working_ip_line(probe));
+    if !probe.doh_failures.is_empty() {
+        log.push_str(&format!(
+            "  ℹ️ Не ответили DoH-сервисы: {}\n",
+            probe.doh_failures.join("; ")
+        ));
     }
 
     log.push('\n');
+}
+
+/// Строка про адрес, по которому удалось достучаться до сервера.
+///
+/// Название строки обязано соответствовать факту. Раньше адрес с живым TCP:443,
+/// но рвущимся HTTPS печатался как «Рабочий IP (сайт открывается)» — это была
+/// прямая ложь: при `BadCert`/`Rst`/таймауте сайт через этот адрес НЕ
+/// открывается. Решение принимается по фактическому `HttpResult`, а не по
+/// разбору текста примечания.
+fn working_ip_line(probe: &site_probe::DomainProbe) -> String {
+    let ip = match &probe.working_ip {
+        Some(ip) => ip,
+        None => return "  Рабочий IP:          не найден\n".to_string(),
+    };
+    let source = match probe.working_ip_source {
+        Some(IpSource::Doh) => " (найден через DoH)",
+        Some(IpSource::SystemDns) => " (из системного DNS)",
+        None => "",
+    };
+    match &probe.working_http {
+        // Единственный случай, когда адрес честно называется рабочим.
+        Some(HttpResult::Ok(code)) => format!(
+            "  Рабочий IP:          {}{} (сайт открывается, HTTP {})\n",
+            ip, source, code
+        ),
+        Some(HttpResult::BadCert) => format!(
+            "  IP с открытым TCP:443: {}{} (сертификат не совпадает с именем домена — сайт НЕ открывается)\n",
+            ip, source
+        ),
+        Some(HttpResult::Rst) => format!(
+            "  IP с открытым TCP:443: {}{} (HTTPS рвётся — сайт НЕ открывается)\n",
+            ip, source
+        ),
+        Some(HttpResult::Tls) => format!(
+            "  IP с открытым TCP:443: {}{} (TLS-рукопожатие рвётся — сайт НЕ открывается)\n",
+            ip, source
+        ),
+        Some(HttpResult::Timeout) => format!(
+            "  IP с открытым TCP:443: {}{} (таймаут — сайт не проверен)\n",
+            ip, source
+        ),
+        Some(HttpResult::BlockPage) => format!(
+            "  IP с открытым TCP:443: {}{} (отдаёт страницу блокировки)\n",
+            ip, source
+        ),
+        Some(HttpResult::Dns) => format!(
+            "  IP с открытым TCP:443: {}{} (DNS-ошибка при обращении)\n",
+            ip, source
+        ),
+        Some(HttpResult::Other(m)) => format!(
+            "  IP с открытым TCP:443: {}{} (ошибка: {} — сайт НЕ открывается)\n",
+            ip, source, m
+        ),
+        // TCP отвечает, но HTTPS-запрос не выполнялся: утверждать нечего.
+        None => format!(
+            "  IP с открытым TCP:443: {}{} (HTTPS не проверен)\n",
+            ip, source
+        ),
+    }
 }
 
 /// Текст состояния DNS-резолвера для отчёта.
@@ -296,39 +358,50 @@ fn write_dns_substitution(log: &mut String, meta: &ReportMeta) {
     if meta.main_dns_sub.is_empty() {
         return;
     }
-    let host = meta.main_probe.as_ref().map(|p| p.host.clone()).unwrap_or_default();
+    let probe = meta.main_probe.as_ref();
 
     log.push_str("🔁 ПРОВЕРКА ПОДМЕНЫ DNS (обход отравленного DNS через DoH):\n");
     for sub in &meta.main_dns_sub {
         if sub.http_ok {
             log.push_str(&format!("  ✅ {} — {}\n", sub.service, sub.http_note));
+        } else if sub.resolved.is_empty() {
+            log.push_str(&format!("  ❌ {} — {}\n", sub.service, sub.http_note));
         } else {
-            if sub.resolved.is_empty() {
-                log.push_str(&format!("  ❌ {} — {}\n", sub.service, sub.http_note));
-            } else {
-                log.push_str(&format!(
-                    "  ❌ {} — {}. IP {} реально не открывают HTTPS (RST/таймаут — блок по SNI, а не DNS)\n",
-                    sub.service,
-                    sub.http_note,
-                    sub.resolved.join(", ")
-                ));
-            }
+            log.push_str(&format!(
+                "  ❌ {} — {}. IP {} реально не открывают HTTPS (RST/таймаут — блок по SNI, а не DNS)\n",
+                sub.service,
+                sub.http_note,
+                sub.resolved.join(", ")
+            ));
         }
     }
-    if let Some(sub) = meta.main_dns_sub.iter().find(|s| s.http_ok) {
-        log.push_str("  → ПОДМЕНА DNS РАБОТАЕТ. Сайт открывается через рабочий IP.\n");
-        if !host.is_empty() {
-            if let Some(ip) = &sub.working_ip {
-                log.push_str("    Добавьте в hosts (C:\\Windows\\System32\\drivers\\etc\\hosts):\n");
-                log.push_str(&format!("      {} {}\n", ip, host));
-                log.push_str(&format!("      {} www.{}\n", ip, host));
+
+    // Строки hosts берём из ЕДИНОГО места — `site_probe::hosts_entries`, того же,
+    // что использует блок «ВЕРОЯТНАЯ ПРИЧИНА». Раньше список собирался здесь
+    // отдельно и всегда подставлял `www.<host>` — для домена, который сам
+    // начинается с `www.`, это давало несуществующее имя `www.www.…`.
+    let entries = probe.map(site_probe::hosts_entries).unwrap_or_default();
+    let opens_by_name = probe
+        .map(|p| !p.verdict.site_broken() || p.verdict.needs_address_fix())
+        .unwrap_or(false);
+
+    if !entries.is_empty() {
+        log.push_str(&format!(
+            "  → ПРОВЕРЕННЫЙ АДРЕС НАЙДЕН. {}\n",
+            if opens_by_name {
+                "Сайт открывается по нему — если в браузере всё ещё не открывается, пропишите адрес в hosts:"
+            } else {
+                "Добавьте в hosts (C:\\Windows\\System32\\drivers\\etc\\hosts):"
             }
+        ));
+        for line in &entries {
+            log.push_str(&format!("      {}\n", line));
         }
         log.push_str("    Затем выполните: ipconfig /flushdns\n");
     } else {
         // Не советуем hosts, если ни один IP не дал валидного HTTPS: подсказка
         // «пропишите IP вручную» без доказанного рабочего адреса бесполезна.
-        log.push_str("  → Подмена DNS не помогла: ни один из найденных IP не отдал валидный HTTPS-ответ для этого имени.\n");
+        log.push_str("  → ПОДМЕНА DNS НЕ ПОМОГЛА: ни один из найденных IP не отдал валидный HTTPS-ответ для этого имени.\n");
         log.push_str("    Смена DNS и запись в hosts тут не помогут — ищите причину в блоке «ВЕРОЯТНАЯ ПРИЧИНА» выше.\n");
     }
     log.push('\n');
@@ -509,7 +582,8 @@ mod tests {
     use super::*;
     use crate::analyzer_probe::Classification;
     use crate::diagnostics_probe::{DnsInfo, DnsState};
-    use crate::site_probe::{CauseContext, DomainProbe, Verdict};
+    use crate::site_probe::{DomainProbe, IpSource};
+    use crate::site_verdict::{CauseContext, Verdict};
 
     fn empty_classification() -> Classification {
         Classification {
@@ -540,13 +614,14 @@ mod tests {
         let host = "cactuscompute.com";
         let www_url = "https://www.cactuscompute.com/";
         let verdict = Verdict::WwwOnly;
-        let diagnosis = crate::site_probe::explain(
+        let diagnosis = crate::site_verdict::explain(
             verdict,
             &CauseContext {
                 host,
                 www_url: Some(www_url),
                 apex_ip: Some("216.150.1.1"),
-                dns_consistent: true,
+                dns_spoofed: false,
+                doh_working_ip: None,
                 same_host_alt_ip_works: false,
                 isp_redirect: None,
             },
@@ -556,16 +631,19 @@ mod tests {
         DomainProbe {
             host: host.to_string(),
             dns,
-            dns_consistent: true,
             primary_ips: vec!["216.150.1.1".to_string()],
+            doh_ips: vec![],
             working_ip: None,
-            http_note: "TCP timeout".to_string(),
+            working_ip_source: None,
+            working_http: None,
+            http_note: "ни один IP не ответил на TCP:443".to_string(),
             verdict,
             www_host: Some("www.cactuscompute.com".to_string()),
             www_ips: vec!["216.150.16.65".to_string()],
             www_url: Some(www_url.to_string()),
             isp_redirect: None,
             dns_spoofed: None,
+            doh_failures: vec![],
             diagnosis: Some(diagnosis),
         }
     }
@@ -649,7 +727,6 @@ let log = build_report(&meta_with(p), &empty_classification());
     #[test]
     fn spoofed_dns_is_never_reported_as_clean() {
         let mut p = www_only_probe();
-        p.dns_consistent = true;
         p.dns_spoofed = Some("системный DNS вернул 188.186.154.88, DoH-резолверы — 104.21.95.93, 172.67.144.20 (пересечений нет)".to_string());
         let log = build_report(&meta_with(p), &empty_classification());
         assert!(log.contains("ОБНАРУЖЕНА ПОДМЕНА DNS"), "{}", log);
@@ -657,6 +734,105 @@ let log = build_report(&meta_with(p), &empty_classification());
         assert!(log.contains("UDP:53 перехвачен"), "{}", log);
         // The untrusted addresses must be called out as untrusted.
         assert!(log.contains("недостоверны"), "{}", log);
+    }
+
+    /// Ответы 1.1.1.1 и 8.8.8.8 идут по тому же перехватываемому UDP:53.
+    /// Показывать их без пометки — значит выдать подменённый ответ за
+    /// ответ Cloudflare/Google.
+    #[test]
+    fn udp_dns_lines_are_marked_untrusted_when_spoofed() {
+        let mut p = www_only_probe();
+        p.dns.cloudflare = vec!["188.186.154.88".parse().unwrap()];
+        p.dns.google = vec!["188.186.154.88".parse().unwrap()];
+        p.dns_spoofed = Some("перехват доказан".to_string());
+        let log = build_report(&meta_with(p), &empty_classification());
+        for line in ["DNS (1.1.1.1)", "DNS (8.8.8.8)", "DNS (система)"] {
+            let l = log
+                .lines()
+                .find(|l| l.contains(line))
+                .unwrap_or_else(|| panic!("нет строки {}", line));
+            assert!(
+                l.contains("UDP:53 перехвачен"),
+                "{} должен быть помечен как недостоверный: {}",
+                line,
+                l
+            );
+        }
+    }
+
+    #[test]
+    fn udp_dns_lines_have_no_warning_when_clean() {
+        let log = build_report(&meta_with(www_only_probe()), &empty_classification());
+        assert!(
+            !log.contains("ответ недостоверен"),
+            "при чистом DNS предупреждение неуместно: {}",
+            log
+        );
+    }
+
+    /// Главная регрессия задания: адрес с BadCert печатался как
+    /// «Рабочий IP … (сайт открывается)». Через такой адрес сайт НЕ открывается.
+    #[test]
+    fn bad_cert_ip_is_never_called_working() {
+        let mut p = www_only_probe();
+        p.verdict = Verdict::BadCert;
+        p.working_ip = Some("188.186.154.88".to_string());
+        p.working_ip_source = Some(IpSource::SystemDns);
+        p.working_http = Some(HttpResult::BadCert);
+        p.http_note = "HTTPS через 188.186.154.88: SSL-сертификат невалиден".to_string();
+        let log = build_report(&meta_with(p), &empty_classification());
+        assert!(!log.contains("сайт открывается)"), "{}", log);
+        let line = log
+            .lines()
+            .find(|l| l.contains("188.186.154.88") && l.contains("открытым TCP:443"))
+            .expect("нет строки про адрес");
+        assert!(line.contains("НЕ открывается"), "{}", line);
+    }
+
+    /// Тот же запрет для RST и таймаута.
+    #[test]
+    fn rst_and_timeout_ips_are_not_called_working() {
+        for (res, marker) in [
+            (HttpResult::Rst, "HTTPS рвётся"),
+            (HttpResult::Timeout, "таймаут"),
+            (HttpResult::Tls, "TLS-рукопожатие рвётся"),
+        ] {
+            let mut p = www_only_probe();
+            p.verdict = Verdict::IpReset;
+            p.working_ip = Some("1.2.3.4".to_string());
+            p.working_ip_source = Some(IpSource::SystemDns);
+            p.working_http = Some(res.clone());
+            let line = working_ip_line(&p);
+            assert!(line.contains(marker), "{:?} -> {}", res, line);
+            assert!(
+                !line.contains("сайт открывается"),
+                "{:?} must not be reported as working: {}",
+                res,
+                line
+            );
+        }
+    }
+
+    /// Обратный случай: реальный HTTP-ответ — единственное основание назвать
+    /// адрес рабочим.
+    #[test]
+    fn ok_http_is_the_only_reason_to_call_ip_working() {
+        let mut p = www_only_probe();
+        p.verdict = Verdict::Open;
+        p.working_ip = Some("104.21.95.93".to_string());
+        p.working_ip_source = Some(IpSource::Doh);
+        p.working_http = Some(HttpResult::Ok(200));
+        let line = working_ip_line(&p);
+        assert!(line.contains("Рабочий IP"), "{}", line);
+        assert!(line.contains("сайт открывается"), "{}", line);
+        assert!(line.contains("104.21.95.93"), "{}", line);
+        assert!(line.contains("через DoH"), "{}", line);
+    }
+
+    #[test]
+    fn missing_working_ip_is_stated_plainly() {
+        let p = www_only_probe();
+        assert!(working_ip_line(&p).contains("не найден"), "{}", working_ip_line(&p));
     }
 
     #[test]
@@ -674,6 +850,107 @@ let log = build_report(&meta_with(p), &empty_classification());
         let log = build_report(&meta_with(p), &empty_classification());
         assert!(log.contains("lawfilter.ertelecom.ru"), "{}", log);
         assert!(log.contains("Подмена ответа оператором"), "{}", log);
+    }
+
+    /// Полный сценарий пользователя: отравленный DNS, проверенный адрес найден
+    /// через DoH. Отчёт обязан назвать первопричину, дать готовые строки hosts
+    /// и нигде не сказать «невалидный сертификат».
+    #[test]
+    fn poisoned_dns_report_names_cause_and_gives_hosts_lines() {
+        let host = "nnmclub.to";
+        let verdict = Verdict::DnsBlocked;
+        let diagnosis = crate::site_verdict::explain(
+            verdict,
+            &CauseContext {
+                host,
+                www_url: None,
+                apex_ip: Some("188.186.146.207"),
+                dns_spoofed: true,
+                doh_working_ip: Some("104.21.95.93"),
+                same_host_alt_ip_works: true,
+                isp_redirect: None,
+            },
+        );
+        let mut dns = DnsInfo::new();
+        dns.system = vec!["188.186.146.207".parse().unwrap()];
+        dns.cloudflare = vec!["188.186.146.207".parse().unwrap()];
+        let probe = DomainProbe {
+            host: host.to_string(),
+            dns,
+            primary_ips: vec!["188.186.146.207".to_string()],
+            doh_ips: vec!["104.21.95.93".to_string()],
+            working_ip: Some("104.21.95.93".to_string()),
+            working_ip_source: Some(IpSource::Doh),
+            working_http: Some(HttpResult::Ok(200)),
+            http_note: "HTTPS через 104.21.95.93: HTTP 200".to_string(),
+            verdict,
+            www_host: Some("www.nnmclub.to".to_string()),
+            www_ips: vec![],
+            www_url: None,
+            isp_redirect: None,
+            dns_spoofed: Some("системный DNS вернул 188.186.146.207, DoH-резолверы — 104.21.95.93 (пересечений нет)".to_string()),
+            doh_failures: vec!["dns.dns-ai.ru: не ответил за 9 с (таймаут)".to_string()],
+            diagnosis: Some(diagnosis),
+        };
+        let log = build_report(&meta_with(probe), &empty_classification());
+
+        assert!(log.contains("DNS-ПОДМЕНА"), "{}", log);
+        assert!(log.contains("104.21.95.93 nnmclub.to"), "{}", log);
+        assert!(log.contains("104.21.95.93 www.nnmclub.to"), "{}", log);
+        assert!(log.contains("ipconfig /flushdns"), "{}", log);
+        // Подменённый адрес не должен быть назван рабочим.
+        assert!(
+            !log.contains("Рабочий IP:          188.186.146.207"),
+            "{}",
+            log
+        );
+        assert!(log.contains("Не ответили DoH-сервисы"), "{}", log);
+    }
+
+    /// Если проверенного адреса нет — отчёт не имеет права предлагать hosts.
+    #[test]
+    fn report_does_not_offer_hosts_without_verified_ip() {
+        let host = "nnmclub.to";
+        let verdict = Verdict::DnsBlocked;
+        let diagnosis = crate::site_verdict::explain(
+            verdict,
+            &CauseContext {
+                host,
+                www_url: None,
+                apex_ip: Some("188.186.146.207"),
+                dns_spoofed: true,
+                doh_working_ip: None,
+                same_host_alt_ip_works: false,
+                isp_redirect: None,
+            },
+        );
+        let mut dns = DnsInfo::new();
+        dns.system = vec!["188.186.146.207".parse().unwrap()];
+        let probe = DomainProbe {
+            host: host.to_string(),
+            dns,
+            primary_ips: vec!["188.186.146.207".to_string()],
+            doh_ips: vec![],
+            working_ip: None,
+            working_ip_source: None,
+            working_http: None,
+            http_note: "ни один IP не ответил на TCP:443".to_string(),
+            verdict,
+            www_host: Some("www.nnmclub.to".to_string()),
+            www_ips: vec![],
+            www_url: None,
+            isp_redirect: None,
+            dns_spoofed: Some("расхождение доказано".to_string()),
+            doh_failures: vec![],
+            diagnosis: Some(diagnosis),
+        };
+        let log = build_report(&meta_with(probe), &empty_classification());
+        assert!(
+            !log.contains("System32\\drivers\\etc\\hosts"),
+            "без проверенного адреса hosts предлагать нечего: {}",
+            log
+        );
+        assert!(log.contains("Запись в hosts сейчас не поможет"), "{}", log);
     }
 
     /// Regression: "работает, трогать не обязательно" was printed unconditionally.

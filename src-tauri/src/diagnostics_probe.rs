@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::{TcpStream, UdpSocket, SocketAddr, IpAddr};
 use std::error::Error as StdError;
 use std::time::Duration;
@@ -323,7 +324,17 @@ pub fn dns_multi(domain: &str) -> DnsInfo {
 /// DoH-сервисы для проверки «подмены DNS»: возвращают настоящие IP в обход
 /// отравленного/перехваченного DNS. Используются и в тесте подмены DNS, и в
 /// автоматической проверке при анализе доменов.
-pub const DOH_RESOLVERS: &[&str] = &["xbox-dns.ru", "geohide.ru", "dns.comss.one"];
+///
+/// Единственный источник правды по списку (core rules §2.1): и отчёт об
+/// анализе домена, и поиск рабочего IP для hosts читают его отсюда.
+pub const DOH_RESOLVERS: &[&str] = &[
+    "xbox-dns.ru",
+    "geohide.ru",
+    "eu.geohide.ru",
+    "dns.comss.one",
+    "dns.bezmezhau.com",
+    "dns.dns-ai.ru",
+];
 
 /// Резолвит хост DoH-сервера (бутстрап): сначала системный DNS, при неудаче —
 /// публичный 1.1.1.1 (UDP). Без него нельзя узнать IP, на который Https-клиент
@@ -385,6 +396,118 @@ pub fn resolve_via_doh(domain: &str, doh_host: &str) -> Result<Vec<IpAddr>, Stri
         8000,
     )
     .unwrap_or_else(|| Err(format!("сервис {} не ответил за 8 с (таймаут)", svc)))
+}
+
+/// Ответ одного DoH-сервиса по домену. Сервис, который не ответил, не
+/// пропадает молча: его ошибка уезжает в отчёт, иначе «0 адресов» читается
+/// как «домен не существует» (core rules §2.2).
+#[derive(Debug, Clone)]
+pub struct DohAnswer {
+    pub service: String,
+    pub ips: Vec<IpAddr>,
+    /// Реальная причина, по которой сервис не дал адресов.
+    pub error: Option<String>,
+}
+
+/// Все ответы DoH-сервисов по домену — один сетевой проход вместо N.
+#[derive(Debug, Clone, Default)]
+pub struct DohAnswers {
+    pub answers: Vec<DohAnswer>,
+}
+
+impl DohAnswers {
+    /// Все адреса, которые вернул хотя бы один сервис, без дублей, в порядке
+    /// появления. Пустой список означает «ни один сервис не ответил».
+    pub fn all_ips(&self) -> Vec<IpAddr> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for a in &self.answers {
+            for ip in &a.ips {
+                if seen.insert(*ip) {
+                    out.push(*ip);
+                }
+            }
+        }
+        out
+    }
+
+    /// Подробности по сервисам, которые не ответили, — одной строкой на сервис.
+    pub fn failures(&self) -> Vec<String> {
+        self.answers
+            .iter()
+            .filter_map(|a| {
+                a.error
+                    .as_ref()
+                    .map(|e| format!("{}: {}", a.service, e))
+            })
+            .collect()
+    }
+}
+
+/// Резолвит домен через ВСЕ доверенные DoH-сервисы параллельно, с общим
+/// жёстким дедлайном: зависший сервис не должен держать проверку.
+///
+/// Это единственная точка обращения к DoH за списком сервисов — и детект
+/// подмены DNS, и поиск рабочего IP для hosts берут адреса отсюда, а не
+/// опрашивают сервисы повторно каждый сам по себе.
+pub fn resolve_doh_all(domain: &str) -> DohAnswers {
+    let (tx, rx) = mpsc::channel::<(usize, DohAnswer)>();
+    let total = DOH_RESOLVERS.len();
+
+    for (idx, service) in DOH_RESOLVERS.iter().enumerate() {
+        let tx = tx.clone();
+        let domain = domain.to_string();
+        let service = service.to_string();
+        thread::spawn(move || {
+            let answer = match resolve_via_doh(&domain, &service) {
+                Ok(ips) => DohAnswer {
+                    service,
+                    ips,
+                    error: None,
+                },
+                Err(e) => DohAnswer {
+                    service,
+                    ips: vec![],
+                    error: Some(e),
+                },
+            };
+            let _ = tx.send((idx, answer));
+        });
+    }
+    drop(tx);
+
+    let mut slots: Vec<Option<DohAnswer>> = (0..total).map(|_| None).collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(9);
+    let mut got = 0usize;
+    while got < total {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match rx.recv_timeout(deadline - now) {
+            Ok((idx, answer)) => {
+                if slots[idx].is_none() {
+                    got += 1;
+                }
+                slots[idx] = Some(answer);
+            }
+            Err(_) => break,
+        }
+    }
+
+    let answers: Vec<DohAnswer> = slots
+        .into_iter()
+        .enumerate()
+        .map(|(idx, slot)| {
+            slot.unwrap_or_else(|| DohAnswer {
+                service: DOH_RESOLVERS[idx].to_string(),
+                ips: vec![],
+                error: Some("не ответил за 9 с (таймаут)".to_string()),
+            })
+        })
+        .collect();
+
+    DohAnswers { answers }
 }
 
 /// Есть ли у пользователя рабочий IPv6 до целевого домена (winws только IPv4).

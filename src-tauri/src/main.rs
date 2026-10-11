@@ -6,6 +6,7 @@ mod analyzer;
 mod analyzer_probe;
 mod analyzer_report;
 mod site_probe;
+mod site_verdict;
 mod testing;
 mod bypass_lists;
 mod diagnostics;

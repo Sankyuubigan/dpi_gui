@@ -371,7 +371,7 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
     // DoH-сервисы xbox-dns.ru/geohide.ru и ищем рабочий IP для подмены.
     // При WwwOnly проверка бессмысленна: рабочее имя уже найдено.
     let main_dns_sub = if main_probe.verdict.site_broken()
-        && main_probe.verdict != site_probe::Verdict::WwwOnly
+        && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
     {
         site_probe::check_dns_substitution(&main_host, true)
     } else {
