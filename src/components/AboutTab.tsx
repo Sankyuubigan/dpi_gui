@@ -4,7 +4,21 @@ import { getVersion } from "@tauri-apps/api/app";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open } from "@tauri-apps/plugin-shell";
-import { Info, RefreshCw, Download, ExternalLink, CheckCircle2, AlertTriangle } from "lucide-react";
+import {
+  getReleaseHistory,
+  installRelease,
+  type ReleaseInfo,
+} from "@my-tauri-plugins/plugin-about-updates";
+import {
+  Info,
+  RefreshCw,
+  Download,
+  ExternalLink,
+  CheckCircle2,
+  AlertTriangle,
+  History,
+  RotateCcw,
+} from "lucide-react";
 
 type Status =
   | "idle"
@@ -24,11 +38,54 @@ export default function AboutTab() {
   const [isDownloading, setIsDownloading] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
 
+  const [history, setHistory] = useState<ReleaseInfo[] | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [selected, setSelected] = useState("");
+  const [rollbackBusy, setRollbackBusy] = useState(false);
+  const [rollbackMsg, setRollbackMsg] = useState("");
+
   useEffect(() => {
     getVersion()
       .then(setVersion)
       .catch(() => setVersion("?"));
   }, []);
+
+  const toggleHistory = async () => {
+    if (history) {
+      setHistory(null);
+      return;
+    }
+    setHistoryLoading(true);
+    setRollbackMsg("");
+    try {
+      setHistory(await getReleaseHistory());
+    } catch (e: any) {
+      setRollbackMsg(e?.message || String(e));
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const doRollback = async () => {
+    const target = history?.find((r) => r.version === selected);
+    if (!target) return;
+    setRollbackBusy(true);
+    setRollbackMsg(`Откат на ${target.version}: скачивание установщика...`);
+    try {
+      // Гасим обход до скачивания/установки: winws.exe и драйвер WinDivert
+      // держат файлы в bin/ заблокированными (иначе установщик падает с os error 32).
+      try {
+        await invoke("stop_bypass");
+      } catch (_) {
+        // Остановка не удалась — не блокируем попытку отката.
+      }
+      await installRelease(target.downloadUrl, target.version);
+      setRollbackMsg(`Откат на ${target.version} запущен, приложение будет перезапущено.`);
+    } catch (e: any) {
+      setRollbackMsg(e?.message || String(e));
+      setRollbackBusy(false);
+    }
+  };
 
   const checkForUpdates = async () => {
     setStatus("checking");
@@ -183,6 +240,67 @@ export default function AboutTab() {
             </div>
           )}
         </div>
+      </div>
+
+      <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2">
+            <History size={18} className="text-gray-500" />
+            История релизов и откат
+          </h2>
+          <button
+            onClick={toggleHistory}
+            disabled={historyLoading || rollbackBusy}
+            className="flex items-center gap-2 bg-gray-100 text-gray-700 px-4 py-2 rounded-md font-semibold hover:bg-gray-200 disabled:opacity-50"
+          >
+            <RefreshCw size={16} className={historyLoading ? "animate-spin" : ""} />
+            {history ? "Скрыть" : "Показать"}
+          </button>
+        </div>
+
+        {history && (
+          <>
+            <div className="flex flex-col sm:flex-row gap-2 items-stretch">
+              <select
+                value={selected}
+                onChange={(e) => setSelected(e.target.value)}
+                disabled={rollbackBusy}
+                className="w-full border-gray-300 rounded-md shadow-sm p-2 border focus:border-blue-500 focus:ring-blue-500"
+              >
+                <option value="" disabled>
+                  -- Выберите версию --
+                </option>
+                {history
+                  .filter((r) => !r.isCurrent)
+                  .map((r) => (
+                    <option key={r.version} value={r.version}>
+                      {r.pubDate
+                        ? `v${r.version} — ${new Date(r.pubDate).toLocaleDateString()}`
+                        : `v${r.version}`}
+                    </option>
+                  ))}
+              </select>
+              <button
+                onClick={doRollback}
+                disabled={!selected || rollbackBusy}
+                className="flex items-center justify-center gap-2 bg-amber-600 text-white px-4 py-2 rounded-md font-semibold hover:bg-amber-700 disabled:opacity-50 whitespace-nowrap"
+              >
+                <RotateCcw size={16} />
+                Откатить
+              </button>
+            </div>
+
+            {history.filter((r) => !r.isCurrent).length === 0 && (
+              <p className="text-sm text-gray-500 mt-3">
+                Нет более старых версий с установщиком.
+              </p>
+            )}
+
+            {rollbackMsg && (
+              <p className="text-sm text-gray-600 mt-3 break-all">{rollbackMsg}</p>
+            )}
+          </>
+        )}
       </div>
     </div>
   );

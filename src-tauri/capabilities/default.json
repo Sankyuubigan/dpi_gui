@@ -6,6 +6,7 @@
   "permissions": [
     "core:default",
     "updater:default",
+    "about-updates:default",
     "process:allow-restart",
     "shell:allow-open"
   ]

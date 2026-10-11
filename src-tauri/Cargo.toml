@@ -1,6 +1,6 @@
 [package]
 name = "dpi_gui"
-version = "26.10.3"
+version = "26.10.4"
 description = "DPI Bypass GUI"
 authors = ["Sankyuubigan"]
 edition = "2021"
@@ -13,6 +13,8 @@ tauri = { version = "2.0.0", features = [] }
 tauri-plugin-shell = "2.0.0"
 tauri-plugin-updater = { version = "2", default-features = false, features = ["native-tls", "zip"] }
 tauri-plugin-process = "2"
+# Модуль «О приложении / Обновления»: история релизов GitHub + откат (общий репозиторий my-tauri-plugins).
+tauri-plugin-about-updates = { path = "../../my-tauri-plugins/tauri-plugin-about-updates" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 reqwest = { version = "0.12", features = ["blocking"] }

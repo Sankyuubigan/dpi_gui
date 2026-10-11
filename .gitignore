@@ -20,7 +20,8 @@
 /test/zapret-discord-youtube
 
 # Updater signing key (NEVER commit) and release artifacts
+# ВНИМАНИЕ: latest.json НЕ игнорировать — release.bat коммитит его в репозиторий,
+# оттуда апдейтер его и читает (raw.githubusercontent.com/<repo>/main/latest.json).
 /src-tauri/tauri.key
 /src-tauri/release.build.conf.json
-/latest.json
 /tasks
