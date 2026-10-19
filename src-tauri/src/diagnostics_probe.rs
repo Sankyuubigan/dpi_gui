@@ -18,13 +18,50 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[derive(Debug, Clone, PartialEq)]
 pub enum HttpResult {
     Ok(u16),
-    BlockPage,   // Ответ получен, но это страница-заглушка блокировки
+    BlockPage,   // Ответ с явными маркерами блокировки в теле (подставил оператор)
+    /// Голый отказ сервера (403/451 без маркеров блокировки в теле).
+    /// Это НЕ обязательно цензура провайдера: так же отвечает сам сервер
+    /// при региональном ограничении (гео-блок). Выдавать его за «страницу
+    /// блокировки провайдера» было прямой ложью (кейс cohere: с VPN работает).
+    Forbidden(u16),
     Dns,         // Не резолвится (DNS-цензура / NXDOMAIN)
     Rst,         // Сброс соединения (RST) — типично для DPI
     Tls,         // Ошибка TLS/рукопожатия
     BadCert,     // TLS прошёл, но сертификат невалиден для имени (NET::ERR_CERT_*)
     Timeout,     // Таймаут
     Other(String),
+}
+
+/// Адрес-заглушка в ответе резолвера: такой ответ означает «заблокировано»,
+/// а не адрес сайта. Попадание заглушки в список «проверенных» и в TCP-пробы
+/// давало ложь вида «IP через DoH (проверенные): 0.0.0.0».
+pub fn is_stub_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => {
+            let o = v.octets();
+            v.is_unspecified()
+                || v.is_loopback()
+                || v.is_private()
+                || v.is_link_local()
+                // CGNAT 100.64/10 — в публичном DNS такому делать нечего.
+                || (o[0] == 100 && (64..128).contains(&o[1]))
+        }
+        IpAddr::V6(v) => {
+            v.is_unspecified() || v.is_loopback() || (v.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+/// Маркеры подставленной страницы блокировки в теле ответа.
+/// Единственный источник правды (core rules §2.1): обе HTTP-классификации
+/// (`http_classify_with` здесь и `http_via_ip` в site_probe) читают отсюда,
+/// а не держат каждая свой список.
+pub fn body_looks_like_blockpage(low_text: &str) -> bool {
+    low_text.contains("роскомнадзор")
+        || low_text.contains("заблокир")
+        || low_text.contains("this site is blocked")
+        || low_text.contains("access denied: by order")
+        || low_text.contains("страница не может быть отображена")
 }
 
 /// Запуск потенциально зависающей операции с таймаутом.
@@ -391,7 +428,15 @@ pub fn resolve_via_doh(domain: &str, doh_host: &str) -> Result<Vec<IpAddr>, Stri
             if ips.is_empty() {
                 return Err("сервис вернул пустой ответ".to_string());
             }
-            Ok(ips)
+            // Заглушки (0.0.0.0 и т.п.) — это отказ резолвера, а не адреса.
+            let real: Vec<IpAddr> = ips.iter().copied().filter(|ip| !is_stub_ip(ip)).collect();
+            if real.is_empty() {
+                return Err(format!(
+                    "сервис вернул только заглушки ({})",
+                    ips.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
+                ));
+            }
+            Ok(real)
         },
         8000,
     )
@@ -418,11 +463,15 @@ pub struct DohAnswers {
 impl DohAnswers {
     /// Все адреса, которые вернул хотя бы один сервис, без дублей, в порядке
     /// появления. Пустой список означает «ни один сервис не ответил».
+    /// Заглушки сюда не попадают даже при прямом конструировании `DohAnswer`.
     pub fn all_ips(&self) -> Vec<IpAddr> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for a in &self.answers {
             for ip in &a.ips {
+                if is_stub_ip(ip) {
+                    continue;
+                }
                 if seen.insert(*ip) {
                     out.push(*ip);
                 }
@@ -594,17 +643,14 @@ pub fn http_classify_with(url: &str, secs: u64) -> HttpResult {
     match client.get(url).send() {
         Ok(resp) => {
             let status = resp.status().as_u16();
+            // Голый 403/451 БЕЗ маркеров блокировки — отказ самого сервера
+            // (часто региональное ограничение), а не страница провайдера.
             if status == 403 || status == 451 {
-                return HttpResult::BlockPage;
+                return HttpResult::Forbidden(status);
             }
             if (200..=399).contains(&status) {
                 let low = resp.text().unwrap_or_default().to_lowercase();
-                if low.contains("роскомнадзор")
-                    || low.contains("заблокир")
-                    || low.contains("this site is blocked")
-                    || low.contains("access denied: by order")
-                    || low.contains("страница не может быть отображена")
-                {
+                if body_looks_like_blockpage(&low) {
                     HttpResult::BlockPage
                 } else {
                     HttpResult::Ok(status)
@@ -711,5 +757,41 @@ mod tests {
         assert_eq!(classify_err_text("operation timed out"), HttpResult::Timeout);
         assert_eq!(classify_err_text("os error 10060"), HttpResult::Timeout);
         assert_eq!(classify_err_text("что-то неведомое"), HttpResult::Other("что-то неведомое".to_string()));
+    }
+
+    /// Заглушки резолвера — не адреса: 0.0.0.0, loopback, private, CGNAT.
+    #[test]
+    fn stub_ips_are_filtered() {
+        for s in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "172.16.0.1",
+            "100.64.0.1",
+            "::",
+            "::1",
+        ] {
+            assert!(is_stub_ip(&s.parse().unwrap()), "{}", s);
+        }
+        for s in ["34.96.76.122", "104.18.2.115", "8.8.8.8", "1.1.1.1"] {
+            assert!(!is_stub_ip(&s.parse().unwrap()), "{}", s);
+        }
+    }
+
+    /// Заглушка в ответе DoH-сервиса не попадает в общий список адресов.
+    #[test]
+    fn all_ips_skips_stubs() {
+        let answers = DohAnswers {
+            answers: vec![DohAnswer {
+                service: "test".to_string(),
+                ips: vec!["0.0.0.0".parse().unwrap(), "104.18.2.115".parse().unwrap()],
+                error: None,
+            }],
+        };
+        assert_eq!(
+            answers.all_ips(),
+            vec!["104.18.2.115".parse::<IpAddr>().unwrap()]
+        );
     }
 }

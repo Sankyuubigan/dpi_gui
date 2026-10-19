@@ -28,6 +28,11 @@ pub enum Verdict {
     /// Системный DNS отдаёт не те адреса, что защищённый канал (DoH).
     DnsBlocked,
     BlockPage,
+    /// Сервер отвечает голым отказом (403/451 без маркеров подмены) и на
+    /// системном, и на проверенном адресе. Это ограничение самого сервиса
+    /// (часто региональное) — лечится VPN/сменой сети, а не обходом,
+    /// исключениями или hosts.
+    GeoBlocked,
     /// Оператор связи подменил ответ редиректом на страницу блокировки (РКН).
     /// Виден только на порту 80: запрос уходит, но ответ приходит не от
     /// сервера, а от провайдера. По HTTPS провайдер рвёт соединение.
@@ -53,6 +58,7 @@ impl Verdict {
             Verdict::BadCert => "НЕВАЛИДНЫЙ СЕРТИФИКАТ",
             Verdict::DnsBlocked => "DNS-ПОДМЕНА",
             Verdict::BlockPage => "СТРАНИЦА БЛОКИРОВКИ",
+            Verdict::GeoBlocked => "РЕГИОНАЛЬНОЕ ОГРАНИЧЕНИЕ (НУЖЕН VPN)",
             Verdict::IspBlockRedirect => "БЛОКИРОВКА ОПЕРАТОРОМ (РКН)",
             Verdict::NoPath => "НЕТ ПУТИ",
             Verdict::Unknown => "ПРИЧИНА НЕ ЯСНА",
@@ -80,6 +86,9 @@ pub struct ProbeFacts {
     pub system_http: Option<HttpResult>,
     /// HTTPS по адресам ИЗ DoH (`None` — ни один DoH-адрес не прошёл TCP:443).
     pub doh_http: Option<HttpResult>,
+    /// DoH вернул только те же адреса, что системный DNS (проверять отдельно
+    /// нечего — системный адрес тем самым проверен защищённым каналом).
+    pub doh_agrees: bool,
     /// Хотя бы один адрес ответил на TCP:443 (не важно, по какому каналу).
     pub any_tcp_ok: bool,
     /// Среди всех проб было RST — признак обрыва соединения.
@@ -99,16 +108,27 @@ pub fn classify(f: &ProbeFacts) -> Verdict {
         return Verdict::Open;
     }
 
-    // 2. Ответ сервера вместо сайта — это называемая причина, она важнее
-    //    любых догадок о сети.
+    // 2. Подставленная страница блокировки (явные маркеры в теле ответа) —
+    //    это называемая причина, она важнее любых догадок о сети.
     if matches!(f.system_http, Some(HttpResult::BlockPage)) {
         return Verdict::BlockPage;
+    }
+
+    // 2b. Голый отказ сервера (403/451) и на системном, и на проверенном
+    //     адресе при чистом DNS — ограничение самого сервиса (гео-блок),
+    //     а не цензура провайдера. Доказательство: VPN открывает сайт.
+    if !f.dns_spoofed
+        && matches!(f.system_http, Some(HttpResult::Forbidden(_)))
+        && (matches!(f.doh_http, Some(HttpResult::Forbidden(_))) || f.doh_agrees)
+    {
+        return Verdict::GeoBlocked;
     }
 
     // 3. Системный DNS доказанно подменён. Любой неуспешный ответ получен по
     //    адресу, который сайту не принадлежит, — судить о сайте по нему нельзя,
     //    поэтому BadCert/Rst/Timeout здесь означают лишь одно: этот адрес чужой.
     //    Первопричина установлена точно, и лечение другое, чем при BadCert.
+    //    Исключение: адреса совпадают — это не подмена, а гео-CDN (см. выше).
     if f.dns_spoofed {
         return match f.doh_http {
             // Проверенный адрес открывает сайт: им можно и нужно лечить.
@@ -219,6 +239,7 @@ pub fn http_result_note(r: &HttpResult) -> String {
         HttpResult::Timeout => "таймаут".to_string(),
         HttpResult::Dns => "DNS-ошибка".to_string(),
         HttpResult::BlockPage => "страница блокировки".to_string(),
+        HttpResult::Forbidden(code) => format!("отказ сервера HTTP {}", code),
         HttpResult::Other(m) => m.clone(),
     }
 }
@@ -296,8 +317,16 @@ fn probable_cause(verdict: Verdict, ctx: &CauseContext) -> String {
         },
 
         Verdict::BlockPage => {
-            "Сервер отдаёт страницу блокировки вместо сайта — обычно это ответ с кодом 403 или 451."
+            "Оператор связи подставляет страницу блокировки вместо сайта (в теле ответа — явные маркеры блокировки)."
                 .to_string()
+        }
+
+        Verdict::GeoBlocked => {
+            let apex = ctx.apex_ip.unwrap_or("?");
+            format!(
+                "Сам сервис отказывает в доступе (голый HTTP 403/451 без признаков подмены) и по системному адресу {}, и по проверенному адресу. DNS чистый — это ограничение самого сервиса, обычно региональное: из другой страны сайт открывается.",
+                apex
+            )
         }
 
         Verdict::IpUnreachable => {
@@ -374,7 +403,29 @@ fn collect_actions(verdict: Verdict, ctx: &CauseContext, d: &mut Diagnosis) {
                     .to_string(),
             );
             d.wont_help.push(
-                "Смена DNS не поможет: страницу блокировки отдаёт сам провайдер, и адрес у неё тот же."
+                "Смена DNS не поможет: страницу блокировки подставляет оператор связи, и адрес у неё тот же."
+                    .to_string(),
+            );
+        }
+
+        Verdict::GeoBlocked => {
+            // Явное «доказательств нет»: лист исключения не наблюдался, но
+            // голый отказ с обоих адресов при чистом DNS + открытие через VPN —
+            // косвенный признак ограничения сервиса, а не провайдера.
+            d.do_this.push(
+                "Попробуйте VPN или смените сеть/страну: ограничение ставит сам сервис, обход DPI его не снимет."
+                    .to_string(),
+            );
+            d.wont_help.push(
+                "Обход winws не поможет: соединение доходит до сервера, отказывает сам сервер."
+                    .to_string(),
+            );
+            d.wont_help.push(
+                "Ни смена DNS, ни запись в hosts: адрес верный, но сервер отказывает этому региону."
+                    .to_string(),
+            );
+            d.wont_help.push(
+                "Исключения обхода не нужны: ломать тут нечего — обход ни при чём."
                     .to_string(),
             );
         }
@@ -776,6 +827,65 @@ fn clean_dns_site_opens_via_system_is_open() {
         assert!(d.wont_help.is_empty(), "{:?}", d.wont_help);
     }
 
+    /// Кейс cohere: голый 403 с системного и DoH-адреса при чистом DNS —
+    /// региональное ограничение сервиса, а не страница провайдера.
+    #[test]
+    fn same_forbidden_on_both_channels_is_geo_blocked() {
+        let mut f = facts();
+        f.system_http = Some(HttpResult::Forbidden(403));
+        f.doh_http = Some(HttpResult::Forbidden(403));
+        f.any_tcp_ok = true;
+        assert_eq!(classify(&f), Verdict::GeoBlocked);
+    }
+
+    /// DoH подтверждает тот же адрес (проверять отдельно нечего) — тоже гео-блок.
+    #[test]
+    fn forbidden_with_doh_agreeing_is_geo_blocked() {
+        let mut f = facts();
+        f.system_http = Some(HttpResult::Forbidden(403));
+        f.doh_agrees = true;
+        f.any_tcp_ok = true;
+        assert_eq!(classify(&f), Verdict::GeoBlocked);
+    }
+
+    /// Подмена DNS важнее голого 403: по чужому адресу о сервере судить нельзя.
+    #[test]
+    fn spoofed_forbidden_without_doh_ok_is_unknown() {
+        let mut f = facts();
+        f.dns_spoofed = true;
+        f.system_http = Some(HttpResult::Forbidden(403));
+        f.any_tcp_ok = true;
+        assert_eq!(classify(&f), Verdict::Unknown);
+    }
+
+    /// Открытие по DoH при подмене — всё ещё DNS-подмена, не гео-блок.
+    #[test]
+    fn spoofed_forbidden_with_doh_ok_is_dns_blocked() {
+        let mut f = facts();
+        f.dns_spoofed = true;
+        f.system_http = Some(HttpResult::Forbidden(403));
+        f.doh_http = Some(HttpResult::Ok(200));
+        f.any_tcp_ok = true;
+        assert_eq!(classify(&f), Verdict::DnsBlocked);
+    }
+
+    /// GeoBlocked честно советует VPN и запрещает бесполезные действия.
+    #[test]
+    fn geo_blocked_advises_vpn_and_forbids_useless() {
+        let d = explain(Verdict::GeoBlocked, &ctx("example.com"));
+        assert!(d.do_this.iter().any(|a| a.contains("VPN")), "{:?}", d.do_this);
+        assert!(
+            d.wont_help.iter().any(|a| a.contains("hosts")),
+            "{:?}",
+            d.wont_help
+        );
+        assert!(
+            !d.do_this.iter().any(|a| a.contains("исключен")),
+            "исключения обхода при гео-блоке советовать нельзя: {:?}",
+            d.do_this
+        );
+    }
+
     #[test]
     fn verdict_names_are_unique() {
         let all = [
@@ -787,6 +897,7 @@ fn clean_dns_site_opens_via_system_is_open() {
             Verdict::BadCert,
             Verdict::DnsBlocked,
             Verdict::BlockPage,
+            Verdict::GeoBlocked,
             Verdict::IspBlockRedirect,
             Verdict::NoPath,
             Verdict::Unknown,

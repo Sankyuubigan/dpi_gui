@@ -114,7 +114,10 @@ fn verify_site_via_ip(host: String, ip: String) -> Result<String, String> {
             Ok(format!("✅ Сайт {} открывается через {} (HTTP {})", host, ip, code))
         }
         crate::diagnostics_probe::HttpResult::BlockPage => {
-            Ok(format!("⚠️ {} через {} — страница блокировки (403/451/заглушка)", ip, host))
+            Ok(format!("⚠️ {} через {} — страница блокировки (подставил оператор)", ip, host))
+        }
+        crate::diagnostics_probe::HttpResult::Forbidden(code) => {
+            Ok(format!("🌍 {} через {} — отказ сервера HTTP {} без признаков подмены (возможно, региональное ограничение — проверьте через VPN)", ip, host, code))
         }
         crate::diagnostics_probe::HttpResult::Rst => {
             Ok(format!("🚫 {} — HTTPS сброшен (RST). Блок по SNI/IP: подмена в hosts не поможет, нужен обход (winws).", ip))

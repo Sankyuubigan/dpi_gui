@@ -25,7 +25,8 @@ pub struct ProfileTestOutcome {
 fn verdict_from_http(r: &diagnostics_probe::HttpResult) -> (bool, String) {
     match r {
         diagnostics_probe::HttpResult::Ok(s) => (true, format!("УСПЕХ (HTTP {})", s)),
-        diagnostics_probe::HttpResult::BlockPage => (false, "Страница блокировки (403/451/заглушка)".to_string()),
+        diagnostics_probe::HttpResult::BlockPage => (false, "Страница блокировки (подставил оператор)".to_string()),
+        diagnostics_probe::HttpResult::Forbidden(s) => (false, format!("Отказ сервера HTTP {} (возможно, региональное ограничение — проверьте через VPN)", s)),
         diagnostics_probe::HttpResult::Dns => (false, "DNS не резолвится (NXDOMAIN / DNS-цензура)".to_string()),
         diagnostics_probe::HttpResult::Rst => (false, "RST — соединение сброшено (типично для DPI)".to_string()),
         diagnostics_probe::HttpResult::Tls => (false, "TLS-рукопожатие рвётся".to_string()),
@@ -77,6 +78,7 @@ pub fn test_single_profile(app: AppHandle, profile_name: &str, url: &str, game_f
         match &result {
             diagnostics_probe::HttpResult::Other(m) => m.clone(),
             diagnostics_probe::HttpResult::BlockPage => "получена страница-заглушка вместо сайта".to_string(),
+            diagnostics_probe::HttpResult::Forbidden(s) => format!("сервер отказал с HTTP {} без признаков подмены (возможно, гео-блок — проверьте через VPN)", s),
             diagnostics_probe::HttpResult::Dns => "запись домена не найдена системным DNS".to_string(),
             diagnostics_probe::HttpResult::Rst => "соединение оборвано RST при рукопожатии".to_string(),
             diagnostics_probe::HttpResult::Tls => "TLS-хендшейк не завершился за время пробы".to_string(),

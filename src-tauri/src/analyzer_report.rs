@@ -68,7 +68,7 @@ pub fn build_report(meta: &ReportMeta, c: &Classification) -> String {
     log.push_str(&format!("🔎 Обнаружено доменов: {}\n\n", meta.discovered.len()));
 
     // === Домены, которые НУЖНО добавить в обход (general-лист) ===
-    write_need_bypass(&mut log, c);
+    write_need_bypass(&mut log, meta, c);
 
     // === Домены, которые ЛОМАЕТ обход (в исключения) ===
     write_bypass_breaks(&mut log, c);
@@ -91,7 +91,7 @@ pub fn build_report(meta: &ReportMeta, c: &Classification) -> String {
                 let ok = subs.iter().find(|s| s.http_ok);
                 match ok {
                     Some(s) => log.push_str(&format!(
-                        "    {} → подмена через {} НАШЛА домен (IP {} отвечает на TCP:443)\n",
+                        "    {} → подмена через {} нашла КАНДИДАТА (IP {} отвечает на TCP:443, HTTPS не проверен — гарантии, что сайт откроется, нет)\n",
                         h,
                         s.service,
                         s.working_ip.as_ref().unwrap_or(&"-".to_string())
@@ -156,6 +156,7 @@ fn write_diagnosis(log: &mut String, meta: &ReportMeta) {
         SiteVerdict::IpReset => "🚫",
         SiteVerdict::TlsBroken | SiteVerdict::BadCert => "🔐",
         SiteVerdict::BlockPage => "⛔",
+        SiteVerdict::GeoBlocked => "🌍",
         _ => "⚠️",
     };
 
@@ -201,6 +202,7 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
         SiteVerdict::TlsBroken => "🔐",
         SiteVerdict::BadCert => "🔐",
         SiteVerdict::BlockPage => "⛔",
+        SiteVerdict::GeoBlocked => "🌍",
         _ => "⚠️",
     };
     log.push_str(&format!(
@@ -226,18 +228,41 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
     log.push_str(&format!("  DNS (система):      {}{}\n", sys, untrusted));
     log.push_str(&format!("  DNS (1.1.1.1):      {}{}\n", cf, untrusted));
     log.push_str(&format!("  DNS (8.8.8.8):      {}{}\n", gg, untrusted));
-    // DNS-цензура. Раньше здесь стояло «не обнаружена», если системный DNS
-    // что-то вернул, — но подменённый ответ неотличим от настоящего по форме,
-    // и подмена проходила как норма. Теперь вывод опирается на сверку UDP:53
-    // с DoH (probe.dns_spoofed), а если сверка невозможна — так и пишем.
+    // Сверка системного DNS с защищённым каналом (DoH) — единственный
+    // достоверный способ заметить подмену UDP:53. Она возможна только когда
+    // DoH реально ответил: иначе «расхождений не найдено» было бы ложью
+    // (не сравнивали — а не «проверили и чисто»).
     let dns_state = match &probe.dns_spoofed {
         Some(_) => "ОБНАРУЖЕНА ПОДМЕНА DNS (см. строку ниже)".to_string(),
+        None if probe.doh_ips.is_empty() && !probe.doh_failures.is_empty() => {
+            "сравнение с DoH невозможно: ни один DoH-сервис не ответил — о подмене судить нельзя".to_string()
+        }
         None => "расхождений системного DNS с DoH не найдено".to_string(),
     };
     log.push_str(&format!("  DNS-цензура:        {}\n", dns_state));
     if let Some(spoof) = &probe.dns_spoofed {
         log.push_str(&format!("  ⚠️ UDP:53 перехвачен: {}\n", spoof));
         log.push_str("     адреса из строки «DNS (система)» и из «IP apex» недостоверны\n");
+    }
+    // Публичные резолверы 1.1.1.1/8.8.8.8 тоже ходят по UDP:53 и тоже могут
+    // отличаться от системного — по честности (кейс openrouter: система
+    // 104.18.x против 1.1.1.1 8.6.x). Это предупреждение, а не диагноз:
+    // различать подмену и гео-CDN по одной сверке нельзя.
+    if probe.dns_spoofed.is_none()
+        && matches!(probe.dns.system_state, DnsState::Ok)
+        && !probe.dns.system.is_empty()
+    {
+        let sys: std::collections::HashSet<_> = probe.dns.system.iter().collect();
+        let cf: std::collections::HashSet<_> = probe.dns.cloudflare.iter().collect();
+        let gg: std::collections::HashSet<_> = probe.dns.google.iter().collect();
+        if (!probe.dns.cloudflare.is_empty() && cf.is_disjoint(&sys))
+            || (!probe.dns.google.is_empty() && gg.is_disjoint(&sys))
+        {
+            log.push_str("  ⚠️ Ответы публичных резолверов (1.1.1.1/8.8.8.8) отличаются от системного — это признак подмены UDP:53 либо гео-раздачи CDN, точную причину по одной сверке назвать нельзя\n");
+        }
+    }
+    if !probe.dns.err.is_empty() {
+        log.push_str(&format!("  ⚠️ DNS: {}\n", probe.dns.err));
     }
 
     // Подмена редиректа провайдером — самый точный признак блокировки.
@@ -327,6 +352,10 @@ fn working_ip_line(probe: &site_probe::DomainProbe) -> String {
             "  IP с открытым TCP:443: {}{} (отдаёт страницу блокировки)\n",
             ip, source
         ),
+        Some(HttpResult::Forbidden(code)) => format!(
+            "  IP с открытым TCP:443: {}{} (сервер отказывает: HTTP {} — возможно, региональное ограничение, проверьте через VPN)\n",
+            ip, source, code
+        ),
         Some(HttpResult::Dns) => format!(
             "  IP с открытым TCP:443: {}{} (DNS-ошибка при обращении)\n",
             ip, source
@@ -362,17 +391,22 @@ fn write_dns_substitution(log: &mut String, meta: &ReportMeta) {
 
     log.push_str("🔁 ПРОВЕРКА ПОДМЕНЫ DNS (обход отравленного DNS через DoH):\n");
     for sub in &meta.main_dns_sub {
-        if sub.http_ok {
+        if sub.http_ok && sub.working_ip.is_some() {
             log.push_str(&format!("  ✅ {} — {}\n", sub.service, sub.http_note));
         } else if sub.resolved.is_empty() {
             log.push_str(&format!("  ❌ {} — {}\n", sub.service, sub.http_note));
-        } else {
+        } else if sub.working_ip.is_some() {
+            // TCP-кандидат есть, но HTTPS не открылся: адрес отвечает, сайт —
+            // нет. Это не доказательство «блока по SNI, а не DNS» (раньше
+            // врали именно так) — лишь факт, что подмена не открыла сайт.
             log.push_str(&format!(
-                "  ❌ {} — {}. IP {} реально не открывают HTTPS (RST/таймаут — блок по SNI, а не DNS)\n",
+                "  ❌ {} — {}. IP {} сайт не открыли (адрес отвечает, HTTPS — нет)\n",
                 sub.service,
                 sub.http_note,
                 sub.resolved.join(", ")
             ));
+        } else {
+            log.push_str(&format!("  ❌ {} — {}\n", sub.service, sub.http_note));
         }
     }
 
@@ -407,15 +441,54 @@ fn write_dns_substitution(log: &mut String, meta: &ReportMeta) {
     log.push('\n');
 }
 
-fn write_need_bypass(log: &mut String, c: &Classification) {
+/// Фоновый домен (трекер/телеметрия/аналитика): на доступность сайта не
+/// влияет, советовать его в обход — ложь (кейс cloudflareinsights).
+fn is_background_host(h: &str) -> bool {
+    let low = h.to_ascii_lowercase();
+    [
+        "cloudflareinsights",
+        "analytics",
+        "telemetry",
+        "metrics",
+        "tracking",
+        "beacon",
+        "pixel",
+    ]
+    .iter()
+    .any(|m| low.contains(m))
+}
+
+fn write_need_bypass(log: &mut String, meta: &ReportMeta, c: &Classification) {
     log.push_str("🛡️ ДОМЕНЫ, КОТОРЫЕ НУЖНО ДОБАВИТЬ В ОБХОД (general-лист):\n");
-    if c.need_bypass.is_empty() {
+    // Арбитраж с пофактной диагностикой главного домена: если для него уже
+    // найдено адресное лечение (hosts по проверенному адресу), советовать тот
+    // же хост в обход — противоречие внутри одного отчёта (кейс vercel:
+    // верх говорил «обход не нужен», низ — «добавьте в обход»).
+    let main_fixed_by_hosts: Option<String> =
+        meta.main_probe.as_ref().and_then(|p| {
+            if p.verdict.needs_address_fix() && !site_probe::hosts_entries(p).is_empty() {
+                Some(p.host.clone())
+            } else {
+                None
+            }
+        });
+    // Фоновые домены — в отдельную корзину, а не в обход.
+    let background: Vec<&String> = c.need_bypass.iter().filter(|h| is_background_host(h)).collect();
+    let mut actionable: Vec<&String> = c
+        .need_bypass
+        .iter()
+        .filter(|h| !is_background_host(h))
+        .collect();
+    if let Some(ref fixed) = main_fixed_by_hosts {
+        actionable.retain(|h| *h != fixed);
+    }
+    if actionable.is_empty() {
         log.push_str("  - (пусто) новых доменов для обхода не найдено\n");
     } else {
         let bypass_map = bypass_lists::load_bypass_domains();
         let path = general_list_path();
         let mut parent_suggestions: Vec<String> = Vec::new();
-        for h in &c.need_bypass {
+        for h in &actionable {
             // Если домен уже покрыт обходом (например, родителем) — не советуем дублировать.
             let already = !bypass_lists::find_bypass_matches(std::slice::from_ref(h), &bypass_map).is_empty();
             let parent = bypass_lists::parent_domain(h);
@@ -440,6 +513,20 @@ fn write_need_bypass(log: &mut String, c: &Classification) {
                 "  💡 Родительские домены (winws матчит поддомены, можно сократить список): {}\n",
                 parent_suggestions.join(", ")
             ));
+        }
+    }
+    if let Some(fixed) = main_fixed_by_hosts {
+        if c.need_bypass.iter().any(|h| h == &fixed) {
+            log.push_str(&format!(
+                "  ℹ️ {} лечится записью в hosts (см. блок «ВЕРОЯТНАЯ ПРИЧИНА» выше) — в обход НЕ добавляйте.\n",
+                fixed
+            ));
+        }
+    }
+    if !background.is_empty() {
+        log.push_str("  ℹ️ Фоновые домены (трекеры/телеметрия — на доступность сайта не влияют, в обход НЕ добавлять):\n");
+        for h in &background {
+            log.push_str(&format!("    - {}\n", h));
         }
     }
     log.push('\n');
@@ -998,5 +1085,160 @@ let log = build_report(&meta_with(p), &empty_classification());
         let v = bypass_entry_verdict("site.example", &empty_classification());
         assert!(v.contains("не проверялся"), "{}", v);
         assert!(!v.contains("работает"), "{}", v);
+    }
+
+    /// Кейс vercel: главный хост лечится hosts — в обход его советовать
+    /// нельзя, иначе верх отчёта противоречит низу.
+    #[test]
+    fn host_fixed_by_hosts_is_not_advised_for_bypass() {
+        let host = "9router-vercel-je362iyqk-sankyuubigans-projects.vercel.app";
+        let verdict = Verdict::DnsBlocked;
+        let diagnosis = crate::site_verdict::explain(
+            verdict,
+            &CauseContext {
+                host,
+                www_url: None,
+                apex_ip: Some("64.29.17.131"),
+                dns_spoofed: true,
+                doh_working_ip: Some("216.198.79.195"),
+                same_host_alt_ip_works: true,
+                isp_redirect: None,
+            },
+        );
+        let mut dns = DnsInfo::new();
+        dns.system = vec!["64.29.17.131".parse().unwrap()];
+        let mut meta = meta_with(DomainProbe {
+            host: host.to_string(),
+            dns,
+            primary_ips: vec!["64.29.17.131".to_string()],
+            doh_ips: vec!["216.198.79.195".to_string()],
+            working_ip: Some("216.198.79.195".to_string()),
+            working_ip_source: Some(IpSource::Doh),
+            working_http: Some(HttpResult::Ok(400)),
+            http_note: "HTTPS через 216.198.79.195: HTTP 400".to_string(),
+            verdict,
+            www_host: Some(format!("www.{}", host)),
+            www_ips: vec![],
+            www_url: None,
+            isp_redirect: None,
+            dns_spoofed: Some("перехват доказан".to_string()),
+            doh_failures: vec![],
+            diagnosis: Some(diagnosis),
+        });
+        meta.discovered = vec![host.to_string()];
+        let mut c = empty_classification();
+        c.need_bypass = vec![host.to_string()];
+        let log = build_report(&meta, &c);
+        assert!(log.contains("в обход НЕ добавляйте"), "{}", log);
+        // Хост обязан исчезнуть из списка 🛡️ (остаться может только
+        // пометка «в обход НЕ добавляйте» и общий СОВЕТ-футер).
+        let shield = log
+            .split("ДОМЕНЫ, КОТОРЫЕ НУЖНО ДОБАВИТЬ В ОБХОД")
+            .nth(1)
+            .unwrap_or("");
+        let shield = shield.split("ДОМЕНЫ, КОТОРЫЕ ЛОМАЕТ").next().unwrap_or(shield);
+        assert!(
+            !shield.contains(&format!("  - {} ", host)),
+            "хост с hosts-лечением нельзя советовать в обход: {}",
+            log
+        );
+    }
+
+    /// Кейс cloudflareinsights: трекер — в отдельную корзину, а не в обход.
+    #[test]
+    fn tracker_is_not_advised_for_bypass() {
+        let mut c = empty_classification();
+        c.need_bypass = vec!["static.cloudflareinsights.com".to_string()];
+        let log = build_report(&meta_with(www_only_probe()), &c);
+        assert!(log.contains("Фоновые домены"), "{}", log);
+        assert!(log.contains("в обход НЕ добавлять"), "{}", log);
+        assert!(
+            !log.contains("static.cloudflareinsights.com   [субдомен"),
+            "трекер нельзя советовать в обход: {}",
+            log
+        );
+    }
+
+    /// Кейс openrouter: система и 1.1.1.1 расходятся — отчёт обязан предупредить.
+    #[test]
+    fn system_vs_public_resolver_mismatch_is_flagged() {
+        let mut p = www_only_probe();
+        p.dns.system = vec!["104.18.2.115".parse().unwrap()];
+        p.dns.cloudflare = vec!["8.6.112.0".parse().unwrap()];
+        p.dns.google = vec!["8.6.112.5".parse().unwrap()];
+        let log = build_report(&meta_with(p), &empty_classification());
+        assert!(log.contains("публичных резолверов"), "{}", log);
+    }
+
+    /// DoH мёртв и сравнить не с чем: «расхождений не найдено» — ложь.
+    #[test]
+    fn dead_doh_does_not_claim_clean_dns() {
+        let mut p = www_only_probe();
+        p.doh_ips = vec![];
+        p.doh_failures = vec!["geohide.ru: не ответил за 9 с (таймаут)".to_string()];
+        let log = build_report(&meta_with(p), &empty_classification());
+        assert!(log.contains("сравнение с DoH невозможно"), "{}", log);
+        assert!(
+            !log.contains("расхождений системного DNS с DoH не найдено"),
+            "{}",
+            log
+        );
+    }
+
+    /// Кейс cohere: голый 403 с обоих адресов — VPN-текст, без исключений.
+    #[test]
+    fn geo_blocked_report_advises_vpn_without_exclusions() {
+        let host = "production.api.os.cohere.com";
+        let verdict = Verdict::GeoBlocked;
+        let diagnosis = crate::site_verdict::explain(
+            verdict,
+            &CauseContext {
+                host,
+                www_url: None,
+                apex_ip: Some("34.96.76.122"),
+                dns_spoofed: false,
+                doh_working_ip: None,
+                same_host_alt_ip_works: false,
+                isp_redirect: None,
+            },
+        );
+        let mut dns = DnsInfo::new();
+        dns.system = vec!["34.96.76.122".parse().unwrap()];
+        dns.cloudflare = vec!["34.96.76.122".parse().unwrap()];
+        dns.google = vec!["34.96.76.122".parse().unwrap()];
+        let probe = DomainProbe {
+            host: host.to_string(),
+            dns,
+            primary_ips: vec!["34.96.76.122".to_string()],
+            doh_ips: vec![],
+            working_ip: Some("34.96.76.122".to_string()),
+            working_ip_source: Some(IpSource::SystemDns),
+            working_http: Some(HttpResult::Forbidden(403)),
+            http_note: "HTTPS через 34.96.76.122: отказ сервера HTTP 403".to_string(),
+            verdict,
+            www_host: Some(format!("www.{}", host)),
+            www_ips: vec![],
+            www_url: None,
+            isp_redirect: None,
+            dns_spoofed: None,
+            doh_failures: vec![],
+            diagnosis: Some(diagnosis),
+        };
+        let log = build_report(&meta_with(probe), &empty_classification());
+        assert!(log.contains("РЕГИОНАЛЬНОЕ ОГРАНИЧЕНИЕ"), "{}", log);
+        assert!(log.contains("VPN"), "{}", log);
+        // Блок «ВЕРОЯТНАЯ ПРИЧИНА» не должен советовать исключения обхода
+        // («исключений» встречается и в штатной строке «не требуют исключений»).
+        let cause = log.split("ГЛАВНЫЙ ДОМЕН").next().unwrap_or(&log);
+        assert!(
+            !cause.contains("исключен"),
+            "гео-блок нельзя лечить исключениями обхода: {}",
+            log
+        );
+        assert!(
+            log.contains("сервер отказывает: HTTP 403"),
+            "{}",
+            log
+        );
     }
 }

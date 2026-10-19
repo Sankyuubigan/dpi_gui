@@ -12,7 +12,8 @@ use std::time::Duration;
 use reqwest::blocking::Client;
 
 use crate::diagnostics_probe::{
-    classify_reqwest_err, dns_multi, resolve_doh_all, tcp_connect, DnsInfo, HttpResult,
+    body_looks_like_blockpage, classify_reqwest_err, dns_multi, is_stub_ip, resolve_doh_all,
+    tcp_connect, DnsInfo, HttpResult,
 };
 use crate::site_verdict::{
     classify, explain, hosts_lines, http_result_note, refine_with_isp_redirect, CauseContext,
@@ -177,17 +178,14 @@ fn http_via_ip(host: &str, ip: IpAddr) -> HttpResult {
     match client.get(format!("https://{}/", host)).send() {
         Ok(resp) => {
             let status = resp.status().as_u16();
+            // Голый 403/451 — отказ самого сервера (часто гео-блок),
+            // страница блокировки — только при маркерах подмены в теле.
             if status == 403 || status == 451 {
-                return HttpResult::BlockPage;
+                return HttpResult::Forbidden(status);
             }
             if (200..=399).contains(&status) {
                 let low = resp.text().unwrap_or_default().to_lowercase();
-                if low.contains("роскомнадзор")
-                    || low.contains("заблокир")
-                    || low.contains("this site is blocked")
-                    || low.contains("access denied: by order")
-                    || low.contains("страница не может быть отображена")
-                {
+                if body_looks_like_blockpage(&low) {
                     HttpResult::BlockPage
                 } else {
                     HttpResult::Ok(status)
@@ -222,15 +220,25 @@ impl ProbeOutcome {
     }
 }
 
-/// Пробует TCP:443 по списку адресов и делает HTTPS-запрос по первому ответившему.
+/// Пробует TCP:443 по списку адресов и делает HTTPS-запрос по каждому
+/// ответившему — до первого открывшего сайт. Адреса-заглушки (0.0.0.0 и т.п.)
+/// пропускаются до счётчика `MAX_IPS`: пробовать их — ложь в отчёте.
 fn probe_host_at(host: &str, ips: &[String]) -> ProbeOutcome {
     let mut tcp_only: Option<(String, HttpResult)> = None;
     let mut any_reset = false;
+    let mut tried = 0usize;
 
-    for ip in ips.iter().take(MAX_IPS) {
+    for ip in ips.iter() {
         let Ok(addr) = ip.parse::<IpAddr>() else {
             continue;
         };
+        if is_stub_ip(&addr) {
+            continue;
+        }
+        if tried >= MAX_IPS {
+            break;
+        }
+        tried += 1;
         match tcp_connect(addr, 443).as_str() {
             "RST/REFUSED" => {
                 any_reset = true;
@@ -323,10 +331,17 @@ pub fn probe_domain(host: &str) -> DomainProbe {
 
     let any_reset = sys_probe.any_reset || doh_probe.any_reset;
 
+    // DoH вернул только те же адреса, что системный DNS: проверять отдельно
+    // нечего, а системный адрес тем самым проверен защищённым каналом.
+    // Без этого флага одинаковый 403 с единственного адреса было бы не с чем
+    // сравнить — и гео-блок снова выдавался бы за «страницу провайдера».
+    let doh_agrees = !doh_addr_ips.is_empty() && doh_ips.is_empty();
+
     let facts = ProbeFacts {
         dns_spoofed: dns_spoofed.is_some(),
         system_http: sys_probe.http.clone(),
         doh_http: doh_probe.http.clone(),
+        doh_agrees,
         any_tcp_ok: sys_probe.tcp_ok || doh_probe.tcp_ok,
         any_reset,
         www_ok,
@@ -362,9 +377,11 @@ pub fn probe_domain(host: &str) -> DomainProbe {
     let verdict = refine_with_isp_redirect(base_verdict, isp_redirect.as_deref());
 
     // Адрес для подсказки «записать в hosts»: только проверенный (DoH) и
-    // только если сайт через него действительно открылся.
-    let doh_working_ip = match working_ip_source {
-        Some(IpSource::Doh) => working_ip.as_deref(),
+    // только если сайт через него действительно открылся (HTTP Ok).
+    // Без проверки Ok сюда попадал адрес с отказом/RST — и отчёт советовал
+    // hosts, по которому сайт не открывается.
+    let doh_working_ip = match (working_ip_source, &working_http) {
+        (Some(IpSource::Doh), Some(HttpResult::Ok(_))) => working_ip.as_deref(),
         _ => None,
     };
 
@@ -513,14 +530,24 @@ fn summarize_substitution(
         };
     }
 
-    let display: Vec<String> = ips.iter().take(4).map(|i| i.to_string()).collect();
-    let working = ips
+    let display: Vec<String> = ips
         .iter()
-        .take(6)
-        .find(|ip| tcp_connect(**ip, 443) == "Success")
-        .copied();
+        .filter(|ip| !is_stub_ip(ip))
+        .take(4)
+        .map(|i| i.to_string())
+        .collect();
+    // TCP-живые адреса (без заглушек): HTTPS пробуем по КАЖДОМУ до первого
+    // открывшего сайт. Раньше проверялся только первый TCP-ответивший —
+    // и если им оказывалась заглушка/битый IP, отчёт врал «не помогла»,
+    // хотя следующий адрес сайт открывал (кейс openrouter.ai).
+    let mut live: Vec<IpAddr> = Vec::new();
+    for ip in ips.iter().filter(|ip| !is_stub_ip(ip)).take(6) {
+        if tcp_connect(*ip, 443) == "Success" {
+            live.push(*ip);
+        }
+    }
 
-    let Some(ip) = working else {
+    let Some(first) = live.first().copied() else {
         return DnsSubstitution {
             service: service.to_string(),
             resolved: display,
@@ -536,22 +563,37 @@ fn summarize_substitution(
         return DnsSubstitution {
             service: service.to_string(),
             resolved: display,
-            working_ip: Some(ip.to_string()),
-            http_note: format!("TCP:443 отвечает ({})", ip),
+            working_ip: Some(first.to_string()),
+            http_note: format!("TCP:443 отвечает ({})", first),
             http_ok: true,
         };
     }
 
-    let http = http_via_ip(host, ip);
-    let http_ok = matches!(http, HttpResult::Ok(_));
-    let note = format!("HTTPS через {}: {}", ip, substitution_note(&http));
+    let mut last_note = String::new();
+    for (n, ip) in live.iter().copied().enumerate() {
+        let http = http_via_ip(host, ip);
+        if matches!(http, HttpResult::Ok(_)) {
+            let mut note = format!("HTTPS через {}: {}", ip, substitution_note(&http));
+            if n > 0 {
+                note.push_str(&format!(" (перебрано адресов: {})", n + 1));
+            }
+            return DnsSubstitution {
+                service: service.to_string(),
+                resolved: display,
+                working_ip: Some(ip.to_string()),
+                http_note: note,
+                http_ok: true,
+            };
+        }
+        last_note = format!("HTTPS через {}: {}", ip, substitution_note(&http));
+    }
 
     DnsSubstitution {
         service: service.to_string(),
         resolved: display,
-        working_ip: Some(ip.to_string()),
-        http_note: note,
-        http_ok,
+        working_ip: Some(first.to_string()),
+        http_note: last_note,
+        http_ok: false,
     }
 }
 
@@ -559,6 +601,7 @@ fn substitution_note(r: &HttpResult) -> String {
     match r {
         HttpResult::Ok(code) => format!("HTTP {}", code),
         HttpResult::BlockPage => "страница блокировки".to_string(),
+        HttpResult::Forbidden(code) => format!("отказ сервера HTTP {}", code),
         HttpResult::Tls => "TLS сломан".to_string(),
         HttpResult::BadCert => "SSL-сертификат невалиден".to_string(),
         HttpResult::Rst => "RST — TCP:443 открыт, но HTTPS рвётся (DPI по SNI)".to_string(),
@@ -570,9 +613,11 @@ fn substitution_note(r: &HttpResult) -> String {
 
 /// Готовые строки для файла hosts по проверенному адресу. Пустой список
 /// означает «адреса нет, писать нечего» — вызывающий код обязан это учесть.
+/// Адрес отдаётся только если сайт через него реально открылся (HTTP Ok):
+/// hosts для адреса с отказом/RST — ложь.
 pub fn hosts_entries(probe: &DomainProbe) -> Vec<String> {
-    let ip = match probe.working_ip_source {
-        Some(IpSource::Doh) => probe.working_ip.as_deref(),
+    let ip = match (probe.working_ip_source, &probe.working_http) {
+        (Some(IpSource::Doh), Some(HttpResult::Ok(_))) => probe.working_ip.as_deref(),
         _ => None,
     };
     hosts_lines(&probe.host, ip)
