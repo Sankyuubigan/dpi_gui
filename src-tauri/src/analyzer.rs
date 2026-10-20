@@ -10,9 +10,12 @@ use headless_chrome::protocol::cdp::Network;
 use sysinfo::System;
 use tauri::AppHandle;
 use crate::process;
-use crate::config;
 use crate::analyzer_probe::{self, Probe};
 use crate::analyzer_report::{self, ReportMeta};
+use crate::bypass_toggle;
+use crate::ip_probe;
+use crate::analyzer_ip_report;
+use crate::ip_target;
 use crate::site_probe;
 
 // Скрывает КОНСОЛЬНЫЕ окна, которые порождает headless Chrome на Windows.
@@ -119,16 +122,22 @@ fn extract_value(s: &str, key: &str) -> Option<String> {
 }
 
 pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
-    let target_url = if !url.starts_with("http") { format!("https://{}", url) } else { url.to_string() };
+    // Единая точка распознавания цели (SSOT в ip_target).
+    // IP/IP:port уходит в собственный IP-режим: браузер и сбор доменов
+    // для IP-цели бессмысленны (сайту к IP нечего открывать).
+    match ip_target::parse_target(url) {
+        ip_target::AnalysisTarget::Ip { ip, port } => {
+            let facts = ip_probe::analyze_ip(app, ip, port);
+            Ok(analyzer_ip_report::build_ip_report(ip, port, &facts))
+        }
+        ip_target::AnalysisTarget::Domain { host } => analyze_domain(app, url, host),
+    }
+}
 
+fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<String, String> {
     // Диагностика главного домена: DNS + поиск рабочего IP + первопричина.
     // Делаем сразу, чтобы отчёт начинался с главного: «сайт не открывается, вот почему».
-    let main_host = url::Url::parse(&target_url)
-        .ok()
-        .and_then(|u| u.host_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| target_url.clone())
-        .trim_end_matches('/')
-        .to_string();
+    let target_url = ip_target::target_url_of(url);
     let main_probe = site_probe::probe_domain(&main_host);
 
     // Используем НОВЫЙ headless-режим (--headless=new). В отличие от старого
@@ -302,13 +311,11 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
 
     let classification = if bypass_on && !broken_on.is_empty() {
         // Запоминаем активный профиль, чтобы восстановить обход после проверки.
-        let (saved_profile, saved_game_filter) = read_active_profile();
+        let saved = bypass_toggle::capture_active();
 
         // Выключаем обход и перепроверяем сломанные домены без него.
-        let _ = process::stop_winws();
+        bypass_toggle::stop_bypass();
         bypass_toggled = true;
-        // Пауза на выгрузку драйвера WinDivert (см. docs 4.7).
-        thread::sleep(Duration::from_millis(1200));
 
         let results_off = analyzer_probe::probe_all(&broken_on);
         let mut broken_off: HashSet<String> = HashSet::new();
@@ -331,27 +338,8 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
             }
         }
 
-        // Авто-восстановление обхода прежним профилем.
-        if let Some(profile) = saved_profile {
-            match process::start_winws(app.clone(), &profile, saved_game_filter) {
-                Ok(_) => {
-                    restore_note = Some(format!(
-                        "✅ Обход восстановлен (профиль «{}»).",
-                        profile
-                    ));
-                }
-                Err(e) => {
-                    restore_note = Some(format!(
-                        "⚠️ Не удалось восстановить обход автоматически ({}). Включите профиль вручную.",
-                        e
-                    ));
-                }
-            }
-        } else {
-            restore_note = Some(
-                "⚠️ Активный профиль не определён — включите обход вручную.".to_string(),
-            );
-        }
+        // Авто-восстановление обхода прежним профилем (общая логика SSOT).
+        restore_note = bypass_toggle::restore_bypass(app, &saved);
 
         analyzer_probe::classify_dual(
             results_on,
@@ -400,24 +388,5 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
     };
 
     Ok(analyzer_report::build_report(&meta, &classification))
-}
-
-/// Читает активный профиль обхода и флаг game_filter из config.json.
-fn read_active_profile() -> (Option<String>, bool) {
-    match config::read_config() {
-        Ok(cfg) => {
-            let profile = cfg
-                .get("selected_profile")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string());
-            let game_filter = cfg
-                .get("game_filter")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            (profile, game_filter)
-        }
-        Err(_) => (None, false),
-    }
 }
 

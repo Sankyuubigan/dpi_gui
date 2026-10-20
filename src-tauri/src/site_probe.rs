@@ -165,17 +165,24 @@ fn probe_isp_redirect(host: &str, ip: IpAddr) -> Option<String> {
 }
 
 /// HTTPS-запрос к конкретному адресу: адрес подставляется на уровне сокета,
-/// имя домена остаётся в SNI и в проверке сертификата.
-fn http_via_ip(host: &str, ip: IpAddr) -> HttpResult {
+/// имя домена остаётся в SNI и в проверке сертификата. Публично и с явным
+/// портом: используется также IP-режимом анализа (ip_probe SNI-эксперимент) —
+/// дубль reqwest-клиента для него запрещён (SSOT).
+pub fn http_via_ip(host: &str, ip: IpAddr, port: u16) -> HttpResult {
+    let url = if port == 443 {
+        format!("https://{}/", host)
+    } else {
+        format!("https://{}:{}/", host, port)
+    };
     let client = match Client::builder()
-        .resolve(host, SocketAddr::new(ip, 443))
+        .resolve(host, SocketAddr::new(ip, port))
         .timeout(Duration::from_secs(6))
         .build()
     {
         Ok(c) => c,
         Err(e) => return HttpResult::Other(format!("не удалось создать клиент: {}", e)),
     };
-    match client.get(format!("https://{}/", host)).send() {
+    match client.get(&url).send() {
         Ok(resp) => {
             let status = resp.status().as_u16();
             // Голый 403/451 — отказ самого сервера (часто гео-блок),
@@ -247,7 +254,7 @@ fn probe_host_at(host: &str, ips: &[String]) -> ProbeOutcome {
             "Success" => {}
             _ => continue,
         }
-        let r = http_via_ip(host, addr);
+        let r = http_via_ip(host, addr, 443);
         if let HttpResult::Ok(code) = r {
             return ProbeOutcome {
                 tcp_ok: true,
@@ -492,7 +499,7 @@ pub struct DnsSubstitution {
 /// Экспорт HTTPS-пробы по конкретному IP (для hosts-фичи: проверяем, что
 /// сайт реально открывается через выбранный адрес после записи в hosts).
 pub fn probe_https_by_ip(host: &str, ip: IpAddr) -> HttpResult {
-    http_via_ip(host, ip)
+    http_via_ip(host, ip, 443)
 }
 
 /// Проверка «подмены DNS»: резолв домена через DoH-сервисы и поиск рабочего IP.
@@ -571,7 +578,7 @@ fn summarize_substitution(
 
     let mut last_note = String::new();
     for (n, ip) in live.iter().copied().enumerate() {
-        let http = http_via_ip(host, ip);
+        let http = http_via_ip(host, ip, 443);
         if matches!(http, HttpResult::Ok(_)) {
             let mut note = format!("HTTPS через {}: {}", ip, substitution_note(&http));
             if n > 0 {

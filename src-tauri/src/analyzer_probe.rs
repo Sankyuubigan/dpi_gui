@@ -6,7 +6,7 @@ use reqwest::blocking::Client as HttpClient;
 /// Результат «простукивания» одного домена через сетевой стек ОС.
 /// Так как winws (WinDivert) работает на уровне драйвера, он перехватывает ВЕСЬ
 /// трафик, включая этот запрос. Если обход ломает домен — получим обрыв соединения.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Probe {
     Ok,
     Dns,

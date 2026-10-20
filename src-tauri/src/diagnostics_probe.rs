@@ -292,7 +292,7 @@ fn resolve_via(domain: &str, ns: &str) -> Vec<IpAddr> {
     resolve_via_full(domain, ns).ips
 }
 
-fn resolve_system(domain: &str) -> Vec<IpAddr> {
+pub fn resolve_system(domain: &str) -> Vec<IpAddr> {
     resolve_system_full(domain).ips
 }
 

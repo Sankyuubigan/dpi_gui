@@ -1,0 +1,68 @@
+//! Общая логика «сохранить активный профиль обхода → остановить winws →
+//! восстановить». Единое место (SSOT) для доменного анализа и IP-режима:
+//! раньше эта связка жила в analyzer.rs и при появлении второго потребителя
+//! неизбежно дублировалась бы.
+
+use std::thread;
+use std::time::Duration;
+
+use tauri::AppHandle;
+
+use crate::config;
+use crate::process;
+
+/// Сохранённое состояние обхода на момент начала двухфазовой пробы.
+pub struct SavedBypass {
+    pub profile: Option<String>,
+    pub game_filter: bool,
+}
+
+/// Читает активный профиль обхода и флаг game_filter из config.json.
+pub fn read_active_profile() -> (Option<String>, bool) {
+    match config::read_config() {
+        Ok(cfg) => {
+            let profile = cfg
+                .get("selected_profile")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let game_filter = cfg
+                .get("game_filter")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            (profile, game_filter)
+        }
+        Err(_) => (None, false),
+    }
+}
+
+pub fn capture_active() -> SavedBypass {
+    let (profile, game_filter) = read_active_profile();
+    SavedBypass { profile, game_filter }
+}
+
+/// Остановка обхода и пауза на выгрузку драйвера WinDivert
+/// (см. AGENTS.md п. 3: `stop_winws` делает `sc stop WinDivert`,
+/// драйверу нужно время на выгрузку).
+pub fn stop_bypass() {
+    let _ = process::stop_winws();
+    thread::sleep(Duration::from_millis(1200));
+}
+
+/// Восстановление обхода сохранённым профилем. Возвращает готовый текст
+/// заметки для отчёта (в т.ч. честную ошибку — при неудаче восстановления
+/// или отсутствии профиля, core rules §2.2).
+pub fn restore_bypass(app: &AppHandle, saved: &SavedBypass) -> Option<String> {
+    match &saved.profile {
+        Some(profile) => match process::start_winws(app.clone(), profile, saved.game_filter) {
+            Ok(_) => Some(format!("✅ Обход восстановлен (профиль «{}»).", profile)),
+            Err(e) => Some(format!(
+                "⚠️ Не удалось восстановить обход автоматически ({}). Включите профиль вручную.",
+                e
+            )),
+        },
+        None => Some(
+            "⚠️ Активный профиль не определён — включите обход вручную.".to_string(),
+        ),
+    }
+}

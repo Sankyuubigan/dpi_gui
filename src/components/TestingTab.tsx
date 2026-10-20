@@ -43,8 +43,8 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
     if (!url) return;
     setIsTesting(true);
     setLog([
-      { text: `[Анализ] Запуск анализа доменов для: ${url}...`, kind: "info" },
-      { text: "Фоновый браузер запущен. Сбор доменов и проверка их доступности через обход (займет до ~25 сек)...", kind: "info" }
+      { text: `[Анализ] Запуск анализа для: ${url}...`, kind: "info" },
+      { text: "Идёт анализ: пробы соединения (с обходом/без), поиск кандидатов в списках (до ~30 сек)...", kind: "info" }
     ]);
 
     try {
@@ -273,7 +273,7 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
               disabled={isTesting}
               className="flex-1 flex items-center justify-center gap-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-400 text-white py-2 rounded-lg font-bold transition"
             >
-              <Search size={18} /> Анализ доменов
+              <Search size={18} /> Анализ сайта / IP
             </button>
             <button
               onClick={runProfileTest}
