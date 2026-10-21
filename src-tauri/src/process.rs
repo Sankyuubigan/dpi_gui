@@ -106,6 +106,16 @@ fn spawn_winws(app: &AppHandle, final_args: Vec<String>, quiet: bool) -> Result<
     let pid = child.id();
     let _ = app.emit("log", format!("Процесс запущен успешно. PID: {}", pid));
 
+    // Автомонитор блокировок (PRP «21.10.26»): фоновый sniff-детектор.
+    // Запускается только для обычного (не-тихого) запуска — тихий режим
+    // используется тестами профилей и диагностикой, чтобы не плодить ложные детекции.
+    // Ошибка Err уже несёт свой префикс «[Автомонитор]» — не дублируем его в логе.
+    if !quiet {
+        if let Err(e) = crate::domain_monitor::start_domain_monitor(app.clone()) {
+            let _ = app.emit("log", e);
+        }
+    }
+
     // Перехват stdout. В тихом режиме кухню процесса в лог не льём —
     // winws выводит десятки служебных строк, бесполезных пользователю.
     let stdout = child.stdout.take();
@@ -164,6 +174,11 @@ pub fn start_winws_custom_quiet(app: AppHandle, raw_args_template: &str, game_fi
 }
 
 pub fn stop_winws() -> Result<String, String> {
+    // Сниффер-детектор глушим ПЕРВЫМ шагом: его поток должен успеть увидеть
+    // shutdown и выйти до смерти обхода/службы (PRP ШАГ 3). Ошибка не роняет
+    // штатную остановку обхода.
+    crate::domain_monitor::stop_domain_monitor();
+
     // Останавливаем скрыто, без моргания окон консоли
     let _ = Command::new("taskkill")
         .args(["/F", "/IM", WINWS_EXE])

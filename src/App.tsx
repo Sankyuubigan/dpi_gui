@@ -1,9 +1,26 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import ControlTab from "./components/ControlTab";
 import SettingsTab from "./components/SettingsTab";
 import TestingTab, { type LogEntry } from "./components/TestingTab";
 import AboutTab from "./components/AboutTab";
+
+const MAX_LOG_LINES = 5000; // лог живёт ВСЮ сессию приложения (PRP §7.1)
+const MAX_SUSPICIONS = 200; // список подозрений — рабочая память (PRP §7.2)
+
+export interface Suspicion {
+  domain: string;
+  /// Машинная причина: "rst" | "retrans" (человекочитаемую берём через reasonToHuman).
+  reason: string;
+  client_ip_port: string;
+  /// ШАГ D (PRP §7.5): названия наших списков, где нашёлся домен; пусто = нигде.
+  lists: string[];
+  /// ШАГ E (PRP §7.6): процесс, который стучался; пустая строка = не определился.
+  proc: string;
+  lastTs: number; // observed_at_ms последнего события по домену
+  count: number; // сколько событий по этому домену было (дедуп по домену)
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState("control");
@@ -14,6 +31,67 @@ export default function App() {
   const [testingUrl, setTestingUrl] = useState("youtube.com");
   const [testingIsTesting, setTestingIsTesting] = useState(false);
 
+  // Лог и список подозрений живут ЗДЕСЬ, в App, а НЕ в ControlTab:
+  // App никогда не размонтируется при смене вкладок, поэтому лог сохраняется
+  // на всё время работы приложения (PRP §7.1, баг «лог чистится при смене вкладки»).
+  const [logs, setLogs] = useState<string[]>([]);
+  const [suspicions, setSuspicions] = useState<Suspicion[]>([]);
+
+  const logMsg = (msg: string) => {
+    const time = new Date().toLocaleTimeString();
+    setLogs(prev => [...prev, `[${time}] ${msg}`].slice(-MAX_LOG_LINES));
+  };
+
+  // Слушатели бэкенд-событий: «log» (общий журнал) и «domain_discovery»
+  // (фоновой детектор подозрительных доменов). Дедуп по домену: повтор события
+  // по уже известному домену обновляет его строку (причина/ip/время/счётчик),
+  // новых строк не создаёт (PRP §7.2).
+  useEffect(() => {
+    const unLog = listen<string>("log", (event) => {
+      logMsg(event.payload);
+    });
+    const unDiscovery = listen<any>("domain_discovery", (event) => {
+      const ev = event.payload;
+      const lists: string[] = ev.lists || [];
+      const proc: string = ev.proc_name || "";
+      setSuspicions(prev => {
+        const idx = prev.findIndex(s => s.domain === ev.domain);
+        if (idx >= 0) {
+          const old = prev[idx];
+          const next = [...prev];
+          next[idx] = {
+            ...old,
+            reason: ev.reason,
+            client_ip_port: ev.client_ip_port,
+            lists,
+            proc,
+            lastTs: ev.observed_at_ms || Date.now(),
+            count: old.count + 1,
+          };
+          return next;
+        }
+        const cur: Suspicion = {
+          domain: ev.domain,
+          reason: ev.reason,
+          client_ip_port: ev.client_ip_port,
+          lists,
+          proc,
+          lastTs: ev.observed_at_ms || Date.now(),
+          count: 1,
+        };
+        return [...prev, cur].slice(-MAX_SUSPICIONS);
+      });
+      // Человекочитаемую строку "[БЛОКИРОВКА?] …" в лог пишет сам бэкенд через
+      // app_log (listen("log") выше) — С ТЕКСТОМ СПИСКОВ (ШАГ D). Здесь ручное
+      // дублирование НЕ нужно: раньше фронт дублировал строку без списков (баг).
+    });
+
+    return () => {
+      unLog.then(f => f());
+      unDiscovery.then(f => f());
+    };
+  }, []);
+
   // Загрузка конфигурации при старте
   useEffect(() => {
     async function init() {
@@ -23,7 +101,7 @@ export default function App() {
         setConfig(loadedConfig);
         const loadedProfiles: any[] = await invoke("get_profiles");
         setProfiles(loadedProfiles);
-        
+
         // Проверяем, запущен ли процесс
         const status: boolean = await invoke("check_status");
         setIsRunning(status);
@@ -32,7 +110,7 @@ export default function App() {
       }
     }
     init();
-    
+
     // Периодическая проверка статуса
     const interval = setInterval(async () => {
       const status: boolean = await invoke("check_status");
@@ -79,17 +157,20 @@ export default function App() {
       {/* Содержимое вкладок */}
       <div className="flex-1 overflow-auto p-4">
         {activeTab === "control" && (
-          <ControlTab 
-            isRunning={isRunning} 
-            profiles={profiles} 
-            config={config} 
-            saveConfig={saveConfig} 
+          <ControlTab
+            isRunning={isRunning}
+            profiles={profiles}
+            config={config}
+            saveConfig={saveConfig}
+            logs={logs}
+            suspicions={suspicions}
+            logMsg={logMsg}
           />
         )}
         {activeTab === "settings" && <SettingsTab />}
         {activeTab === "testing" && (
-          <TestingTab 
-            profiles={profiles} 
+          <TestingTab
+            profiles={profiles}
             setProfiles={setProfiles}
             config={config}
             log={testingLog}

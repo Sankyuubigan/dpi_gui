@@ -34,7 +34,7 @@ use crate::process;
 /// устаканиваются перед фазой резолва (тяжёлые паузы живут в bypass_toggle).
 const PROBE_GAP: Duration = Duration::from_millis(200);
 
-pub(crate) fn app_log(app: &AppHandle, msg: impl Into<String>) {
+pub fn app_log(app: &AppHandle, msg: impl Into<String>) {
     let _ = app.emit("log", msg.into());
 }
 

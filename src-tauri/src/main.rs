@@ -21,6 +21,11 @@ mod diagnostics_probe;
 mod diagnostics_techniques;
 mod diagnostics_report;
 mod hosts;
+mod events;
+mod win_divert;
+mod domain_monitor;
+mod list_index;
+mod process_owner;
 
 use tauri::AppHandle;
 

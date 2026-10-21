@@ -1,7 +1,31 @@
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { FolderOpen, Edit3 } from "lucide-react";
+import { FolderOpen, Edit3, Eye } from "lucide-react";
 
 export default function SettingsTab() {
+  const [config, setConfig] = useState<any>(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const cfg: any = await invoke("get_config");
+        setConfig(cfg);
+      } catch (e) {
+        console.error("get_config:", e);
+      }
+    })();
+  }, []);
+
+  const saveMode = async (mode: string) => {
+    if (!config) return;
+    const next = { ...config, domain_monitor_mode: mode };
+    setConfig(next);
+    try {
+      await invoke("save_config", { config: next });
+    } catch (e) {
+      console.error("save_config:", e);
+    }
+  };
   
   const openFile = async (type: string) => {
     try { await invoke("open_file", { fileType: type }); } 
@@ -46,6 +70,31 @@ export default function SettingsTab() {
               <FolderOpen size={18} />
             </button>
           </div>
+        </div>
+      </div>
+
+      <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+        <div className="flex items-center gap-2 mb-4">
+          <Eye size={18} className="text-blue-600" />
+          <h2 className="text-xl font-bold text-gray-800">Наблюдение за блокировками</h2>
+        </div>
+        <p className="text-gray-500 mb-4 text-sm">
+          Фоновый детектор ловит «сломанные» домены (входящий RST от сервера или
+          повторные отправки данных на TLS:443) во время работы обхода. Списки при
+          этом не изменяются — события только в лог. Режим применяется после
+          перезапуска обхода.
+        </p>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Режим детектора</label>
+          <select
+            value={config?.domain_monitor_mode || "observe"}
+            onChange={(e) => saveMode(e.target.value)}
+            disabled={!config}
+            className="w-full border-gray-300 rounded-md shadow-sm p-2 border focus:border-blue-500 focus:ring-blue-500"
+          >
+            <option value="observe">Наблюдение (только лог)</option>
+            <option value="off">Выключено</option>
+          </select>
         </div>
       </div>
     </div>
