@@ -375,6 +375,20 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Strin
         .map(|h| (h.clone(), site_probe::check_dns_substitution(h, false)))
         .collect();
 
+    // Разбор первопричины для главного домена: разновидности 403 (чужой VIP /
+    // WAF-гео / голый отказ), транспорт-блок цензором и — только если транспорт
+    // к родным IP не работает — скан CIDR-диапазонов с поиском рабочего IP.
+    // Условие совпадает с блоком подмены DNS: сайт открывается или найдено
+    // рабочее имя (WwwOnly) — разбирать нечего.
+    let block_scan = if main_probe.verdict.site_broken()
+        && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
+    {
+        let report = crate::ip_range_scan::block_diagnose(app, &main_host);
+        Some((main_host, report))
+    } else {
+        None
+    };
+
     let meta = ReportMeta {
         target_url,
         discovered,
@@ -385,6 +399,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Strin
         main_probe: Some(main_probe),
         main_dns_sub,
         dns_fail_sub,
+        block_scan,
     };
 
     Ok(analyzer_report::build_report(&meta, &classification))

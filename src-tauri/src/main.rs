@@ -8,7 +8,9 @@ mod analyzer_report;
 mod analyzer_ip_report;
 mod bypass_toggle;
 mod ip_candidates;
-mod ip_probe;
+ mod ip_probe;
+
+ mod ip_range_scan;
 mod ip_target;
 mod site_probe;
 mod site_verdict;

@@ -23,6 +23,10 @@ pub struct ReportMeta {
     pub main_dns_sub: Vec<site_probe::DnsSubstitution>,
     /// Проверка подмены DNS для доменов из списка «не резолвится» (до 5).
     pub dns_fail_sub: Vec<(String, Vec<site_probe::DnsSubstitution>)>,
+    /// Разбор первопричины недоступности главного домена: разновидность 403,
+    /// транспорт-блок цензором + скан CIDR Cloudflare (Заполнен, когда сайт
+    /// не открывается: см. `ip_range_scan::block_diagnose`).
+    pub block_scan: Option<(String, crate::ip_range_scan::BlockScanReport)>,
 }
 
 /// Путь к пользовательскому general-листу (для подсказок «добавьте в обход»).
@@ -51,6 +55,9 @@ pub fn build_report(meta: &ReportMeta, c: &Classification) -> String {
 
     // Автопроверка подмены DNS — если обычный DNS отравлен и сайт не открывается.
     write_dns_substitution(&mut log, meta);
+
+    // Разбор блока сервера/IP/CDN главного домена (403-разновидности, скан CIDR).
+    write_block_scan(&mut log, meta);
 
     log.push_str(&format!(
         "Обход (winws) активен: {}\n",
@@ -383,6 +390,21 @@ fn dns_label(ips: &[std::net::IpAddr], state: DnsState) -> String {
     }
 }
 
+/// Секция разбора блока сервера/IP главного домена. Тексты берутся из
+/// ЕДИНОГО места — `ip_range_scan::build_report_lines` (как и hosts-строки
+/// выше берутся из `site_probe::hosts_entries`).
+fn write_block_scan(log: &mut String, meta: &ReportMeta) {
+    let Some((host, report)) = &meta.block_scan else {
+        return;
+    };
+    log.push('\n');
+    for line in crate::ip_range_scan::build_report_lines(host, report) {
+        log.push_str(&line);
+        log.push('\n');
+    }
+    log.push('\n');
+}
+
 fn write_dns_substitution(log: &mut String, meta: &ReportMeta) {
     if meta.main_dns_sub.is_empty() {
         return;
@@ -693,6 +715,7 @@ mod tests {
             main_probe: Some(probe),
             main_dns_sub: Vec::new(),
             dns_fail_sub: Vec::new(),
+            block_scan: None,
         }
     }
 
