@@ -12,8 +12,8 @@ pub type BypassMap = HashMap<String, Vec<PathBuf>>;
 ///
 /// Учитываются:
 /// - `--hostlist=` файлы из аргументов активного профиля (пользовательские списки)
-/// - встроенные списки `default-bypass/list-general.txt` и `default-bypass/list-google.txt`
-///   (всегда подключаются в process.rs независимо от профиля)
+/// - встроенные списки `defaults/list-general.txt` и `defaults/list-google.txt`
+///   (всегда подключаются в process.rs независимо от профиля, папка lists/defaults/)
 ///
 /// Матчинг домена: точное совпадение либо суффикс (домен является субдоменом списка),
 /// т.е. `sub.example.com` найдётся по записи `example.com`.
@@ -48,9 +48,9 @@ pub fn load_bypass_domains() -> BypassMap {
         }
     }
 
-    // 2. Встроенные списки обхода (всегда подключаются в process.rs)
-    candidate_files.push(lists_dir.join("default-bypass").join("list-general.txt"));
-    candidate_files.push(lists_dir.join("default-bypass").join("list-google.txt"));
+    // 2. Встроенные списки обхода (всегда подключаются в process.rs; папка defaults/)
+    candidate_files.push(config::defaults_dir().join("list-general.txt"));
+    candidate_files.push(config::defaults_dir().join("list-google.txt"));
 
     // Убираем дубли (если профиль ссылается на те же файлы)
     candidate_files.sort();
@@ -76,14 +76,14 @@ pub fn load_bypass_domains() -> BypassMap {
     map
 }
 
-/// Собирает домены из пользовательского и встроенного списков ИСКЛЮЧЕНИЙ
-/// (list-exclude.txt и default-exclude.txt). Используется, чтобы не советовать
+/// Собирает домены из пользовательского и дефолтного списков ИСКЛЮЧЕНИЙ
+/// (list-exclude.txt и defaults/default-exclude.txt). Используется, чтобы не советовать
 /// добавлять в исключения то, что юзер уже и так исключил.
 pub fn load_exclude_domains() -> HashSet<String> {
     let lists_dir = config::get_app_dir().join("lists");
     let files = [
         lists_dir.join("list-exclude.txt"),
-        lists_dir.join("default-exclude.txt"),
+        config::defaults_dir().join("default-exclude.txt"),
     ];
     let mut set = HashSet::new();
     for file in files {

@@ -8,8 +8,10 @@
 //! (поле `lists` события `domain_discovery`), списки на фронт не копируются.
 //!
 //! Состав списков — факт из кода (`config.rs::ensure_directories_and_files`):
-//! ровно 6 файлов в `AppData/.../lists/`, профили winws подключают только их,
-//! поэтому директорию не сканируем — фиксируем состав таблицей ниже.
+//! ровно 6 файлов в `AppData/.../lists/` (3 юзерских в корне + 3 дефолтных в
+//! `lists/defaults/`, которые перезаписываются при каждом запуске), профили
+//! winws подключают только их, поэтому директорию не сканируем — фиксируем
+//! состав таблицей ниже.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,9 +22,10 @@ const LIST_FILES: [(&str, &str); 6] = [
     ("list-general.txt", "General List"),
     ("list-exclude.txt", "Exclude List"),
     ("list-google.txt", "Google List"),
-    ("default-exclude.txt", "Дефолтные исключения"),
-    ("default-bypass/list-general.txt", "Дефолтный bypass (General)"),
-    ("default-bypass/list-google.txt", "Дефолтный bypass (Google)"),
+    // Дефолтные списки — единая папка lists/defaults/, перезапись при каждом старте.
+    ("defaults/default-exclude.txt", "Дефолтные исключения"),
+    ("defaults/list-general.txt", "Дефолтный bypass (General)"),
+    ("defaults/list-google.txt", "Дефолтный bypass (Google)"),
 ];
 
 /// Лейблы списков по битовой маске.
@@ -132,7 +135,7 @@ mod tests {
             .expect("время системное настоящий")
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("dpi_gui_list_index_{}_{}", tag, unique));
-        fs::create_dir_all(dir.join("default-bypass")).expect("создание temp-поддерева");
+        fs::create_dir_all(dir.join("defaults")).expect("создание temp-поддерева");
         dir
     }
 
@@ -216,7 +219,7 @@ mod tests {
         // проверка на живой машине; здесь только честный подход через файлы.
         let dir = temp_subdir("realf");
         fs::write(
-            dir.join("default-bypass").join("list-google.txt"),
+            dir.join("defaults").join("list-google.txt"),
             "*.googlevideo.com\n",
         )
         .expect("запись temp");

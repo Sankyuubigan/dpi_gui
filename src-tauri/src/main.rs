@@ -54,6 +54,19 @@ fn open_file(file_type: String) -> Result<(), String> {
     config::open_file_in_editor(&file_type).map_err(|e| e.to_string())
 }
 
+/// Список DoH-сервисов подмены DNS для UI-дропдауна — из дефолт-файла
+/// lists/defaults/doh-services.txt (переписывается при каждом старте).
+/// При сбое чтения файла — встроенный дефолт
+/// (fallback-логика ровно одна, в diagnostics_probe::load_doh_resolvers).
+#[tauri::command]
+fn get_doh_services() -> Vec<String> {
+    let (services, _warnings, _config_error) = diagnostics_probe::load_doh_resolvers();
+    services
+        .iter()
+        .map(|host| format!("https://{}/dns-query", host))
+        .collect()
+}
+
 #[tauri::command]
 fn start_bypass(app: AppHandle, profile_name: String, game_filter: bool) -> Result<String, String> {
     process::start_winws(app, &profile_name, game_filter).map_err(|e| e.to_string())
@@ -164,6 +177,7 @@ fn main() {
             save_config,
             get_profiles,
             open_file,
+            get_doh_services,
             start_bypass,
             stop_bypass,
             check_status,

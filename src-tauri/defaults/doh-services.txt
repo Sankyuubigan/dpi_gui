@@ -1,0 +1,14 @@
+# DoH-сервисы подмены DNS — единственный источник списка (SSOT).
+# Один сервер на строку. Формат: полный URL (https://dns.dagami.ru/dns-query)
+# или только хост (dns.dagami.ru). Пустые строки и # комментарии игнорируются.
+# Файл читается при КАЖДОМ тесте подмены DNS и каждом анализе домена —
+# правки применяются без перезапуска приложения.
+# Если удалить этот файл — используем встроенный список по умолчанию.
+
+https://xbox-dns.ru/dns-query
+https://geohide.ru/dns-query
+https://eu.geohide.ru/dns-query
+https://dns.comss.one/dns-query
+https://dns.bezmezhau.com/dns-query
+https://dns.dns-ai.ru/dns-query
+https://dns.dagami.ru/dns-query

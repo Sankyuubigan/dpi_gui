@@ -5,9 +5,120 @@ use std::process::Command;
 use serde_json::json;
 
 pub fn get_app_dir() -> PathBuf {
+    // Тест/дев-оверрайд: вместо реального AppData — своя папка (sandbox для
+    // юнит-тестов ensure_directories_and_files; в проде переменная не задана).
+    if let Ok(custom) = std::env::var("DPI_GUI_APP_DIR") {
+        if !custom.is_empty() {
+            return PathBuf::from(custom);
+        }
+    }
     let mut path = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push("DPI_GUI");
     path
+}
+
+/// Папка дефолтных списков в AppData: все четыре дефолта перезаписываются
+/// сюда из встроенных исходников при каждом запуске (контракт владельца).
+pub fn defaults_dir() -> PathBuf {
+    get_app_dir().join("lists").join("defaults")
+}
+
+/// Путь к дефолтному файлу DoH-сервисов подмены DNS (lists/defaults/).
+/// Файл перезаписывается при каждом запуске из src-tauri/defaults/, правки
+/// вручную живут только до перезапуска.
+pub fn doh_services_path() -> PathBuf {
+    defaults_dir().join("doh-services.txt")
+}
+
+/// Результат чтения doh-services.txt. `hosts` — нормализованные хосты
+/// (только имена, без схемы и пути), `warnings` — читаемые причины
+/// проигнорированных строк (core rules §2.2: молчаливых ошибок нет).
+#[derive(Debug, PartialEq)]
+pub struct DohServicesRead {
+    pub file_found: bool,
+    pub hosts: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Парсинг текста doh-services.txt: по одному DoH-серверу на строку.
+/// Допускается полный URL (`https://host/dns-query`) или только хост.
+/// Пустые строки и `#` — комментарии. Валидный хост: ≥ 1 точка, символы
+/// только `[a-z0-9.-]`. Дубли убираются с сохранением порядка.
+/// Чистая функция — покрыта юнит-тестами.
+pub fn parse_doh_services(text: &str) -> (Vec<String>, Vec<String>) {
+    let mut hosts: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (idx, raw) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut host = line.to_lowercase();
+        if host.starts_with("http://") {
+            warnings.push(format!(
+                "строка {}: «{}» — DoH-серверы работают только по https://, строка проигнорирована",
+                line_no, raw.trim()
+            ));
+            continue;
+        }
+        if let Some(rest) = host.strip_prefix("https://") {
+            host = rest.to_string();
+        }
+        // Хост = всё до первого слеша (путь, если указан, отбрасываем —
+        // запрос всё равно выполняем по собственному пути /dns-query).
+        if let Some(pos) = host.find('/') {
+            host.truncate(pos);
+        }
+        let host = host.trim_end_matches('.').to_string();
+        if host.is_empty() {
+            warnings.push(format!("строка {}: «{}» — пустое имя хоста, строка проигнорирована", line_no, raw.trim()));
+            continue;
+        }
+        let valid = host.contains('.')
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+        if !valid {
+            warnings.push(format!(
+                "строка {}: «{}» — не похоже на имя DoH-сервера (нужен хост вида dns.example.com), строка проигнорирована",
+                line_no, raw.trim()
+            ));
+            continue;
+        }
+        if seen.insert(host.clone()) {
+            hosts.push(host);
+        }
+    }
+
+    (hosts, warnings)
+}
+
+/// Читает doh-services.txt. Файл не найден/нечитаем → hosts пуст, file_found=false
+/// и warning с реальной причиной; решение о fallback принимает вызывающий код.
+pub fn read_doh_services() -> DohServicesRead {
+    let path = doh_services_path();
+    match fs::read_to_string(&path) {
+        Ok(text) => {
+            let (hosts, warnings) = parse_doh_services(&text);
+            DohServicesRead {
+                file_found: true,
+                hosts,
+                warnings,
+            }
+        }
+        Err(e) => DohServicesRead {
+            file_found: false,
+            hosts: Vec::new(),
+            warnings: vec![format!(
+                "не удалось прочитать список DoH-серверов {}: {}",
+                path.display(),
+                e
+            )],
+        },
+    }
 }
 
 pub fn ensure_directories_and_files() -> Result<(), std::io::Error> {
@@ -44,22 +155,29 @@ pub fn ensure_directories_and_files() -> Result<(), std::io::Error> {
         }
     }
 
-    // Дефолтный список исключений — встроен в бинарник, перезаписывается при каждом запуске
-    let default_exclude = include_str!("../default-exclude.txt");
-    fs::write(lists_dir.join("default-exclude.txt"), default_exclude)?;
-
-    // Дефолтные списки обхода — встроены в бинарник, перезаписываются при каждом запуске
-    let default_bypass_dir = lists_dir.join("default-bypass");
-    if !default_bypass_dir.exists() {
-        fs::create_dir_all(&default_bypass_dir)?;
+    // ДЕФОЛТНЫЕ СПИСКИ — единая папка lists/defaults/, жёсткая перезапись
+    // из встроенных исходников при КАЖДОМ запуске (контракт владельца):
+    // правки дефолтов сначала меняются в repo (src-tauri/defaults/) и едут
+    // релизами ко всем юзерам; правки в AppData живут до перезапуска.
+    let defaults_dir = defaults_dir();
+    if !defaults_dir.exists() {
+        fs::create_dir_all(&defaults_dir)?;
     }
-    let default_bypass_files = vec![
-        ("list-general.txt", include_str!("../default-bypass/list-general.txt")),
-        ("list-google.txt", include_str!("../default-bypass/list-google.txt")),
+    let default_files: &[(&str, &str)] = &[
+        ("list-general.txt", include_str!("../defaults/list-general.txt")),
+        ("list-google.txt", include_str!("../defaults/list-google.txt")),
+        ("default-exclude.txt", include_str!("../defaults/default-exclude.txt")),
+        ("doh-services.txt", include_str!("../defaults/doh-services.txt")),
     ];
-    for (filename, content) in default_bypass_files {
-        fs::write(default_bypass_dir.join(filename), content)?;
+    for (filename, content) in default_files {
+        fs::write(defaults_dir.join(filename), content)?;
     }
+
+    // Миграция со старых мест дефолтов (версии до папки defaults/):
+    // удаляем best-effort, ошибки удаления не фатальны.
+    let _ = fs::remove_file(lists_dir.join("default-exclude.txt"));
+    let _ = fs::remove_file(lists_dir.join("doh-services.txt"));
+    let _ = fs::remove_dir_all(lists_dir.join("default-bypass"));
 
     // Проверка и инициализация профилей вынесена в read_profiles() для надежности
     let _ = read_profiles(); 
@@ -126,6 +244,7 @@ pub fn open_file_in_editor(file_type: &str) -> Result<(), std::io::Error> {
         "list_general" => app_dir.join("lists").join("list-general.txt"),
         "list_exclude" => app_dir.join("lists").join("list-exclude.txt"),
         "profiles" => app_dir.join("profiles.json"),
+        "doh_services" => defaults_dir().join("doh-services.txt"),
         _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Unknown file type")),
     };
 
@@ -135,4 +254,139 @@ pub fn open_file_in_editor(file_type: &str) -> Result<(), std::io::Error> {
         .spawn()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_full_url_and_bare_host() {
+        // Полный URL и bare host одного сервера нормализуются к одному хосту
+        // и схлопываются дедупом в единственную запись.
+        let (hosts, warnings) =
+            parse_doh_services("https://dns.dagami.ru/dns-query\nDns.Dagami.Ru\n");
+        assert_eq!(hosts, vec!["dns.dagami.ru".to_string()]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn comments_and_blank_lines_are_skipped() {
+        let text = "\n# comment\n   \n  # с пробелом\nhttps://xbox-dns.ru/dns-query\n";
+        let (hosts, warnings) = parse_doh_services(text);
+        assert_eq!(hosts, vec!["xbox-dns.ru".to_string()]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn http_scheme_is_rejected_with_warning() {
+        let (hosts, warnings) = parse_doh_services("http://dns.example.com/dns-query\n");
+        assert!(hosts.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("https"));
+    }
+
+    #[test]
+    fn garbage_line_produces_warning() {
+        let (hosts, warnings) = parse_doh_services("https://not a host here\n");
+        assert!(hosts.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("строка 1"));
+    }
+
+    #[test]
+    fn path_and_trailing_dot_are_trimmed() {
+        let (hosts, warnings) = parse_doh_services("https://geohide.ru/dns-query\nEu.Geohide.Ru.\n");
+        assert_eq!(hosts, vec!["geohide.ru".to_string(), "eu.geohide.ru".to_string()]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn duplicates_kept_once_in_order() {
+        let text = "a.example.ru\nb.example.ru\na.example.ru\n";
+        let (hosts, warnings) = parse_doh_services(text);
+        assert_eq!(hosts, vec!["a.example.ru".to_string(), "b.example.ru".to_string()]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn empty_text_yields_nothing() {
+        let (hosts, warnings) = parse_doh_services("");
+        assert!(hosts.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn default_embedded_file_parses_clean() {
+        // Встроенный дефолт всегда обязан парситься без единого warning —
+        // защита от опечаток при будущих правках defaults/doh-services.txt.
+        let (hosts, warnings) = parse_doh_services(include_str!("../defaults/doh-services.txt"));
+        assert!(warnings.is_empty(), "warnings: {:?}", warnings);
+        assert_eq!(
+            hosts,
+            vec![
+                "xbox-dns.ru",
+                "geohide.ru",
+                "eu.geohide.ru",
+                "dns.comss.one",
+                "dns.bezmezhau.com",
+                "dns.dns-ai.ru",
+                "dns.dagami.ru",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ensure_writes_defaults_and_migrates_old_layout() {
+        // Полный smoke-контракт ensure_directories_and_files на временной папке:
+        // 1) lists/defaults/ получает все 4 дефолта (жёсткая перезапись);
+        // 2) старые места дефолтов удаляются;
+        // 3) юзерские списки в корне lists/ не трогаются.
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("время системное")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dpi_gui_ensure_{}", unique));
+        // Стартовая раскладка «до папки defaults/»:
+        std::fs::create_dir_all(dir.join("lists").join("default-bypass"))
+            .expect("создание старой раскладки");
+        std::fs::write(dir.join("lists").join("default-exclude.txt"), "old.content\n")
+            .expect("запись старого дефолта");
+        std::fs::write(dir.join("lists").join("doh-services.txt"), "https://old.example/dns-query\n")
+            .expect("запись старого doh");
+        std::fs::write(dir.join("lists").join("default-bypass").join("list-google.txt"), "old\n")
+            .expect("запись старого bypass");
+        std::fs::write(dir.join("lists").join("list-general.txt"), "example.com\n")
+            .expect("запись юзерского списка");
+
+        std::env::set_var("DPI_GUI_APP_DIR", &dir);
+        let ensured = ensure_directories_and_files();
+        std::env::remove_var("DPI_GUI_APP_DIR");
+        ensured.expect("ensure завершается без ошибок");
+
+        let defaults = dir.join("lists").join("defaults");
+        for (name, src) in [
+            ("list-general.txt", include_str!("../defaults/list-general.txt")),
+            ("list-google.txt", include_str!("../defaults/list-google.txt")),
+            ("default-exclude.txt", include_str!("../defaults/default-exclude.txt")),
+            ("doh-services.txt", include_str!("../defaults/doh-services.txt")),
+        ] {
+            let text = std::fs::read_to_string(defaults.join(name))
+                .unwrap_or_else(|e| panic!("{} не создан: {}", name, e));
+            assert_eq!(text, src, "{} обязан равняться встроенному дефолту", name);
+        }
+
+        assert!(!dir.join("lists").join("default-exclude.txt").exists(), "старый exclude удалён");
+        assert!(!dir.join("lists").join("default-bypass").exists(), "старая папка bypass удалена");
+        assert!(!dir.join("lists").join("doh-services.txt").exists(), "старый doh удалён");
+
+        let user_list = std::fs::read_to_string(dir.join("lists").join("list-general.txt"))
+            .expect("юзерский список на месте");
+        assert_eq!(user_list, "example.com\n", "юзерские списки ensure не перезаписывает");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

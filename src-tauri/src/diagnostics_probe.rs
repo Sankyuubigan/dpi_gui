@@ -10,6 +10,7 @@ use trust_dns_resolver::error::ResolveErrorKind;
 use trust_dns_resolver::Resolver;
 use reqwest::blocking::Client;
 use tauri::AppHandle;
+use crate::config;
 use crate::process;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -362,9 +363,12 @@ pub fn dns_multi(domain: &str) -> DnsInfo {
 /// отравленного/перехваченного DNS. Используются и в тесте подмены DNS, и в
 /// автоматической проверке при анализе доменов.
 ///
-/// Единственный источник правды по списку (core rules §2.1): и отчёт об
-/// анализе домена, и поиск рабочего IP для hosts читают его отсюда.
-pub const DOH_RESOLVERS: &[&str] = &[
+/// Право правды у файла `lists/defaults/doh-services.txt` (SSOT, перезаписывается
+/// при каждом старте из src-tauri/defaults/, редактируется через UI/вручную) —
+/// см. `load_doh_resolvers()`. Эта
+/// константа остаётся только встроенным дефолтом: она используется, когда
+/// файл отсутствует или не содержит ни одной валидной записи.
+pub const DOH_RESOLVERS_FALLBACK: &[&str] = &[
     "xbox-dns.ru",
     "geohide.ru",
     "eu.geohide.ru",
@@ -372,6 +376,51 @@ pub const DOH_RESOLVERS: &[&str] = &[
     "dns.bezmezhau.com",
     "dns.dns-ai.ru",
 ];
+
+/// Читает дефолтный список DoH-сервисов из `lists/defaults/doh-services.txt`
+/// (вызывается при КАЖДОМ проходе — правки применяются без перезапуска).
+///
+/// Возвращает `(сервисы, warnings, config_error)`:
+/// - файл не найден/нечитаем → встроенный дефолт + warning с причиной;
+/// - файл прочитан, но валидных записей нет → встроенный дефолт И
+///   config_error в отчёт (не молчаливое «0 адресов», core rules §2.2);
+/// - нормальный случай → содержимое файла + warnings с проигнорированными
+///   мусорными строками, если были.
+///
+/// Публично и для Tauri-команды `get_doh_services` (UI-дропдаун) — чтобы
+/// fallback-логика была ровно одна, а не копия в main.rs.
+pub fn load_doh_resolvers() -> (Vec<String>, Vec<String>, Option<String>) {
+    let fallback: Vec<String> = DOH_RESOLVERS_FALLBACK
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let read = config::read_doh_services();
+
+    if !read.file_found {
+        let mut warnings = read.warnings;
+        let path = config::doh_services_path();
+        warnings.push(format!(
+            "файл списка DoH не найден ({}), используется встроенный список по умолчанию",
+            path.display()
+        ));
+        return (fallback, warnings, None);
+    }
+
+    if read.hosts.is_empty() {
+        let path = config::doh_services_path();
+        let mut warnings = read.warnings;
+        let error = format!(
+            "файл списка DoH-серверов ({}) прочитан, но валидных записей в нём нет — \
+             используется встроенный список по умолчанию. Добавьте хосты вида \
+             «https://dns.example.ru/dns-query» в этот файл.",
+            path.display()
+        );
+        warnings.push(format!("пустой список DoH-серверов → {}", error));
+        return (fallback, warnings, Some(error));
+    }
+
+    (read.hosts, read.warnings, None)
+}
 
 /// Резолвит хост DoH-сервера (бутстрап): сначала системный DNS, при неудаче —
 /// публичный 1.1.1.1 (UDP). Без него нельзя узнать IP, на который Https-клиент
@@ -458,6 +507,12 @@ pub struct DohAnswer {
 #[derive(Debug, Clone, Default)]
 pub struct DohAnswers {
     pub answers: Vec<DohAnswer>,
+    /// Проблема конфигурации списка DoH (файл есть, но пуст) — не мешает
+    /// сетевому проходу, но обязана попасть в отчёт.
+    pub config_error: Option<String>,
+    /// Замечания о конфигурации (мусорные строки файла, отсутствие файла
+    /// при использовании встроенного дефолта). Не ошибка прохода.
+    pub warnings: Vec<String>,
 }
 
 impl DohAnswers {
@@ -481,15 +536,21 @@ impl DohAnswers {
     }
 
     /// Подробности по сервисам, которые не ответили, — одной строкой на сервис.
+    /// Сюда же складываются config_error (первым) и warnings из конфигурации
+    /// файла списка: отчёт обязан показывать реальные причины (core rules §2.2),
+    /// а вызывающий код (site_probe) менять не нужно.
     pub fn failures(&self) -> Vec<String> {
-        self.answers
-            .iter()
-            .filter_map(|a| {
-                a.error
-                    .as_ref()
-                    .map(|e| format!("{}: {}", a.service, e))
-            })
-            .collect()
+        let mut out = Vec::new();
+        if let Some(e) = &self.config_error {
+            out.push(e.clone());
+        }
+        for a in &self.answers {
+            if let Some(e) = a.error.as_ref() {
+                out.push(format!("{}: {}", a.service, e));
+            }
+        }
+        out.extend(self.warnings.iter().cloned());
+        out
     }
 }
 
@@ -500,10 +561,11 @@ impl DohAnswers {
 /// подмены DNS, и поиск рабочего IP для hosts берут адреса отсюда, а не
 /// опрашивают сервисы повторно каждый сам по себе.
 pub fn resolve_doh_all(domain: &str) -> DohAnswers {
+    let (services, warnings, config_error) = load_doh_resolvers();
     let (tx, rx) = mpsc::channel::<(usize, DohAnswer)>();
-    let total = DOH_RESOLVERS.len();
+    let total = services.len();
 
-    for (idx, service) in DOH_RESOLVERS.iter().enumerate() {
+    for (idx, service) in services.iter().enumerate() {
         let tx = tx.clone();
         let domain = domain.to_string();
         let service = service.to_string();
@@ -549,14 +611,18 @@ pub fn resolve_doh_all(domain: &str) -> DohAnswers {
         .enumerate()
         .map(|(idx, slot)| {
             slot.unwrap_or_else(|| DohAnswer {
-                service: DOH_RESOLVERS[idx].to_string(),
+                service: services[idx].clone(),
                 ips: vec![],
                 error: Some("не ответил за 9 с (таймаут)".to_string()),
             })
         })
         .collect();
 
-    DohAnswers { answers }
+    DohAnswers {
+        answers,
+        config_error,
+        warnings,
+    }
 }
 
 /// Есть ли у пользователя рабочий IPv6 до целевого домена (winws только IPv4).
@@ -788,6 +854,7 @@ mod tests {
                 ips: vec!["0.0.0.0".parse().unwrap(), "104.18.2.115".parse().unwrap()],
                 error: None,
             }],
+            ..Default::default()
         };
         assert_eq!(
             answers.all_ips(),

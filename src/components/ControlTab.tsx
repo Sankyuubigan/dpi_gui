@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, type Dispatch, type SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Play, Square, Activity, Search, Eye, Terminal } from "lucide-react";
+import { Play, Square, Activity, Eye, Terminal, Trash2 } from "lucide-react";
 import { reasonToHuman } from "./reasonText";
 import type { Suspicion } from "../App";
 
@@ -11,6 +11,7 @@ export default function ControlTab({
   saveConfig,
   logs,
   suspicions,
+  setSuspicions,
   logMsg,
 }: {
   isRunning: boolean;
@@ -19,10 +20,12 @@ export default function ControlTab({
   saveConfig: (c: any) => void;
   logs: string[];
   suspicions: Suspicion[];
+  setSuspicions: Dispatch<SetStateAction<Suspicion[]>>;
   logMsg: (msg: string) => void;
 }) {
   const logEndRef = useRef<HTMLDivElement>(null);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  // Выбранная позиция в списке ошибок (домен). null = ничего не выбрано.
+  const [selectedDomain, setSelectedDomain] = useState<string | null>(null);
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "auto" });
@@ -31,27 +34,15 @@ export default function ControlTab({
   // PRP §7.1: храним до 5000 строк в App, рендерим последние ~500 для скорости.
   const visibleLogs = logs.slice(-500);
 
-  // ОДНА кнопка «Анализ» на весь список подозрений (PRP §7.2, решение юзера):
-  // последовательный батч-анализ каждого домена СУЩЕСТВУЮЩИМ механизмом
-  // «Анализ сайта» (run_domain_analysis), результаты — в общий лог.
-  const runBatchAnalysis = async () => {
-    if (isAnalyzing || suspicions.length === 0) return;
-    setIsAnalyzing(true);
-    logMsg(`ПАКЕТНЫЙ АНАЛИЗ: ${suspicions.length} доменов...`);
-    let i = 0;
-    for (const s of suspicions) {
-      i += 1;
-      logMsg(`[АНАЛИЗ ${i}/${suspicions.length}] ${s.domain} — запускаю...`);
-      try {
-        const result: string = await invoke("run_domain_analysis", { url: s.domain });
-        logMsg(`[АНАЛИЗ ${i}/${suspicions.length}] ${s.domain}:`);
-        logMsg(result);
-      } catch (e: any) {
-        logMsg(`[АНАЛИЗ ${i}/${suspicions.length}] ${s.domain} — ОШИБКА: ${e}`);
-      }
-    }
-    logMsg("ПАКЕТНЫЙ АНАЛИЗ завершён.");
-    setIsAnalyzing(false);
+  // Очистка ТОЛЬКО выбранной позиции: удаляем её из списка ошибок, остальные
+  // остаются. Если с того же домена снова придут ошибки — детектор добавит
+  // строку заново (дедап в App), это ожидаемое поведение.
+  const clearSelected = () => {
+    if (!selectedDomain) return;
+    const cleared = selectedDomain;
+    setSuspicions(prev => prev.filter(s => s.domain !== cleared));
+    logMsg(`Ошибки сети: очищена позиция ${cleared}`);
+    setSelectedDomain(null);
   };
 
   const handleStart = async () => {
@@ -140,75 +131,103 @@ export default function ControlTab({
         </div>
       </div>
 
-      {/* СПИСОК ПОДОЗРЕНИЙ (PRP §7.2): строка на домен, дедуп по домену,
-          повтор обновляет счётчик/время строке. КНОПОК в строках НЕТ —
-          одна кнопка «Анализ» на весь список сверху. */}
+      {/* СПИСОК ОШИБОК СЕТИ: строка на домен, дедуп по домену, повтор
+          обновляет счётчик/время строке. Клик по строке — выбор позиции;
+          кнопка «Очистить» удаляет ТОЛЬКО выбранную. Повторные ошибки
+          того же домена снова появятся в списке — это норма. */}
       <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
         <div className="flex items-center justify-between gap-3 mb-3">
           <div className="flex items-center gap-2">
             <Eye size={18} className="text-red-500" />
-            <h3 className="font-bold text-gray-800">Подозрения ({suspicions.length})</h3>
+            <h3 className="font-bold text-gray-800">Ошибки сети ({suspicions.length})</h3>
           </div>
           {suspicions.length > 0 && (
             <button
-              onClick={runBatchAnalysis}
-              disabled={isAnalyzing}
-              className="flex items-center gap-2 bg-orange-600 hover:bg-orange-700 disabled:bg-gray-300 text-white px-4 py-2 rounded-md font-bold text-sm transition-colors"
+              onClick={clearSelected}
+              disabled={!selectedDomain}
+              className={
+                "flex items-center gap-2 px-4 py-2 rounded-md font-bold text-sm transition-colors border " +
+                (selectedDomain
+                  ? "border-red-300 text-red-600 hover:bg-red-50"
+                  : "border-gray-200 text-gray-400 cursor-not-allowed")
+              }
+              title={
+                selectedDomain
+                  ? `Удалить выбранную позицию из списка: ${selectedDomain}`
+                  : "Сначала выберите позицию — кликните на строку списка"
+              }
             >
-              <Search size={16} /> {isAnalyzing ? "Анализ идёт..." : "Анализ"}
+              <Trash2 size={16} /> Очистить
             </button>
           )}
         </div>
         {suspicions.length === 0 ? (
           <p className="text-sm text-gray-500">
-            Пока ничего подозрительного не замечено. Список наполняется фоновым
+            Пока ошибок сети не замечено. Список наполняется фоновым
             детектором, когда обход активен.
           </p>
         ) : (
           <div className="max-h-48 overflow-y-auto divide-y divide-gray-100">
-            {suspicions.map((s) => (
-              <div key={s.domain} className="flex items-start justify-between gap-3 py-2">
-                <div className="min-w-0 flex-wrap">
-                  <span className="font-semibold text-red-600 text-sm">{s.domain}</span>
-                  <span className="text-gray-600 text-sm">
-                    {" "}— {reasonToHuman(s.reason)} — {s.client_ip_port}
-                  </span>
+            {suspicions.map((s) => {
+              const isSelected = selectedDomain === s.domain;
+              return (
+                <div
+                  key={s.domain}
+                  onClick={() => setSelectedDomain(isSelected ? null : s.domain)}
+                  className={
+                    "flex items-start justify-between gap-3 py-2 cursor-pointer select-none " +
+                    (isSelected
+                      ? "bg-amber-50 border-l-4 border-amber-400 pl-2 pr-1"
+                      : "hover:bg-gray-50 border-l-4 border-transparent pl-2 pr-1")
+                  }
+                  title={
+                    isSelected
+                      ? "Выбрано. Повторный клик — снять выбор"
+                      : "Клик — выбрать позицию, затем «Очистить» удалит её из списка"
+                  }
+                >
+                  <div className="min-w-0 flex-wrap">
+                    <span className="font-semibold text-red-600 text-sm">{s.domain}</span>
+                    <span className="text-gray-600 text-sm">
+                      {" "}— {reasonToHuman(s.reason)} — {s.client_ip_port}
+                    </span>
+                  </div>
+                  {/* ЧИПЫ (ШАГ E): бейджи вместо болтающегося текста.
+                      Процесс — фиолетовый, списки — голубые, «не определён» — серые
+                      (честный текст, никакой тишины). ×N и время остаются справа. */}
+                  <div className="flex flex-wrap items-center justify-end gap-1.5 shrink-0 pt-0.5">
+                    {s.proc ? (
+                      <span
+                        className="inline-flex items-center gap-1 rounded-full border border-purple-200 bg-purple-50 px-2 py-0.5 text-[11px] font-medium text-purple-700"
+                        title="Процесс, который стучался на домен"
+                      >
+                        <Terminal size={10} /> {s.proc}
+                      </span>
+                    ) : (
+                      <span className="rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[11px] text-gray-400">
+                        процесс не определён
+                      </span>
+                    )}
+                    {s.lists && s.lists.length > 0 ? (
+                      <span
+                        className="inline-flex items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[11px] text-sky-700"
+                        title="Наши списки, в которых найден домен"
+                      >
+                        в списках: {s.lists.join(", ")}
+                      </span>
+                    ) : (
+                      <span className="rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[11px] text-gray-400">
+                        в списках отсутствует
+                      </span>
+                    )}
+                    {s.count > 1 && (
+                      <span className="font-semibold text-gray-500 text-[11px]">×{s.count}</span>
+                    )}
+                    <span className="text-gray-400 text-[11px]">{new Date(s.lastTs).toLocaleTimeString()}</span>
+                  </div>
                 </div>
-                {/* ЧИПЫ (ШАГ E): бейджи вместо болтающегося текста.
-                    Процесс — фиолетовый, списки — голубые, «не определён» — серые
-                    (честный текст, никакой тишины). ×N и время остаются справа. */}
-                <div className="flex flex-wrap items-center justify-end gap-1.5 shrink-0 pt-0.5">
-                  {s.proc ? (
-                    <span
-                      className="inline-flex items-center gap-1 rounded-full border border-purple-200 bg-purple-50 px-2 py-0.5 text-[11px] font-medium text-purple-700"
-                      title="Процесс, который стучался на домен"
-                    >
-                      <Terminal size={10} /> {s.proc}
-                    </span>
-                  ) : (
-                    <span className="rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[11px] text-gray-400">
-                      процесс не определён
-                    </span>
-                  )}
-                  {s.lists && s.lists.length > 0 ? (
-                    <span
-                      className="inline-flex items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[11px] text-sky-700"
-                      title="Наши списки, в которых найден домен"
-                    >
-                      в списках: {s.lists.join(", ")}
-                    </span>
-                  ) : (
-                    <span className="rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[11px] text-gray-400">
-                      в списках отсутствует
-                    </span>
-                  )}
-                  {s.count > 1 && (
-                    <span className="font-semibold text-gray-500 text-[11px]">×{s.count}</span>
-                  )}
-                  <span className="text-gray-400 text-[11px]">{new Date(s.lastTs).toLocaleTimeString()}</span>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>

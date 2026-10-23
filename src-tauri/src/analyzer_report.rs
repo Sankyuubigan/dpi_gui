@@ -39,7 +39,9 @@ fn general_list_path() -> String {
 }
 
 fn is_builtin(p: &PathBuf) -> bool {
-    p.to_string_lossy().replace("\\", "/").contains("default-bypass/")
+    // Дефолтные (системные) списки живут в lists/defaults/ — их нельзя
+    // советовать редактировать юзеру.
+    p.to_string_lossy().replace("\\", "/").contains("defaults/")
 }
 
 pub fn build_report(meta: &ReportMeta, c: &Classification) -> String {

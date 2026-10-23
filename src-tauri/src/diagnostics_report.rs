@@ -149,9 +149,9 @@ pub fn generate_profile(
     // + общие блоки по спискам, как в штатных профилях.
     let args = format!(
         "--wf-tcp=80,443 --wf-udp=443 \
-         --filter-udp=443 --hostlist=\"{l}/list-general.txt\" --hostlist-exclude=\"{l}/default-exclude.txt\" --dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fake-quic=\"{b}/quic_initial_www_google_com.bin\" --new \
+         --filter-udp=443 --hostlist=\"{l}/defaults/list-general.txt\" --hostlist-exclude=\"{l}/defaults/default-exclude.txt\" --dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fake-quic=\"{b}/quic_initial_www_google_com.bin\" --new \
          --filter-tcp=443 --hostlist=\"{h}\" {d} --new \
-         --filter-tcp=80,443 --hostlist=\"{l}/list-general.txt\" --hostlist-exclude=\"{l}/default-exclude.txt\" {d}",
+         --filter-tcp=80,443 --hostlist=\"{l}/defaults/list-general.txt\" --hostlist-exclude=\"{l}/defaults/default-exclude.txt\" {d}",
         l = lists_dir,
         b = bin_dir,
         h = diag_host,

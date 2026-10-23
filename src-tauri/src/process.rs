@@ -48,9 +48,11 @@ fn resolve_args(app: &AppHandle, raw_args_template: &str, game_filter: bool, qui
     };
 
     let mut final_args = Vec::new();
-    let default_exclude_arg = format!("--hostlist-exclude={}/default-exclude.txt", lists_dir);
-    let default_bypass_general_arg = format!("--hostlist={}/default-bypass/list-general.txt", lists_dir);
-    let default_bypass_google_arg = format!("--hostlist={}/default-bypass/list-google.txt", lists_dir);
+    // Дефолтные списки живут в единой папке lists/defaults/ (config.rs
+    // перезаписывает их при каждом запуске).
+    let default_exclude_arg = format!("--hostlist-exclude={}/defaults/default-exclude.txt", lists_dir);
+    let default_bypass_general_arg = format!("--hostlist={}/defaults/list-general.txt", lists_dir);
+    let default_bypass_google_arg = format!("--hostlist={}/defaults/list-google.txt", lists_dir);
 
     for arg in parsed_args {
         // Мы жестко вырезаем логику IPSet, чтобы не зависеть от лишних файлов

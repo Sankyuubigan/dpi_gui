@@ -21,6 +21,7 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
   const [hostsIp, setHostsIp] = useState("");
   const [diag, setDiag] = useState<any>(null);
   const [testProgress, setTestProgress] = useState<{ total: number; done: number; current: string } | null>(null);
+  const [dohOptions, setDohOptions] = useState<string[]>([]); // DoH-пресеты из SSOT-файла
 
   const appendEntry = (text: string, kind: LogKind) => {
     setLog((prev: LogEntry[]) => [...prev, { text, kind }].slice(-100));
@@ -38,6 +39,26 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
       unlisten.then(f => f());
     };
   }, []);
+
+  // Список DoH-пресетов читается из lists/doh-services.txt (SSOT):
+  // пользователь правит файл — UI подтягивает его без перезапуска.
+  useEffect(() => {
+    invoke<string[]>("get_doh_services")
+      .then(setDohOptions)
+      .catch(() => setDohOptions([])); // при сбое поле остаётся ручным вводом
+  }, []);
+
+  const openDohList = async () => {
+    try {
+      await invoke("open_file", { fileType: "doh_services" });
+      appendLog("Открыт файл списка DoH-сервисов (doh-services.txt) в Блокноте.");
+      // Сохранил файл в блокноте → в следующий раз дропдаун перечитается отсюда.
+      const refreshed = await invoke<string[]>("get_doh_services");
+      setDohOptions(refreshed);
+    } catch (e: any) {
+      appendLog(`[Ошибка]: не удалось открыть список DoH: ${e}`);
+    }
+  };
 
   const runDeepAnalysis = async () => {
     if (!url) return;
@@ -290,15 +311,24 @@ export default function TestingTab({ profiles, setProfiles, config, log, setLog,
               list="dns-presets"
               value={dnsIp}
               onChange={(e) => setDnsIp(e.target.value)}
-              placeholder="IP DNS или DoH (например 1.1.1.1 или https://xbox-dns.ru/dns-query)"
+              placeholder="IP DNS или DoH (например 1.1.1.1 или https://dns.dagami.ru/dns-query)"
               className="w-1/3 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 outline-none text-sm"
-              title="Кастомный DNS-сервер: IP (1.1.1.1) или DoH-сервис подмены DNS (https://xbox-dns.ru/dns-query, https://geohide.ru/dns-query)"
+              title="Кастомный DNS-сервер: IP (1.1.1.1) или DoH-сервис подмены DNS. Полный список DoH — кнопка ✎, редактируется в файле doh-services.txt"
             />
             <datalist id="dns-presets">
               <option value="1.1.1.1">Cloudflare</option>
-              <option value="https://xbox-dns.ru/dns-query">xbox-dns.ru (DoH)</option>
-              <option value="https://geohide.ru/dns-query">geohide.ru (DoH)</option>
+              {dohOptions.map((u) => (
+                <option key={u} value={u} />
+              ))}
             </datalist>
+            <button
+              onClick={openDohList}
+              disabled={isTesting}
+              className="shrink-0 p-2 border border-gray-300 rounded-lg hover:bg-gray-100 disabled:bg-gray-100 transition"
+              title="Открыть список DoH-серверов (doh-services.txt) в Блокноте — добавить/убрать сервисы"
+            >
+              <FileEdit size={18} className="text-gray-600" />
+            </button>
             <button
               onClick={runDnsTest}
               disabled={isTesting}

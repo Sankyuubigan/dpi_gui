@@ -164,6 +164,7 @@ export default function App() {
             saveConfig={saveConfig}
             logs={logs}
             suspicions={suspicions}
+            setSuspicions={setSuspicions}
             logMsg={logMsg}
           />
         )}
