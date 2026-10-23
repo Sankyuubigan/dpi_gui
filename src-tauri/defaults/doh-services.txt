@@ -12,3 +12,17 @@ https://dns.comss.one/dns-query
 https://dns.bezmezhau.com/dns-query
 https://dns.dns-ai.ru/dns-query
 https://dns.dagami.ru/dns-query
+https://dns.magicdns.ru/dns-query
+# --- Глобальные unfiltered-резолверы (AdGuard KB / DNSCrypt sources,
+# --- см. docs/blocks.md §2). ТСПУ режет их IP — работают только в обходе.
+https://unfiltered.adguard-dns.com/dns-query
+https://cloudflare-dns.com/dns-query
+https://dns.google/dns-query
+https://doh.sandbox.opendns.com/dns-query
+https://doh.dns.sb/dns-query
+https://dns10.quad9.net/dns-query
+https://wikimedia-dns.org/dns-query
+https://doh.libredns.gr/dns-query
+https://unfiltered.joindns4.eu/dns-query
+https://dns.digitale-gesellschaft.ch/dns-query
+https://dns.decloudus.com/dns-query

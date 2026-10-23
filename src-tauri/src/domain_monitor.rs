@@ -7,6 +7,8 @@
 //!   исходящего TLS ClientHello (штучно собирается по сегментам, в т.ч. разрезанным
 //!   tamper-движком winws); второй сигнал — повторные исходящие DATA-диапазоны
 //!   (ретрансмиссии), порог ровно как у winws (default retrans-threshold = 3);
+//!   третий сигнал — QUIC (UDP:443): повторные Initial при полном молчании
+//!   сервера (расшифровка Initial — модуль quic_sniff, RFC 9001 Initial Secrets);
 //! - НИКАКИХ записей на диск: события только в память процесса и в UI;
 //! - списки пользователя НИКАК не затрагиваются (детектор списки даже не читает);
 //! - ошибки не молчат: честная строка в лог с кодом ошибки.
@@ -22,6 +24,10 @@ use tauri::{AppHandle, Emitter};
 
 use crate::events::app_log;
 use crate::list_index::ListIndex;
+use crate::quic_sniff::{
+    classify_quic, parse_initial_payload, parse_udp_packet, ParsedInitial, QuicCryptoBuffer,
+    QuicPacketKind,
+};
 use crate::win_divert::{
     open_sniff_handle, SniffHandle, WinDivertAddress, MAX_PACKET_LEN,
 };
@@ -54,7 +60,7 @@ const FLAG_RST: u8 = 0x04;
 #[derive(Clone, serde::Serialize)]
 pub struct DomainDiscoveryEvent {
     pub domain: String,
-    /// "rst" | "retrans"
+    /// "rst" | "retrans" | "quic"
     pub reason: &'static str,
     /// «1.2.3.4:443» (сервер).
     pub client_ip_port: String,
@@ -66,6 +72,9 @@ pub struct DomainDiscoveryEvent {
     /// PRP ревизия 4 §7.6 (ШАГ E): имя процесса, который стучался;
     /// пустая строка = не определился.
     pub proc_name: String,
+    /// Полный путь exe того же процесса (хинт в UI при наведении на чип);
+    /// пустая строка = путь не отдала система.
+    pub proc_path: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,131 +110,20 @@ pub fn read_mode() -> MonitorMode {
 }
 
 /// Строка фильтра WinDivert — ровно одна функция сборки (SSOT).
+/// UDP:443 нужен для QUIC/HTTP-3 (PRP 23.10.26): без него браузерные
+/// QUIC-запросы целиком проходят мимо детектора.
 pub fn sniff_filter() -> &'static str {
-    "tcp.DstPort == 443 or tcp.SrcPort == 443"
+    "tcp.DstPort == 443 or tcp.SrcPort == 443 or udp.DstPort == 443 or udp.SrcPort == 443"
 }
 
 // ---------------------------------------------------------------------------
-// SNI-парсер: ровно одна функция + статусы (тестовый контракт).
+// SNI-парсер — SSOT в tls_sni (ОДИН парсер на весь проект; его же шлёт
+// QUIC-ветка). Локально остаются be16/be24 — разбор IPv4-заголовка ниже.
 // ---------------------------------------------------------------------------
-#[derive(Debug, PartialEq)]
-pub enum CliHelloStatus {
-    Found(String),
-    Incomplete,
-    NotClientHello,
-}
+pub use crate::tls_sni::{parse_client_hello, CliHelloStatus};
 
 fn be16(b: &[u8], off: usize) -> usize {
     ((b[off] as usize) << 8) | (b[off + 1] as usize)
-}
-fn be24(b: &[u8], off: usize) -> usize {
-    ((b[off] as usize) << 16) | ((b[off + 1] as usize) << 8) | b[off + 2] as usize
-}
-
-/// Распарсить TLS ClientHello из байтов потока (TCP payload) и взять SNI.
-/// Гарантии: не паникует на мусоре/обрезанных байтах; берёт ПЕРВЫЙ server_name
-/// с name_type = 0; домен — lowercase, содержащий хотя бы одну точку.
-pub fn parse_client_hello(b: &[u8]) -> CliHelloStatus {
-    if b.is_empty() {
-        return CliHelloStatus::Incomplete;
-    }
-    // TLS record: type(1) + version(2) + length(2).
-    if b.len() < 5 {
-        return CliHelloStatus::Incomplete;
-    }
-    if b[0] != 0x16 {
-        return CliHelloStatus::NotClientHello;
-    }
-    let rec_len = be16(b, 3);
-    if 5 + rec_len > b.len() {
-        return CliHelloStatus::Incomplete;
-    }
-    let hs = &b[5..5 + rec_len];
-    if hs.is_empty() {
-        return CliHelloStatus::Incomplete;
-    }
-    if hs[0] != 0x01 {
-        return CliHelloStatus::NotClientHello;
-    }
-    if hs.len() < 4 {
-        return CliHelloStatus::Incomplete;
-    }
-    let hs_len = be24(hs, 1);
-    if 4 + hs_len > hs.len() {
-        return CliHelloStatus::Incomplete;
-    }
-    let body = &hs[4..4 + hs_len];
-
-    // ClientHello body: version(2) random(32).
-    if body.len() < 34 {
-        return CliHelloStatus::Incomplete;
-    }
-    let mut p: usize = 34;
-    // session_id
-    if p >= body.len() {
-        return CliHelloStatus::Incomplete;
-    }
-    let sid_len = body[p] as usize;
-    p += 1 + sid_len;
-    if p + 2 > body.len() {
-        return CliHelloStatus::Incomplete;
-    }
-    // cipher_suites
-    let cs_len = be16(body, p);
-    p += 2 + cs_len;
-    if p >= body.len() {
-        return CliHelloStatus::Incomplete;
-    }
-    // compression_methods
-    let comp_len = body[p] as usize;
-    p += 1 + comp_len;
-    if p + 2 > body.len() {
-        return CliHelloStatus::Incomplete;
-    }
-    // extensions
-    let exts_len = be16(body, p);
-    p += 2;
-    let end = p + exts_len;
-    if p > body.len() || end > body.len() {
-        return CliHelloStatus::Incomplete;
-    }
-
-    let mut have_name = false;
-    while p + 4 <= body.len() {
-        let etype = be16(body, p);
-        let elen = be16(body, p + 2);
-        p += 4;
-        if p + elen > body.len() {
-            return CliHelloStatus::Incomplete;
-        }
-        let edata = &body[p..p + elen];
-        p += elen;
-
-        if etype == 0x0000 && elen >= 5 {
-            have_name = true;
-            // server_name_list: [u16 list_len][u8 name_type=0][u16 host_len][host]
-            if edata[2] == 0 {
-                let host_len = be16(edata, 3);
-                if 5 + host_len > edata.len() {
-                    return CliHelloStatus::Incomplete;
-                }
-                let host_bytes = &edata[5..5 + host_len];
-                if let Ok(host) = std::str::from_utf8(host_bytes) {
-                    let host = host.trim().to_ascii_lowercase();
-                    let host = host.trim_end_matches('.');
-                    // Домен обязан быть непустым и содержать точку (SNI-«localhost»
-                    // и пустые имена детектору не интересны).
-                    if !host.is_empty() && host.contains('.') {
-                        return CliHelloStatus::Found(host.to_string());
-                    }
-                }
-            }
-        }
-    }
-    if have_name {
-        return CliHelloStatus::NotClientHello;
-    }
-    CliHelloStatus::NotClientHello
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +285,9 @@ struct FlowState {
     /// Кэш на флоу: запрашиваем ТОЛЬКО на исходящем пакете (соединение живо),
     /// пока None — к моменту RST таблица Windows уже пуста для этого сокета.
     proc: Option<String>,
+    /// Полный путь exe того же процесса (для хинта в UI). None = не отдала
+    /// система (защищённые процессы / правки прав) — имя остаётся.
+    proc_path: Option<String>,
     /// seq исходящих DATA → (количество повторов | флаг «событие уже отдали» = бит 0x80).
     retx: HashMap<u32, u8>,
     last_seen: Instant,
@@ -400,6 +301,7 @@ impl FlowState {
             sni: SniCollector::new(),
             hostname: None,
             proc: None,
+            proc_path: None,
             retx: HashMap::new(),
             last_seen: Instant::now(),
         }
@@ -553,6 +455,96 @@ fn now_ms() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// QUIC (UDP:443) — HTTP/3-поток: собираем Crypto из расшифрованных Initial.
+// Крипто-разбор живёт в модуле quic_sniff; здесь — только трекинг и решения.
+// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct QuicFlowKey {
+    remote_ip: IpAddr,
+    remote_port: u16,
+    local_port: u16,
+    dcid: Vec<u8>,
+}
+
+struct QuicFlowState {
+    crypto: QuicCryptoBuffer,
+    hostname: Option<String>,
+    initials_out: u8,
+    event_sent: bool,
+    proc: Option<String>,
+    /// Полный путь exe владельца (для хинта в UI), None = не отдала система.
+    proc_path: Option<String>,
+    last_seen: Instant,
+}
+
+impl QuicFlowState {
+    fn new() -> Self {
+        Self {
+            crypto: QuicCryptoBuffer::new(),
+            hostname: None,
+            initials_out: 0,
+            event_sent: false,
+            proc: None,
+            proc_path: None,
+            last_seen: Instant::now(),
+        }
+    }
+
+    /// Учитывает один расшифрованный Initial; возвращает домен, когда пора
+    /// отдать событие (>= RETRANS_THRESHOLD Initial: QUIC-клиент ретранслирует
+    /// Initial ТОЛЬКО если сервер молчит — это и есть «QUIC ломается»).
+    fn note_initial(&mut self, parsed: ParsedInitial) -> Option<String> {
+        self.last_seen = Instant::now();
+        for (offset, chunk) in &parsed.crypto_chunks {
+            self.crypto.feed(*offset, chunk);
+        }
+        if self.hostname.is_none() {
+            self.hostname = self.crypto.hostname();
+        }
+        self.initials_out = self.initials_out.saturating_add(1);
+        if !self.event_sent && self.initials_out >= RETRANS_THRESHOLD {
+            if let Some(h) = self.hostname.clone() {
+                self.event_sent = true;
+                return Some(h);
+            }
+        }
+        None
+    }
+}
+
+struct QuicTracker {
+    flows: HashMap<QuicFlowKey, QuicFlowState>,
+    no_decrypt_initials: u64,
+}
+
+impl QuicTracker {
+    fn new() -> Self {
+        Self { flows: HashMap::new(), no_decrypt_initials: 0 }
+    }
+
+    /// TTL и вытеснение при MAX_FLOWS — та же дисциплина, что у TCP-трекера.
+    fn maintain(&mut self, now: Instant) {
+        self.flows.retain(|_, st| {
+            now.duration_since(st.last_seen) < Duration::from_secs(FLOW_TTL_SECS)
+        });
+        if self.flows.len() > MAX_FLOWS {
+            let mut vec: Vec<(Instant, QuicFlowKey)> = self
+                .flows
+                .iter()
+                .map(|(k, v)| (v.last_seen, k.clone()))
+                .collect();
+            vec.sort_by_key(|(t, _)| *t);
+            let excess = self.flows.len() - MAX_FLOWS;
+            let removed: Vec<QuicFlowKey> =
+                vec.into_iter().take(excess).map(|(_, k)| k).collect();
+            for key in removed {
+                self.flows.remove(&key);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Данные одного пакета.
 // ---------------------------------------------------------------------------
 struct TcpInfo<'a> {
@@ -654,19 +646,37 @@ fn make_tcp<'a>(
 // ---------------------------------------------------------------------------
 struct WorkerCtx {
     tracker: FlowTracker,
+    /// QUIC (UDP:443) поток-трекер (PRP 23.10.26, шаг 3).
+    quic: QuicTracker,
     dedup: Dedupe,
     rate: RateLimiter,
     /// Принадлежность домена спискам (ШАГ D, PRP §7.5).
     lists: ListIndex,
     no_domain_count: u64,
+    /// Честное предупреждение не молчит, но и не шумит: один лог за сессию.
+    ipv6_warned: bool,
     packets_since_maintain: u64,
 }
 
 fn handle_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], addr: &WinDivertAddress) {
-    if addr.is_loopback() || addr.is_ipv6() {
-        return; // IPv6/loopback — вне первого этапа (PRP §4.4)
+    if addr.is_loopback() {
+        return; // loopback — вне первого этапа (PRP §4.4)
+    }
+    if addr.is_ipv6() {
+        // IPv6 — вне этапа (PRP §4.4); ошибки не молчат: ОДИН лог за сессию.
+        if !ctx.ipv6_warned {
+            ctx.ipv6_warned = true;
+            app_log(app, "[Автомонитор] IPv6-пакеты не разбираются (этап — только IPv4)");
+        }
+        return;
     }
     let outbound = addr.is_outbound();
+
+    // UDP → QUIC-ветка (HTTP/3), всё остальное — классический TCP-детектор.
+    if bytes.len() >= 10 && bytes[9] == 17 {
+        handle_udp_packet(app, ctx, bytes, outbound);
+        return;
+    }
     let Some(t) = parse_tcp_packet(bytes, false) else {
         return;
     };
@@ -681,7 +691,9 @@ fn handle_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], addr: &WinD
     ctx.packets_since_maintain += 1;
     if ctx.packets_since_maintain >= 512 {
         ctx.packets_since_maintain = 0;
-        ctx.tracker.maintain(Instant::now());
+        let now = Instant::now();
+        ctx.tracker.maintain(now);
+        ctx.quic.maintain(now);
     }
 
     // Исходящий (клиент → сервер): собираем ClientHello и считаем ретрансы.
@@ -693,11 +705,17 @@ fn handle_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], addr: &WinD
         // ШАГ E (PRP §7.6): владелец сокета кэшируем на живом соединении
         // (исходящий пакет), один lookup на флоу; remote = dst.
         if state.proc.is_none() {
-            state.proc = crate::process_owner::owner_name(local_port, remote_ip, remote_port);
+            if let Some((name, exe)) =
+                crate::process_owner::owner_name_and_exe(local_port, remote_ip, remote_port)
+            {
+                state.proc = Some(name);
+                state.proc_path = if exe.is_empty() { None } else { Some(exe) };
+            }
         }
         if let Some((reason, domain)) = state.record_outgoing(t.seq, t.payload) {
             let proc_name = state.proc.clone();
-            ctx.emit(app, domain, reason, remote_ip, remote_port, proc_name);
+            let proc_path = state.proc_path.clone();
+            ctx.emit(app, domain, reason, remote_ip, remote_port, proc_name, proc_path, "tls");
         }
         return;
     }
@@ -706,9 +724,12 @@ fn handle_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], addr: &WinD
     if t.flags & FLAG_RST != 0 {
         if let Some(mut state) = ctx.tracker.flows.remove(&key) {
             let proc_name = state.proc.clone();
+            let proc_path = state.proc_path.clone();
             state.maintenance(Instant::now());
             match state.hostname.clone() {
-                Some(domain) => ctx.emit(app, domain, "rst", remote_ip, remote_port, proc_name),
+                Some(domain) => {
+                    ctx.emit(app, domain, "rst", remote_ip, remote_port, proc_name, proc_path, "tls")
+                }
                 None => {
                     ctx.no_domain_count += 1;
                     if ctx.no_domain_count % NO_DOMAIN_FLUSH_EVERY == 0 {
@@ -730,6 +751,63 @@ fn handle_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], addr: &WinD
     }
 }
 
+// ---------------------------------------------------------------------------
+// QUIC-обработка UDP-датаграммы (в общий sniff-хендл теперь падает и UDP:443).
+// ---------------------------------------------------------------------------
+fn handle_udp_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], outbound: bool) {
+    let Some(u) = parse_udp_packet(bytes, false) else {
+        return; // урезанный/нечитаемый IP-пакет — детектор трафик не трогает
+    };
+    let (remote_ip, remote_port, local_port) = if outbound {
+        (u.dst_ip, u.dst_port, u.src_port)
+    } else {
+        (u.src_ip, u.src_port, u.dst_port)
+    };
+
+    if !outbound {
+        // Сервер ответил (Handshake/VN/Retry) — соединение живо: гасим треки
+        // данного 4-tuple БЕЗ события (событие тут не нужно).
+        ctx.quic.flows.retain(|k, _| {
+            k.remote_ip != remote_ip || k.remote_port != remote_port || k.local_port != local_port
+        });
+        return;
+    }
+
+    let Some(kind) = classify_quic(u.payload) else { return };
+    if kind != QuicPacketKind::Initial {
+        return; // SNI живёт только в Initial (RFC 9001 §4.4)
+    }
+    let Some(parsed) = parse_initial_payload(u.payload) else {
+        // Расшифровать Initial не удалось (мусор/иная реализация UDP:443).
+        // Не молчим: ОДИН честный лог на сессию детектора, дальше — тишина.
+        ctx.quic.no_decrypt_initials += 1;
+        if ctx.quic.no_decrypt_initials == 1 {
+            app_log(
+                app,
+                "[Автомонитор] QUIC Initial не расшифрован (мусор/иная реализация) — детектор продолжает работу",
+            );
+        }
+        return;
+    };
+
+    let key = QuicFlowKey { remote_ip, remote_port, local_port, dcid: parsed.dcid.clone() };
+    // Один lookup на флоу (кэш в состоянии) — так же, как в TCP-ветке ШАГа E.
+    let (owner_name, owner_path) =
+        crate::process_owner::owner_name_and_exe(local_port, remote_ip, remote_port)
+            .map(|(n, e)| (Some(n), if e.is_empty() { None } else { Some(e) }))
+            .unwrap_or((None, None));
+    let state = ctx.quic.flows.entry(key).or_insert_with(|| QuicFlowState {
+        proc: owner_name,
+        proc_path: owner_path,
+        ..QuicFlowState::new()
+    });
+    if let Some(domain) = state.note_initial(parsed) {
+        let proc_name = state.proc.clone();
+        let proc_path = state.proc_path.clone();
+        ctx.emit(app, domain, "quic", remote_ip, remote_port, proc_name, proc_path, "quic");
+    }
+}
+
 impl WorkerCtx {
     fn emit(
         &mut self,
@@ -739,6 +817,8 @@ impl WorkerCtx {
         ip: IpAddr,
         port: u16,
         proc_name: Option<String>,
+        proc_path: Option<String>,
+        l7proto: &'static str,
     ) {
         let now = Instant::now();
         if !self.dedup.allow(&domain, reason, now) {
@@ -754,12 +834,14 @@ impl WorkerCtx {
             domain: domain.clone(),
             reason,
             client_ip_port: ip_port.clone(),
-            l7proto: "tls",
+            l7proto,
             observed_at_ms: now_ms(),
             lists,
             // ШАГ E: кто стучался; пустая строка = не определился (фронт
             // честно показывает «процесс не определён», не молчит).
             proc_name: proc_name.unwrap_or_default(),
+            // Полный путь exe — для хинта по наведению мыши в UI.
+            proc_path: proc_path.unwrap_or_default(),
         };
         // Решение юзера (21.10.26, финал): строки блокировок в «Лог событий»
         // НЕ пишем — их единственное место это список подозрений (дедуп по
@@ -824,7 +906,7 @@ pub fn start_domain_monitor(app: AppHandle) -> Result<(), String> {
         })
         .map_err(|e| format!("[Автомонитор] старт потока не удался: {}", e))?;
 
-    app_log(&app, "[Автомонитор] старт (SNIFF, TCP:443, priority LOWEST)");
+    app_log(&app, "[Автомонитор] старт (SNIFF, TCP/UDP:443, priority LOWEST)");
     *guard = Some(MonitorState { stop, thread, raw });
     Ok(())
 }
@@ -849,10 +931,12 @@ pub fn stop_domain_monitor() {
 fn worker(app: AppHandle, handle: SniffHandle, stop: Arc<AtomicBool>, lists: ListIndex) {
     let mut ctx = WorkerCtx {
         tracker: FlowTracker::new(),
+        quic: QuicTracker::new(),
         dedup: Dedupe::new(),
         rate: RateLimiter::new(),
         lists,
         no_domain_count: 0,
+        ipv6_warned: false,
         packets_since_maintain: 0,
     };
     let mut buf = vec![0u8; MAX_PACKET_LEN];
@@ -951,6 +1035,74 @@ mod tests {
             st.record_outgoing(0, &payload);
         }
         assert!(st.record_outgoing(0, &payload).is_none(), "без домена событие НЕ отдали");
+    }
+
+    // --- Дедуп/раз rate -----------------------------------------------------
+    // --- QUIC (UDP:443) -----------------------------------------------------
+    #[test]
+    fn quic_initial_event_on_third_initial_server_silent() {
+        let ch = build_client_hello(b"example.test");
+        let dcid = [7u8; 8];
+        let packet = crate::quic_sniff::build_quic_initial_v1(&dcid, &ch);
+        let mut st = QuicFlowState::new();
+        let mut got = None;
+        for _ in 0..3 {
+            let parsed = crate::quic_sniff::parse_initial_payload(&packet)
+                .expect("синтетический Initial обязан расшифровываться");
+            got = st.note_initial(parsed);
+        }
+        assert_eq!(got.as_deref(), Some("example.test"), "событие — на 3-м Initial");
+        assert!(st.event_sent, "событие однократно");
+        // Повторные Initial после отдачи события — тишина.
+        let parsed = crate::quic_sniff::parse_initial_payload(&packet).expect("расшифровка");
+        assert!(st.note_initial(parsed).is_none(), "повтор после event_sent — тишина");
+    }
+
+    #[test]
+    fn quic_hostname_missing_is_quiet() {
+        // Initial БЕЗ Crypto-кадров: домен не появится — событие НЕ отдаём.
+        let parsed = ParsedInitial { dcid: vec![1u8; 8], crypto_chunks: vec![] };
+        let mut st = QuicFlowState::new();
+        for _ in 0..5 {
+            assert!(st.note_initial(parsed.clone()).is_none());
+        }
+    }
+
+    #[test]
+    fn quic_tracker_ttl_and_cap() {
+        let mut t = QuicTracker::new();
+        let mut st = QuicFlowState::new();
+        st.last_seen = Instant::now() - Duration::from_secs(FLOW_TTL_SECS + 1);
+        t.flows.insert(
+            QuicFlowKey {
+                remote_ip: IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+                remote_port: 443,
+                local_port: 50000,
+                dcid: vec![1; 8],
+            },
+            st,
+        );
+        t.maintain(Instant::now());
+        assert!(t.flows.is_empty(), "по TTL затухло");
+
+        // Лимит MAX_FLOWS: лишние (самые старые) вытесняются.
+        for i in 0..(MAX_FLOWS + 5) {
+            let mut st = QuicFlowState::new();
+            // Возрасты в МУХАХ: i как миллисекунды (i*секунды при i≥900
+            // вынесли бы запись за TTL в 15 минут и тест ловил бы сам себя).
+            st.last_seen = Instant::now() - Duration::from_millis(i as u64);
+            t.flows.insert(
+                QuicFlowKey {
+                    remote_ip: IpAddr::V4(Ipv4Addr::new(9, 9, 9, (i % 250) as u8)),
+                    remote_port: 443,
+                    local_port: 50000,
+                    dcid: vec![(i % 251) as u8; 8],
+                },
+                st,
+            );
+        }
+        t.maintain(Instant::now());
+        assert_eq!(t.flows.len(), MAX_FLOWS);
     }
 
     // --- Дедуп/раз rate -----------------------------------------------------

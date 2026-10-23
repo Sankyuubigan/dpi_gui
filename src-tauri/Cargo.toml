@@ -25,3 +25,8 @@ shlex = "1.3"
 url = "2.5"
 trust-dns-resolver = { version = "0.23", features = ["dns-over-https-rustls"] }
 windows-sys = { version = "0.52", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Threading", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+# QUIC-детектор (PRP 23.10.26): HKDF-SHA256 + AES-128-GCM/ECB для Initial (RFC 9001).
+sha2 = "0.10"
+hkdf = "0.12"
+aes = "0.8"
+aes-gcm = "0.10"

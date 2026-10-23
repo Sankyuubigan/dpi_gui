@@ -24,6 +24,8 @@ mod hosts;
 mod events;
 mod win_divert;
 mod domain_monitor;
+mod tls_sni;
+mod quic_sniff;
 mod list_index;
 mod process_owner;
 

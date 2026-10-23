@@ -86,7 +86,15 @@ pub fn find_pid(local_port: u16, remote_ip: IpAddr, remote_port: u16) -> Option<
 }
 
 /// Имя процесса (executable), владеющего соединением; пустое имя/не найдено → None.
-pub fn owner_name(local_port: u16, remote_ip: IpAddr, remote_port: u16) -> Option<String> {
+/// Имя и полный путь exe владельца TCP-сокета (`None` = процесс не найден,
+/// имя пустое). Путь — `Process::exe()` из sysinfo (образ, запустивший
+/// процесс). Пустой путь возвращается как `Some((name, ""))` — отдельная
+/// честная форма «имя есть, путь не отдала СВ».
+pub fn owner_name_and_exe(
+    local_port: u16,
+    remote_ip: IpAddr,
+    remote_port: u16,
+) -> Option<(String, String)> {
     let pid = find_pid(local_port, remote_ip, remote_port)?;
     let pid = Pid::from_u32(pid);
     let mut sys = System::new();
@@ -96,7 +104,11 @@ pub fn owner_name(local_port: u16, remote_ip: IpAddr, remote_port: u16) -> Optio
     if name.is_empty() {
         None
     } else {
-        Some(name)
+        let exe = proc
+            .exe()
+            .map(|p| p.to_string_lossy().trim().to_string())
+            .unwrap_or_default();
+        Some((name, exe))
     }
 }
 
@@ -127,15 +139,16 @@ mod tests {
         // Небольшой сон: row ESTABLISHED обязан уже быть в таблице.
         std::thread::sleep(Duration::from_millis(100));
 
-        let name = owner_name(local_port, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port)
-            .expect("владелец собственного соединения обязан найтись");
+        let (name, _exe) =
+            owner_name_and_exe(local_port, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port)
+                .expect("владелец собственного соединения обязан найтись");
         assert!(
             !name.trim().is_empty(),
             "имя процесса не пустое: {name}"
         );
 
         // IPv6-запрос не паникует и честно отвечает None вне v6-детекции.
-        assert!(owner_name(
+        assert!(owner_name_and_exe(
             local_port,
             "2001:db8::1".parse().expect("v6-литерал"),
             port

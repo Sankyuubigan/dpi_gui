@@ -199,7 +199,11 @@ export default function ControlTab({
                     {s.proc ? (
                       <span
                         className="inline-flex items-center gap-1 rounded-full border border-purple-200 bg-purple-50 px-2 py-0.5 text-[11px] font-medium text-purple-700"
-                        title="Процесс, который стучался на домен"
+                        title={
+                          s.procPath
+                            ? "Процесс, который стучался на домен\nПуть exe: " + s.procPath
+                            : "Процесс, который стучался на домен\nПуть exe не отдала система"
+                        }
                       >
                         <Terminal size={10} /> {s.proc}
                       </span>

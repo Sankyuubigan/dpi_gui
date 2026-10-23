@@ -18,6 +18,9 @@ export interface Suspicion {
   lists: string[];
   /// ШАГ E (PRP §7.6): процесс, который стучался; пустая строка = не определился.
   proc: string;
+  /// Полный путь exe того же процесса (хинт при наведении мыши);
+  /// пустая строка = путь не отдала система.
+  procPath: string;
   lastTs: number; // observed_at_ms последнего события по домену
   count: number; // сколько событий по этому домену было (дедуп по домену)
 }
@@ -54,6 +57,7 @@ export default function App() {
       const ev = event.payload;
       const lists: string[] = ev.lists || [];
       const proc: string = ev.proc_name || "";
+      const procPath: string = ev.proc_path || "";
       setSuspicions(prev => {
         const idx = prev.findIndex(s => s.domain === ev.domain);
         if (idx >= 0) {
@@ -65,6 +69,7 @@ export default function App() {
             client_ip_port: ev.client_ip_port,
             lists,
             proc,
+            procPath,
             lastTs: ev.observed_at_ms || Date.now(),
             count: old.count + 1,
           };
@@ -76,6 +81,7 @@ export default function App() {
           client_ip_port: ev.client_ip_port,
           lists,
           proc,
+          procPath,
           lastTs: ev.observed_at_ms || Date.now(),
           count: 1,
         };

@@ -332,6 +332,18 @@ mod tests {
                 "dns.bezmezhau.com",
                 "dns.dns-ai.ru",
                 "dns.dagami.ru",
+                "dns.magicdns.ru",
+                "unfiltered.adguard-dns.com",
+                "cloudflare-dns.com",
+                "dns.google",
+                "doh.sandbox.opendns.com",
+                "doh.dns.sb",
+                "dns10.quad9.net",
+                "wikimedia-dns.org",
+                "doh.libredns.gr",
+                "unfiltered.joindns4.eu",
+                "dns.digitale-gesellschaft.ch",
+                "dns.decloudus.com",
             ]
             .iter()
             .map(|s| s.to_string())
