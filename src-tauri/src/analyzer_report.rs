@@ -145,12 +145,19 @@ fn write_diagnosis(log: &mut String, meta: &ReportMeta) {
         None => return,
     };
 
-    // Если сайт открыт — короткий подтверждающий блок, без шума.
+    // Если сайт открыт — короткий подтверждающий блок. Но ЧЕСТНЫЙ:
+    // «доступен» означает «страница отдалась», а не «сервис работоспособен»,
+    // и в отчёте обязана быть адресная таблица — за ней юзер и приходит
+    // (кейс AI-студий: данные собирались, но прятались от пользователя).
     if probe.verdict == SiteVerdict::Open {
         log.push_str(&format!(
             "✅ САЙТ «{}» ДОСТУПЕН — домен и сеть в порядке ({}).\n\n",
             probe.host, probe.http_note
         ));
+        write_address_table(log, probe);
+        log.push_str(
+            "  ℹ️ Проверено открытие самой страницы. Часть сервисов (AI-платформы, хостинги,\n  соцсети) ограничивает доступ ВНУТРИ страницы или по региону клиента — одним\n  GET-запросом это не видно. Если сайт фактически не работает при «ДОСТУПЕН» —\n  попробуйте VPN (смена исходного IP), а не смену DNS/hosts.\n\n",
+        );
         return;
     }
 
@@ -165,7 +172,7 @@ fn write_diagnosis(log: &mut String, meta: &ReportMeta) {
         SiteVerdict::IpReset => "🚫",
         SiteVerdict::TlsBroken | SiteVerdict::BadCert => "🔐",
         SiteVerdict::BlockPage => "⛔",
-        SiteVerdict::GeoBlocked => "🌍",
+        SiteVerdict::GeoBlocked | SiteVerdict::ServiceRestricted => "🌍",
         _ => "⚠️",
     };
 
@@ -194,6 +201,95 @@ fn write_diagnosis(log: &mut String, meta: &ReportMeta) {
     log.push('\n');
 }
 
+/// Адресная таблица главного домена — печатается при ЛЮБОМ вердикте,
+/// включая «Open» (кейс AI-студии: все данные собирались, но отчёт их
+/// прятал). Строится ТОЛЬКО из полей `DomainProbe` — списки адресов
+/// повторно не собираются (SSOT; core §2.2: молчаливое сокрытие адресов
+/// запрещено).
+fn write_address_table(log: &mut String, probe: &site_probe::DomainProbe) {
+    log.push_str(&format!("  📊 АДРЕСНАЯ ТАБЛИЦА «{}»:\n", probe.host));
+
+    let sys = if probe.primary_ips.is_empty() {
+        "(нет)".to_string()
+    } else {
+        probe.primary_ips.join(", ")
+    };
+    log.push_str(&format!("    системный DNS (UDP:53): {}\n", sys));
+
+    if probe.doh_ips.is_empty() {
+        if !probe.doh_failures.is_empty() {
+            log.push_str(
+                "    через DoH: ни один сервис не ответил (причины — см. замечание выше)\n",
+            );
+        }
+    } else if probe.doh_ip_services.is_empty() {
+        // Крайний случай: адреса есть, а подписей сервисов нет — адреса всё
+        // равно обязаны печататься (молчаливое сокрытие запрещено, core §2.2).
+        log.push_str(&format!(
+            "    через DoH: {} (сервис-источник не определён)\n",
+            probe.doh_ips.join(", ")
+        ));
+    } else {
+        for (ip, svcs) in &probe.doh_ip_services {
+            match svcs.len() {
+                // Адрес не нашёлся ни в одном «ответе с профилем» — не рисуем
+                // пустую строку (адрес попал в doh_ips без сервиса).
+                0 => log.push_str(&format!("    через DoH: {}\n", ip)),
+                // Адрес отдал ТОЛЬКО один сервис, системный DNS его не знает:
+                // типовой признак «обходного» DoH-шлюза (кейс AI-сервисов).
+                1 => log.push_str(&format!(
+                    "    через DoH: {} ← отдал только сервис «{}» (другие резолверы этот адрес не вернули): возможно, прокси-шлюз сервиса, а не адрес сайта\n",
+                    ip, svcs[0]
+                )),
+                _ => log.push_str(&format!(
+                    "    через DoH: {} (сервисы: {})\n",
+                    ip,
+                    svcs.join(", ")
+                )),
+            }
+        }
+    }
+
+    // Рабочий адрес: тот, через который реально прошла HTTPS-проба
+    // (собран в site_probe::pick_working).
+    match &probe.working_ip {
+        Some(ip) => {
+            let src = match probe.working_ip_source {
+                Some(IpSource::Doh) => "DoH",
+                Some(IpSource::SystemDns) => "системный DNS",
+                None => "?",
+            };
+            log.push_str(&format!(
+                "    HTTPS-проба прошла через: {} (источник: {})\n",
+                ip, src
+            ));
+            // Рецепт «Open»-через-одиночный-сервис: браузер получает тот же
+            // маршрут, только включив этот DoH; hosts тут временное лечение.
+            if probe.verdict == SiteVerdict::Open {
+                let solo = probe
+                    .doh_ip_services
+                    .iter()
+                    .filter(|(i, _)| i.as_str() == ip.as_str())
+                    .find(|(_, s)| s.len() == 1);
+                if let Some((_, svcs)) = solo {
+                    log.push_str(&format!(
+                        "    💡 Сайт открылся через адрес DoH-сервиса «{}»: чтобы браузер шёл тем же путём — включите этот DoH-сервис в браузере/Windows. Запись такого адреса в hosts сработает лишь до смены шлюза — постоянной её делать нельзя.\n",
+                        svcs[0]
+                    ));
+                }
+            }
+        }
+        None => log.push_str("    HTTPS-проба прошла через: не определялась\n"),
+    }
+
+    if let Some(wh) = &probe.www_host {
+        if !probe.www_ips.is_empty() {
+            log.push_str(&format!("    www «{}»: {}\n", wh, probe.www_ips.join(", ")));
+        }
+    }
+    log.push('\n');
+}
+
 fn write_main_domain(log: &mut String, meta: &ReportMeta) {
     let probe = match &meta.main_probe {
         Some(p) => p,
@@ -211,7 +307,7 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
         SiteVerdict::TlsBroken => "🔐",
         SiteVerdict::BadCert => "🔐",
         SiteVerdict::BlockPage => "⛔",
-        SiteVerdict::GeoBlocked => "🌍",
+        SiteVerdict::GeoBlocked | SiteVerdict::ServiceRestricted => "🌍",
         _ => "⚠️",
     };
     log.push_str(&format!(
@@ -288,9 +384,29 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
     log.push_str(&format!("  IP apex (системный DNS): {}\n", prim));
     // Проверенные адреса из защищённого канала — именно их имеет смысл
     // прописывать в hosts, и именно они отличают «подменённый адрес» от
-    // настоящего.
+    // настоящего. Для каждого адреса — его источник (кто из DoH-сервисов
+    // его отдал), как требует адресная таблица: молчаливое сокрытие
+    // происхождения адреса запрещено (core §2.2).
     if !probe.doh_ips.is_empty() {
-        log.push_str(&format!("  IP через DoH (проверенные): {}\n", probe.doh_ips.join(", ")));
+        let labeled = probe
+            .doh_ips
+            .iter()
+            .map(|ip| {
+                let svcs: &[String] = probe
+                    .doh_ip_services
+                    .iter()
+                    .find(|(i, _)| i.as_str() == ip.as_str())
+                    .map(|(_, s)| s.as_slice())
+                    .unwrap_or(&[]);
+                match svcs.len() {
+                    0 => ip.clone(),
+                    1 => format!("{} ← «{}» (возможно, прокси-шлюз)", ip, svcs[0]),
+                    _ => format!("{} ({})", ip, svcs.join(", ")),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        log.push_str(&format!("  IP через DoH (проверенные): {}\n", labeled));
     }
     if let Some(wh) = &probe.www_host {
         let www = if probe.www_ips.is_empty() {
@@ -309,10 +425,20 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
     log.push_str(&format!("  Соединение главного IP:    {}\n", probe.http_note));
     log.push_str(&working_ip_line(probe));
     if !probe.doh_failures.is_empty() {
-        log.push_str(&format!(
-            "  ℹ️ Не ответили DoH-сервисы: {}\n",
-            probe.doh_failures.join("; ")
-        ));
+        // Короткая сводка вместо голых io-протоколов (core §2.2): имя сервиса
+        // и сжатая причина на одну строку; длинные тексты-истории не выплёскиваем.
+        let brief: Vec<String> = probe
+            .doh_failures
+            .iter()
+            .map(|f| {
+                let mut s: String = f.chars().take(72).collect();
+                if f.chars().count() > 72 {
+                    s.push('…');
+                }
+                s
+            })
+            .collect();
+        log.push_str(&format!("  ℹ️ Не ответили DoH-сервисы: {}\n", brief.join("; ")));
     }
 
     log.push('\n');
@@ -342,7 +468,7 @@ fn working_ip_line(probe: &site_probe::DomainProbe) -> String {
             ip, source, code
         ),
         Some(HttpResult::BadCert) => format!(
-            "  IP с открытым TCP:443: {}{} (сертификат не совпадает с именем домена — сайт НЕ открывается)\n",
+            "  IP с открытым TCP:443: {}{} (сертификат не принадлежит домену сайта: по HTTPS отвечал посторонний сервер — сайт НЕ открывается)\n",
             ip, source
         ),
         Some(HttpResult::Rst) => format!(
@@ -365,6 +491,12 @@ fn working_ip_line(probe: &site_probe::DomainProbe) -> String {
             "  IP с открытым TCP:443: {}{} (сервер отказывает: HTTP {} — возможно, региональное ограничение, проверьте через VPN)\n",
             ip, source, code
         ),
+        Some(HttpResult::ServiceRestrict) => {
+            format!(
+                "  IP с живым HTTP: {}{} (страница отдалась, но сервис сам сообщает об ограничении по региону — «открывается» лишь формально)\n",
+                ip, source
+            )
+        }
         Some(HttpResult::Dns) => format!(
             "  IP с открытым TCP:443: {}{} (DNS-ошибка при обращении)\n",
             ip, source
@@ -736,6 +868,9 @@ mod tests {
                 doh_working_ip: None,
                 same_host_alt_ip_works: false,
                 isp_redirect: None,
+                doh_http80_hint: false,
+                doh_candidates: Vec::new(),
+                probe_fail_note: None,
             },
         );
         let mut dns = DnsInfo::new();
@@ -745,6 +880,7 @@ mod tests {
             dns,
             primary_ips: vec!["216.150.1.1".to_string()],
             doh_ips: vec![],
+            doh_ip_services: vec![],
             working_ip: None,
             working_ip_source: None,
             working_http: None,
@@ -947,6 +1083,70 @@ let log = build_report(&meta_with(p), &empty_classification());
         assert!(working_ip_line(&p).contains("не найден"), "{}", working_ip_line(&p));
     }
 
+    /// Кейс AI-студии: при вердикте «Open» отчёт обязан показать ВСЕ собранные
+    /// адреса (системные, DoH) и рабочий адрес с источником, а не только
+    /// короткую строку «ДОСТУПЕН».
+    #[test]
+    fn open_report_prints_address_table() {
+        let mut p = www_only_probe();
+        p.verdict = Verdict::Open;
+        p.primary_ips = vec!["192.178.183.10".to_string()];
+        p.doh_ips = vec!["74.125.205.105".to_string(), "199.189.249.126".to_string()];
+        p.doh_ip_services = vec![
+            ("74.125.205.105".to_string(), vec!["dns.comss.one".to_string(), "geohide.ru".to_string()]),
+            ("199.189.249.126".to_string(), vec!["geohide.ru".to_string()]),
+        ];
+        p.working_ip = Some("199.189.249.126".to_string());
+        p.working_ip_source = Some(IpSource::Doh);
+        p.working_http = Some(HttpResult::Ok(200));
+        let log = build_report(&meta_with(p), &empty_classification());
+        assert!(log.contains("АДРЕСНАЯ ТАБЛИЦА"), "{}", log);
+        assert!(log.contains("192.178.183.10"), "{}", log);
+        assert!(log.contains("74.125.205.105"), "{}", log);
+        assert!(log.contains("199.189.249.126"), "{}", log);
+        // Подпись источника адресов DoH.
+        assert!(log.contains("dns.comss.one"), "{}", log);
+        // Адрес одного-единственного сервиса помечен как возможный шлюз.
+        assert!(log.contains("прокси-шлюз"), "{}", log);
+        // Рабочий адрес с источником.
+        assert!(log.contains("источник: DoH"), "{}", log);
+        // Рецепт «включи этот DoH» при открытии через шлюз.
+        assert!(log.contains("включите этот DoH-сервис"), "{}", log);
+        // Оговорка про ограничения внутри страницы — обязательна при «Open».
+        assert!(
+            log.contains("Проверено открытие самой страницы"),
+            "{}",
+            log
+        );
+    }
+
+    /// Подписи источников DoH-адресов обязаны присутствовать и в секции
+    /// «ГЛАВНЫЙ ДОМЕН НЕ ОТКРЫВАЕТСЯ» (не-Open), не только в таблице «Open»:
+    /// кейс turboimagehost приходит вердиктом DnsBlocked.
+    #[test]
+    fn non_open_section_labels_doh_sources_and_gateway() {
+        let mut p = www_only_probe();
+        p.verdict = Verdict::DnsBlocked;
+        p.dns_spoofed = Some("расхождение".to_string());
+        p.doh_ips = vec!["104.21.20.243".to_string(), "199.189.249.126".to_string()];
+        p.doh_ip_services = vec![
+            ("104.21.20.243".to_string(), vec!["dns.comss.one".to_string(), "geohide.ru".to_string()]),
+            ("199.189.249.126".to_string(), vec!["geohide.ru".to_string()]),
+        ];
+        let log = build_report(&meta_with(p), &empty_classification());
+        // Оба адреса напечатаны с их источниками.
+        assert!(
+            log.contains("104.21.20.243 (dns.comss.one, geohide.ru)"),
+            "{}",
+            log
+        );
+        assert!(
+            log.contains("199.189.249.126 ← «geohide.ru» (возможно, прокси-шлюз)"),
+            "{}",
+            log
+        );
+    }
+
     #[test]
     fn clean_dns_says_no_discrepancy_found() {
         let log = build_report(&meta_with(www_only_probe()), &empty_classification());
@@ -981,6 +1181,9 @@ let log = build_report(&meta_with(p), &empty_classification());
                 doh_working_ip: Some("104.21.95.93"),
                 same_host_alt_ip_works: true,
                 isp_redirect: None,
+                doh_http80_hint: false,
+                doh_candidates: Vec::new(),
+                probe_fail_note: None,
             },
         );
         let mut dns = DnsInfo::new();
@@ -991,6 +1194,7 @@ let log = build_report(&meta_with(p), &empty_classification());
             dns,
             primary_ips: vec!["188.186.146.207".to_string()],
             doh_ips: vec!["104.21.95.93".to_string()],
+            doh_ip_services: Vec::new(),
             working_ip: Some("104.21.95.93".to_string()),
             working_ip_source: Some(IpSource::Doh),
             working_http: Some(HttpResult::Ok(200)),
@@ -1034,6 +1238,9 @@ let log = build_report(&meta_with(p), &empty_classification());
                 doh_working_ip: None,
                 same_host_alt_ip_works: false,
                 isp_redirect: None,
+                doh_http80_hint: false,
+                doh_candidates: Vec::new(),
+                probe_fail_note: None,
             },
         );
         let mut dns = DnsInfo::new();
@@ -1043,6 +1250,7 @@ let log = build_report(&meta_with(p), &empty_classification());
             dns,
             primary_ips: vec!["188.186.146.207".to_string()],
             doh_ips: vec![],
+            doh_ip_services: Vec::new(),
             working_ip: None,
             working_ip_source: None,
             working_http: None,
@@ -1062,7 +1270,9 @@ let log = build_report(&meta_with(p), &empty_classification());
             "без проверенного адреса hosts предлагать нечего: {}",
             log
         );
-        assert!(log.contains("Запись в hosts сейчас не поможет"), "{}", log);
+        // Честный текст ключевого отказа (см. dns_poisoned_actions):
+        // без проверенного адреса запись в hosts — риск, а не решение.
+        assert!(log.contains("Подтверждённо рабочей строки для hosts нет"), "{}", log);
     }
 
     /// Regression: "работает, трогать не обязательно" was printed unconditionally.
@@ -1128,6 +1338,9 @@ let log = build_report(&meta_with(p), &empty_classification());
                 doh_working_ip: Some("216.198.79.195"),
                 same_host_alt_ip_works: true,
                 isp_redirect: None,
+                doh_http80_hint: false,
+                doh_candidates: Vec::new(),
+                probe_fail_note: None,
             },
         );
         let mut dns = DnsInfo::new();
@@ -1137,6 +1350,7 @@ let log = build_report(&meta_with(p), &empty_classification());
             dns,
             primary_ips: vec!["64.29.17.131".to_string()],
             doh_ips: vec!["216.198.79.195".to_string()],
+            doh_ip_services: Vec::new(),
             working_ip: Some("216.198.79.195".to_string()),
             working_ip_source: Some(IpSource::Doh),
             working_http: Some(HttpResult::Ok(400)),
@@ -1225,6 +1439,9 @@ let log = build_report(&meta_with(p), &empty_classification());
                 doh_working_ip: None,
                 same_host_alt_ip_works: false,
                 isp_redirect: None,
+                doh_http80_hint: false,
+                doh_candidates: Vec::new(),
+                probe_fail_note: None,
             },
         );
         let mut dns = DnsInfo::new();
@@ -1236,6 +1453,7 @@ let log = build_report(&meta_with(p), &empty_classification());
             dns,
             primary_ips: vec!["34.96.76.122".to_string()],
             doh_ips: vec![],
+            doh_ip_services: Vec::new(),
             working_ip: Some("34.96.76.122".to_string()),
             working_ip_source: Some(IpSource::SystemDns),
             working_http: Some(HttpResult::Forbidden(403)),

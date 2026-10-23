@@ -144,6 +144,9 @@ fn verify_site_via_ip(host: String, ip: String) -> Result<String, String> {
         crate::diagnostics_probe::HttpResult::Forbidden(code) => {
             Ok(format!("🌍 {} через {} — отказ сервера HTTP {} без признаков подмены (возможно, региональное ограничение — проверьте через VPN)", ip, host, code))
         }
+        crate::diagnostics_probe::HttpResult::ServiceRestrict => {
+            Ok(format!("⚠️ {} через {} — сайт отдался, но сервис сам сообщает об ограничении (регион источника): сеть здесь не при чём, нужен VPN", ip, host))
+        }
         crate::diagnostics_probe::HttpResult::Rst => {
             Ok(format!("🚫 {} — HTTPS сброшен (RST). Блок по SNI/IP: подмена в hosts не поможет, нужен обход (winws).", ip))
         }

@@ -22,6 +22,7 @@ use reqwest::blocking::Client;
 use reqwest::header::ACCEPT;
 use tauri::AppHandle;
 
+use crate::diagnostics_probe::{classify_reqwest_err, HttpResult};
 use crate::ip_probe::app_log;
 
 /// «Родных» адресов домена достаточно проверить по первым нескольким.
@@ -386,17 +387,28 @@ fn probe(host: &str, ip: IpAddr) -> HttpOutcome {
             HttpOutcome::Http { status, body_head, cf_mitigated }
         }
         Err(e) => {
-            let text = e.to_string();
-            if e.is_timeout() {
-                HttpOutcome::Timeout
-            } else if e.is_connect() && (text.contains("10054") || text.contains("reset")) {
-                HttpOutcome::Rst
-            } else if text.to_lowercase().contains("certificate")
-                || text.to_lowercase().contains("cert")
-            {
-                HttpOutcome::Tls
-            } else {
-                HttpOutcome::Other(text)
+            // SSOT (core rules): причина ошибки разбирается ЕДИНСТВЕННОЙ
+            // функцией classify_reqwest_err — она ходит по цепочке error.source()
+            // reqwest, поэтому HttpOutcome::Other несёт КОНКРЕТНУЮ причину
+            // («соединение сброшено», «истёк таймаут», «ошибка сертификата»),
+            // а не голое «error sending request for url».
+            match classify_reqwest_err(&e) {
+                HttpResult::Rst => HttpOutcome::Rst,
+                HttpResult::Timeout => HttpOutcome::Timeout,
+                // Для скана чужой сертификат и TLS-обрыв равнозначны: сайт
+                // HTTP-ответом не ответил.
+                HttpResult::Tls | HttpResult::BadCert => HttpOutcome::Tls,
+                HttpResult::Dns => {
+                    HttpOutcome::Other(
+                        "ошибка резолва имени, хотя IP закреплён за клиентом напрямую".to_string(),
+                    )
+                }
+                HttpResult::Other(t) => HttpOutcome::Other(t),
+                // Классификатор причин здесь иное не возвращает; не паникуем —
+                // честный текст вместо выдуманного статуса.
+                other => {
+                    HttpOutcome::Other(format!("неожиданный итог классификации: {other:?}"))
+                }
             }
         }
     }
@@ -459,14 +471,19 @@ pub fn block_diagnose(app: &AppHandle, host: &str) -> BlockScanReport {
 
     // Проба родных IP.
     let mut outcomes: Vec<HttpOutcome> = Vec::new();
+    // Честные описания всех непроизошедших HTTP-ответов (для итогового лога,
+    // core §2.2): «чужой VIP» мы не имеем права называть, если ответов не было.
+    let mut native_notes: Vec<String> = Vec::new();
     let mut last_err = String::from("без ответа");
     for ip in native_ips.iter().take(NATIVE_PROBE_LIMIT) {
         let o = probe(host, *ip);
+        let note = describe_outcome(&o);
         if o.is_transport_dead() {
-            last_err = describe_outcome(&o);
-            app_log(app, format!("[IPSCAN] родной {ip}: {last_err}"));
+            last_err = note.clone();
+            app_log(app, format!("[IPSCAN] родной {ip}: {note}"));
         } else {
-            app_log(app, format!("[IPSCAN] родной {ip}: {}", describe_outcome(&o)));
+            app_log(app, format!("[IPSCAN] родной {ip}: {note}"));
+            native_notes.push(note);
             outcomes.push(o);
         }
     }
@@ -538,11 +555,26 @@ pub fn block_diagnose(app: &AppHandle, host: &str) -> BlockScanReport {
         return BlockScanReport::ServerFault { status: s };
     }
     if guest_only {
-        // Родные IP отдают только «чужой VIP» 403 — проводим скан, как для мёртвых.
-        app_log(
-            app,
-            "[IPSCAN] родные IP отдали только «чужой VIP» 403 — уточняю сканом CIDR",
-        );
+        // Честность (core §2.2): «чужой VIP» — про HTTP-ответ 403 с маркером
+        // 1034/1003/1000. Если HTTP-ответов не было вовсе (только прочие
+        // ошибки клиента) — называть VIP ложь; но скан CIDR уместен и тут.
+        let any_http = outcomes
+            .iter()
+            .any(|o| matches!(o, HttpOutcome::Http { .. }));
+        if any_http {
+            app_log(
+                app,
+                "[IPSCAN] родные IP отдали только «чужой VIP» 403 — уточняю сканом CIDR",
+            );
+        } else {
+            app_log(
+                app,
+                format!(
+                    "[IPSCAN] родные IP не классифицированы ({}) — уточняю сканом CIDR",
+                    native_notes.join("; ")
+                ),
+            );
+        }
         return BlockScanReport::RangesScanned(scan_ranges(app, host));
     }
     BlockScanReport::NoPath { why: "не удалось классифицировать ответ родных IP".to_string() }
@@ -717,25 +749,45 @@ pub fn build_report_lines(host: &str, r: &BlockScanReport) -> Vec<String> {
                     lines.push(
                         "    Похоже, цензор закрывает весь проанализированный пул по IP.".to_string(),
                     );
-                } else if outcome.guest_refusal_count > 0 && outcome.waf_refusal_count == 0 {
+            } else if outcome.waf_refusal_count > 0 {
+                lines.push(
+                    "    ❌ Региональный блок ПОДТВЕРЖДЁН сканом: живые IP отвечают с WAF-маркерами."
+                        .to_string(),
+                );
+                lines.push(
+                    "    Обход тут бесполезен. Нужен VPN/прокси (смена исходного IP).".to_string(),
+                );
+            } else if outcome.guest_refusal_count > 0 && outcome.other_status_count == 0 {
+                // «Строгий пул» — сильный вывод: ставим его ТОЛЬКО когда каждый
+                // живой HTTP-ответ был именно «чужим VIP» (403 с 1034/1003/1000),
+                // без примеси прочих отказов. Иначе выборка хрупкая.
+                lines.push(
+                    "    ⚠️ Все живые IP ответили «чужой VIP»: похоже, домен привязан к строгому пулу Cloudflare."
+                        .to_string(),
+                );
+                lines.push(
+                    "    Подменить IP через hosts на соседний CF-адрес может не получиться."
+                        .to_string(),
+                );
+            } else {
+                // Честная формулировка вместо сильного вывода (кейс
+                // turboimagehost: 4 VIP в выборке, а соседний диапазон рабочий).
+                if outcome.guest_refusal_count > 0 {
                     lines.push(
-                        "    ⚠️ Все живые IP ответили «чужой VIP»: домен привязан к строгому пулу Cloudflare.".to_string(),
-                    );
-                    lines.push(
-                        "    Подменить IP через hosts на соседний CF-адрес не получится.".to_string(),
-                    );
-                } else if outcome.waf_refusal_count > 0 {
-                    lines.push(
-                        "    ❌ Региональный блок ПОДТВЕРЖДЁН сканом: живые IP отвечают с WAF-маркерами.".to_string(),
-                    );
-                    lines.push(
-                        "    Обход тут бесполезен. Нужен VPN/прокси (смена исходного IP).".to_string(),
+                        "    ❌ Скан не показал рабочего IP; часть живых IP ответила прочими отказами, поэтому вывод о строгом пуле на этих данных не основан."
+                            .to_string(),
                     );
                 } else {
                     lines.push(
-                        "    ❌ Рабочих IP не найдено (живые IP отвечают прочими отказами).".to_string(),
+                        "    ❌ Рабочих IP не найдено (живые IP отвечают прочими отказами)."
+                            .to_string(),
                     );
                 }
+                lines.push(
+                    "    Анализ выбирает лишь несколько адресов из каждого диапазона — можно повторить позже."
+                        .to_string(),
+                );
+            }
             } else {
                 let (ip, status) = outcome.working[0];
                 lines.push(format!(
@@ -874,6 +926,56 @@ mod tests {
         assert!(all.contains("чужой VIP"));
         assert!(all.contains("строго пул") || all.contains("строгому пулу"));
         assert!(!all.contains("РАБОЧИЙ IP НАЙДЕН"));
+    }
+
+    /// «Строгий пул» — запрещён, если HTTP-данных мало или они смешаны:
+    /// только-Other случай и смесь VIP с прочими отказами не дают права
+    /// на этот вывод (кейс turboimagehost).
+    #[test]
+    fn strict_pool_claim_needs_guest_only_http() {
+        let host = "example.org";
+        // Случай «только транспортные смерти»: HTTP-ответов не было вовсе.
+        let no_http = BlockScanReport::RangesScanned(RangeScanOutcome {
+            ranges_source: Ok(25),
+            pool_size: 100,
+            probed: 40,
+            alive_count: 0,
+            guest_refusal_count: 0,
+            waf_refusal_count: 0,
+            other_status_count: 0,
+            working: Vec::new(),
+        });
+        let all = build_report_lines(host, &no_http).join("\n");
+        assert!(!all.contains("привязан к строгому пулу"), "{all}");
+        assert!(!all.contains("Подменить IP через hosts"), "{all}");
+
+        // Смесь: и «чужой VIP», и прочие отказы — сильный вывод запрещён.
+        let mixed = BlockScanReport::RangesScanned(RangeScanOutcome {
+            ranges_source: Ok(25),
+            pool_size: 100,
+            probed: 40,
+            alive_count: 8,
+            guest_refusal_count: 3,
+            waf_refusal_count: 0,
+            other_status_count: 5,
+            working: Vec::new(),
+        });
+        let all = build_report_lines(host, &mixed).join("\n");
+        assert!(!all.contains("привязан к строгому пулу"), "{all}");
+        assert!(!all.contains("Подменить IP через hosts"), "{all}");
+        assert!(all.contains("не основан"), "{all}");
+    }
+
+    /// Причина Other-ошибки обязана попасть в описание и быть короткой
+    /// (проверка форматирования describe_outcome).
+    #[test]
+    fn describe_outcome_other_keeps_honest_cause_and_truncates() {
+        let o = HttpOutcome::Other("io error: соединение сброшено удалённым хостом".to_string());
+        assert!(describe_outcome(&o).contains("соединение сброшено"), "{}", describe_outcome(&o));
+
+        let long = "x".repeat(500);
+        let o = HttpOutcome::Other(long);
+        assert!(describe_outcome(&o).chars().count() <= 170, "{}", describe_outcome(&o));
     }
 
     #[test]

@@ -12,8 +12,8 @@ use std::time::Duration;
 use reqwest::blocking::Client;
 
 use crate::diagnostics_probe::{
-    body_looks_like_blockpage, classify_reqwest_err, dns_multi, is_stub_ip, resolve_doh_all,
-    tcp_connect, DnsInfo, HttpResult,
+    body_looks_like_blockpage, body_looks_region_restricted, classify_reqwest_err, dns_multi,
+    is_stub_ip, resolve_doh_all, tcp_connect, DnsInfo, HttpResult,
 };
 use crate::site_verdict::{
     classify, explain, hosts_lines, http_result_note, refine_with_isp_redirect, CauseContext,
@@ -40,6 +40,11 @@ pub struct DomainProbe {
     pub primary_ips: Vec<String>,
     /// Адреса, найденные через DoH (проверенный канал).
     pub doh_ips: Vec<String>,
+    /// Карта «адрес из `doh_ips` → сервисы DoH, которые его вернули».
+    /// Пусто при пустом `doh_ips`. Нужна отчёту: адрес, который отдал
+    /// только один сервис и которого нет у системного DNS, — кандидат
+    /// «прокси-шлюз» этого сервиса, а не адрес самого сайта.
+    pub doh_ip_services: Vec<(String, Vec<String>)>,
     /// Адрес, по которому сервер ответил на TCP:443.
     pub working_ip: Option<String>,
     /// Какой канал разрешения дал `working_ip`.
@@ -164,6 +169,34 @@ fn probe_isp_redirect(host: &str, ip: IpAddr) -> Option<String> {
     Some(format!("{} -> {}", host, target_host))
 }
 
+/// Фолбэк-проба обычного HTTP (порт 80) по проверенным DoH-адресам: жив ли
+/// транспорт до настоящего адреса, когда HTTPS/TLS из приложения не открыл
+/// сайт. Достаточно самого факта осмысленного HTTP-ответа (1xx–4xx):
+/// редиректы ищет отдельно [`probe_isp_redirect`], здесь это не дублируется.
+/// Любой 5xx считаем «ответили, но ошибка» — подсказку «транспорт жив» такое
+/// не даёт (заглушки ТСПУ тоже умеют отвечать 503).
+fn probe_alive_over_http80(host: &str, ips: &[String]) -> bool {
+    for ip in ips.iter().filter_map(|s| s.parse::<IpAddr>().ok()) {
+        if is_stub_ip(&ip) {
+            continue;
+        }
+        let Ok(client) = Client::builder()
+            .resolve(host, SocketAddr::new(ip, 80))
+            .timeout(Duration::from_secs(5))
+            .build()
+        else {
+            continue;
+        };
+        if let Ok(resp) = client.get(format!("http://{}/", host)).send() {
+            let status = resp.status().as_u16();
+            if (100..=499).contains(&status) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// HTTPS-запрос к конкретному адресу: адрес подставляется на уровне сокета,
 /// имя домена остаётся в SNI и в проверке сертификата. Публично и с явным
 /// портом: используется также IP-режимом анализа (ip_probe SNI-эксперимент) —
@@ -194,6 +227,11 @@ pub fn http_via_ip(host: &str, ip: IpAddr, port: u16) -> HttpResult {
                 let low = resp.text().unwrap_or_default().to_lowercase();
                 if body_looks_like_blockpage(&low) {
                     HttpResult::BlockPage
+                } else if body_looks_region_restricted(&low) {
+                    // Живой HTTP-ответ, но сам сервис сообщает об ограничении
+                    // (регион источника). Сеть в порядке — вердикт «открыт»
+                    // тут был бы ложью (кейс AI-студий).
+                    HttpResult::ServiceRestrict
                 } else {
                     HttpResult::Ok(status)
                 }
@@ -312,6 +350,9 @@ pub fn probe_domain(host: &str) -> DomainProbe {
             .copied()
             .filter(|ip| !primary_set.contains(&ip.to_string())),
     );
+    // Карта «адрес → сервисы DoH» — строится из фактических ответов сервисов
+    // (без повторных запросов), для честной адресной таблицы отчёта.
+    let doh_ip_services = doh_answers.services_map(&doh_ips);
 
     // Проба по адресам из системного DNS.
     let sys_probe = probe_host_at(host, &primary_ips);
@@ -383,6 +424,28 @@ pub fn probe_domain(host: &str) -> DomainProbe {
 
     let verdict = refine_with_isp_redirect(base_verdict, isp_redirect.as_deref());
 
+    // Фолбэк HTTP:80 (кейс turboimagehost: подмена доказана, но HTTPS по
+    // DoH-адресам из приложения не прошёл): проверяем по порту 80 те же
+    // DoH-адреса. Осмысленный ответ — доказательство «транспорт до
+    // настоящего адреса жив, режется TLS/SNI»; вердикт это не меняет
+    // (остаётся DnsBlocked), но текст честно называет лечение через обход.
+    let doh_opened = matches!(doh_probe.http, Some(HttpResult::Ok(_)));
+    let doh_http80_hint =
+        dns_spoofed.is_some() && !doh_opened && probe_alive_over_http80(host, &doh_ips);
+
+    // DoH-адреса, которые нельзя спрятать (core §2.2), если приложение их
+    // HTTPS-пробой не подтвердило: уходят в отчёт как КАНДИДАТЫ с причиной.
+    let doh_candidates: Vec<String> = if doh_opened { Vec::new() } else { doh_ips.clone() };
+    let probe_fail_note: Option<String> = if doh_opened {
+        None
+    } else {
+        match &doh_probe.http {
+            Some(r) => Some(http_result_note(r)),
+            // TCP до DoH-адресов не дошёл: причина — исход из сетевых проб.
+            None => (!doh_probe.note.is_empty()).then(|| doh_probe.note.clone()),
+        }
+    };
+
     // Адрес для подсказки «записать в hosts»: только проверенный (DoH) и
     // только если сайт через него действительно открылся (HTTP Ok).
     // Без проверки Ok сюда попадал адрес с отказом/RST — и отчёт советовал
@@ -403,6 +466,9 @@ pub fn probe_domain(host: &str) -> DomainProbe {
             doh_working_ip,
             same_host_alt_ip_works: matches!(doh_probe.http, Some(HttpResult::Ok(_))),
             isp_redirect: isp_redirect.as_deref(),
+            doh_http80_hint,
+            doh_candidates,
+            probe_fail_note,
         },
     );
 
@@ -411,6 +477,7 @@ pub fn probe_domain(host: &str) -> DomainProbe {
         dns,
         primary_ips,
         doh_ips,
+        doh_ip_services,
         working_ip,
         working_ip_source,
         working_http,
@@ -609,6 +676,9 @@ fn substitution_note(r: &HttpResult) -> String {
         HttpResult::Ok(code) => format!("HTTP {}", code),
         HttpResult::BlockPage => "страница блокировки".to_string(),
         HttpResult::Forbidden(code) => format!("отказ сервера HTTP {}", code),
+        HttpResult::ServiceRestrict => {
+            "страница отдалась, но сервис сообщает об ограничении (регион)".to_string()
+        }
         HttpResult::Tls => "TLS сломан".to_string(),
         HttpResult::BadCert => "SSL-сертификат невалиден".to_string(),
         HttpResult::Rst => "RST — TCP:443 открыт, но HTTPS рвётся (DPI по SNI)".to_string(),
@@ -709,6 +779,10 @@ mod tests {
             dns,
             primary_ips: vec!["188.186.154.88".to_string()],
             doh_ips: vec!["104.21.95.93".to_string()],
+            doh_ip_services: vec![(
+                "104.21.95.93".to_string(),
+                vec!["dns.comss.one".to_string()],
+            )],
             working_ip: Some("104.21.95.93".to_string()),
             working_ip_source: Some(IpSource::Doh),
             working_http: Some(HttpResult::Ok(200)),
@@ -740,6 +814,7 @@ mod tests {
             dns: DnsInfo::new(),
             primary_ips: vec!["188.186.154.88".to_string()],
             doh_ips: vec![],
+            doh_ip_services: vec![],
             working_ip: Some("188.186.154.88".to_string()),
             working_ip_source: Some(IpSource::SystemDns),
             working_http: Some(HttpResult::BadCert),

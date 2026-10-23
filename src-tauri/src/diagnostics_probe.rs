@@ -25,6 +25,11 @@ pub enum HttpResult {
     /// при региональном ограничении (гео-блок). Выдавать его за «страницу
     /// блокировки провайдера» было прямой ложью (кейс cohere: с VPN работает).
     Forbidden(u16),
+    /// Сайт вернул живой HTTP-ответ (2xx/3xx), но в теле страницы сам сервис
+    /// сообщает об ограничении доступа (регион источника, доступность).
+    /// Сеть в порядке — ограничивает сам сервис; на вердикт «открыт» это
+    /// смотреть нельзя (кейс AI-студий: 200 «открывается», пользы нет).
+    ServiceRestrict,
     Dns,         // Не резолвится (DNS-цензура / NXDOMAIN)
     Rst,         // Сброс соединения (RST) — типично для DPI
     Tls,         // Ошибка TLS/рукопожатия
@@ -63,6 +68,25 @@ pub fn body_looks_like_blockpage(low_text: &str) -> bool {
         || low_text.contains("this site is blocked")
         || low_text.contains("access denied: by order")
         || low_text.contains("страница не может быть отображена")
+}
+
+/// Маркеры регионального ограничения В ТЕЛЕ живой 200-страницы.
+/// Единственный источник правды (core rules §2.1), как и blockpage-маркеры:
+/// сканер тела живёт здесь, потребители — site_probe и отчёт. Только общие
+/// фразы (core §2.9): конкретные имена сервисов в движок не вписываются.
+pub fn body_looks_region_restricted(low_text: &str) -> bool {
+    low_text.contains("not available in your country")
+        || low_text.contains("not available in your region")
+        || low_text.contains("not available in your area")
+        || low_text.contains("unavailable in your region")
+        || low_text.contains("not supported in your region")
+        || low_text.contains("location is not supported")
+        || low_text.contains("your region is not supported")
+        || low_text.contains("country is not supported")
+        || low_text.contains("not available from your location")
+        || low_text.contains("недоступен в вашем регионе")
+        || low_text.contains("не поддерживается для вашего региона")
+        || low_text.contains("ограничен для вашего региона")
 }
 
 /// Запуск потенциально зависающей операции с таймаутом.
@@ -552,6 +576,30 @@ impl DohAnswers {
         out.extend(self.warnings.iter().cloned());
         out
     }
+
+    /// Какие сервисы вернули данный адрес. Нужен отчёту: адрес, всплывший
+    /// только у одного DoH-сервиса (и не совпавший с системным DNS) — кандидат
+    /// «прокси-шлюз» этого сервиса, а не адрес сайта (кейс обходных DoH,
+    /// отдающих собственные шлюзы для AI-сервисов).
+    pub fn services_for_ip(&self, ip: &IpAddr) -> Vec<String> {
+        self.answers
+            .iter()
+            .filter(|a| a.ips.iter().any(|x| x == ip))
+            .map(|a| a.service.clone())
+            .collect()
+    }
+
+    /// Карта «адрес → сервисы» под порядок переданного списка адресов.
+    /// Адреса без сервиса (не вернул никто) в карту не попадают.
+    pub fn services_map(&self, ips: &[String]) -> Vec<(String, Vec<String>)> {
+        ips.iter()
+            .filter_map(|s| {
+                let ip: IpAddr = s.parse().ok()?;
+                let svcs = self.services_for_ip(&ip);
+                (!svcs.is_empty()).then(|| (s.clone(), svcs))
+            })
+            .collect()
+    }
 }
 
 /// Резолвит домен через ВСЕ доверенные DoH-сервисы параллельно, с общим
@@ -860,5 +908,60 @@ mod tests {
             answers.all_ips(),
             vec!["104.18.2.115".parse::<IpAddr>().unwrap()]
         );
+    }
+
+    /// Карта «адрес → сервисы»: адрес, который отдал только один сервис,
+    /// подписывается этим сервисом (кандидат «прокси-шлюз» в отчёте).
+    #[test]
+    fn services_map_labels_single_service_addresses() {
+        let answers = DohAnswers {
+            answers: vec![
+                DohAnswer {
+                    service: "svc-a".to_string(),
+                    ips: vec!["74.125.205.105".parse().unwrap(), "199.189.249.126".parse().unwrap()],
+                    error: None,
+                },
+                DohAnswer {
+                    service: "svc-b".to_string(),
+                    ips: vec!["74.125.205.105".parse().unwrap()],
+                    error: None,
+                },
+                DohAnswer {
+                    service: "svc-dead".to_string(),
+                    ips: vec![],
+                    error: Some("таймаут".to_string()),
+                },
+            ],
+            ..Default::default()
+        };
+        let map = answers.services_map(&[
+            "74.125.205.105".to_string(),
+            "199.189.249.126".to_string(),
+        ]);
+        assert_eq!(map.len(), 2, "{:?}", map);
+        // Оба сервиса отдали первый адрес.
+        assert_eq!(
+            map[0].1,
+            vec!["svc-a".to_string(), "svc-b".to_string()],
+            "{:?}",
+            map
+        );
+        // Второй — только один сервис: в отчёте он попадёт под подозрение «шлюза».
+        assert_eq!(map[1].1, vec!["svc-a".to_string()], "{:?}", map);
+    }
+
+    /// Маркеры регионального ограничения в теле живой 200-страницы.
+    #[test]
+    fn region_restricted_body_markers() {
+        for body in [
+            "The requested URL is not available in your region",
+            "Location is not supported error 409",
+            "сервис недоступен в вашем регионе",
+        ] {
+            assert!(body_looks_region_restricted(&body.to_lowercase()), "{}", body);
+        }
+        for body in ["Welcome to our site!", "Loading…", "error code: 1034"] {
+            assert!(!body_looks_region_restricted(&body.to_lowercase()), "{}", body);
+        }
     }
 }

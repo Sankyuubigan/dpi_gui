@@ -33,6 +33,11 @@ pub enum Verdict {
     /// (часто региональное) — лечится VPN/сменой сети, а не обходом,
     /// исключениями или hosts.
     GeoBlocked,
+    /// Страница отдаётся живым HTTP (200/3xx), но в её теле сам сервис
+    /// сообщает об ограничении доступа (регион источника/доступность).
+    /// Формально сайт «открывается» — фактически сервис режет доступ по
+    /// IP клиента. Лечится VPN/прокси; DNS и hosts не при чём.
+    ServiceRestricted,
     /// Оператор связи подменил ответ редиректом на страницу блокировки (РКН).
     /// Виден только на порту 80: запрос уходит, но ответ приходит не от
     /// сервера, а от провайдера. По HTTPS провайдер рвёт соединение.
@@ -59,6 +64,7 @@ impl Verdict {
             Verdict::DnsBlocked => "DNS-ПОДМЕНА",
             Verdict::BlockPage => "СТРАНИЦА БЛОКИРОВКИ",
             Verdict::GeoBlocked => "РЕГИОНАЛЬНОЕ ОГРАНИЧЕНИЕ (НУЖЕН VPN)",
+            Verdict::ServiceRestricted => "СЕРВИС ОГРАНИЧИВАЕТ (НУЖЕН VPN/ПРОКСИ)",
             Verdict::IspBlockRedirect => "БЛОКИРОВКА ОПЕРАТОРОМ (РКН)",
             Verdict::NoPath => "НЕТ ПУТИ",
             Verdict::Unknown => "ПРИЧИНА НЕ ЯСНА",
@@ -127,15 +133,23 @@ pub fn classify(f: &ProbeFacts) -> Verdict {
     // 3. Системный DNS доказанно подменён. Любой неуспешный ответ получен по
     //    адресу, который сайту не принадлежит, — судить о сайте по нему нельзя,
     //    поэтому BadCert/Rst/Timeout здесь означают лишь одно: этот адрес чужой.
-    //    Первопричина установлена точно, и лечение другое, чем при BadCert.
-    //    Исключение: адреса совпадают — это не подмена, а гео-CDN (см. выше).
+    //    Первопричина установлена точно — вердикт ВСЕГДА DnsBlocked. Отсутствие
+    //    проверенного DoH-адреса меняет ЛЕЧЕНИЕ (текст причины и действий
+    //    различает это по doh_working_ip), но не отменяет диагноз: Unknown тут
+    //    был ложью (кейс turboimagehost — «причина не ясна» при доказанной
+    //    подмене).
     if f.dns_spoofed {
-        return match f.doh_http {
-            // Проверенный адрес открывает сайт: им можно и нужно лечить.
-            Some(HttpResult::Ok(_)) => Verdict::DnsBlocked,
-            // Проверенных адресов нет: подмена доказана, но судить о сайте не о чем.
-            _ => Verdict::Unknown,
-        };
+        return Verdict::DnsBlocked;
+    }
+
+    // 3b. Сайт отдал живой HTTP-ответ (2xx/3xx), но в теле страницы сам сервис
+    //     сообщает об ограничении доступа (регион источника, доступность).
+    //     Сеть в порядке — ограничивает сам сервис по IP клиента; DNS/hosts на
+    //     это не влияют (кейс AI-студий: «HTTP 200» не значит «сервис доступен»).
+    //     Проверяется ПОСЛЕ ветки подмены: при доказанной подмене тело пришло
+    //     с чужого адреса, и верить его маркерам нельзя.
+    if matches!(f.system_http, Some(HttpResult::ServiceRestrict)) {
+        return Verdict::ServiceRestricted;
     }
 
     // 4. DNS не подменялся — дальше вердикт ставится по фактическим ответам.
@@ -219,6 +233,17 @@ pub struct CauseContext<'a> {
     pub same_host_alt_ip_works: bool,
     /// Хост, на который провайдер подменил редирект вместо ответа сервера.
     pub isp_redirect: Option<&'a str>,
+    /// По HTTP-порту 80 у проверенных (DoH) адресов приходил осмысленный
+    /// ответ сайта/CDN: транспорт до настоящего адреса жив, а TLS/SNI рвёт
+    /// цензор. Меняет ТЕКСТ причины (совет включить обход), не вердикт.
+    pub doh_http80_hint: bool,
+    /// Найденные через DoH адреса, HTTPS-пробу по которым приложение
+    /// не сумело подтвердить. Пустой список = кандидатов нет вовсе —
+    /// тогда никакого «hosts-совета» по кандидатам не появляется.
+    pub doh_candidates: Vec<String>,
+    /// Причина, по которой HTTPS-проба по DoH-адресам не открыла сайт
+    /// (текст из классификации ошибок reqwest, без выдумок).
+    pub probe_fail_note: Option<String>,
 }
 
 /// Разбор причины: что, скорее всего, произошло и что с этим делать.
@@ -234,12 +259,16 @@ pub fn http_result_note(r: &HttpResult) -> String {
     match r {
         HttpResult::Ok(code) => format!("HTTP {}", code),
         HttpResult::Tls => "TLS сломан".to_string(),
-        HttpResult::BadCert => "SSL-сертификат невалиден".to_string(),
+        HttpResult::BadCert => "сервер отдал сертификат, не принадлежащий домену сайта".to_string(),
         HttpResult::Rst => "RST".to_string(),
         HttpResult::Timeout => "таймаут".to_string(),
         HttpResult::Dns => "DNS-ошибка".to_string(),
         HttpResult::BlockPage => "страница блокировки".to_string(),
         HttpResult::Forbidden(code) => format!("отказ сервера HTTP {}", code),
+        HttpResult::ServiceRestrict => {
+            "страница отдалась, но сервис сообщает об ограничении доступа (регион источника)"
+                .to_string()
+        }
         HttpResult::Other(m) => m.clone(),
     }
 }
@@ -272,7 +301,11 @@ pub fn explain(verdict: Verdict, ctx: &CauseContext) -> Diagnosis {
 fn probable_cause(verdict: Verdict, ctx: &CauseContext) -> String {
     match verdict {
         Verdict::Open => {
-            "Сайт открывается по тому же адресу, по которому он и должен работать.".to_string()
+            "Сайт открывается по тому же адресу, по которому он и должен работать. Проверено только открытие самой страницы: часть сервисов (AI-платформы, хостинги, соцсети) ограничивает доступ внутри страницы или по региону клиента — одним GET-запросом это не видно.".to_string()
+        }
+
+        Verdict::ServiceRestricted => {
+            "Сайт отвечает живой страницей, но сам сервис сообщает в её тексте об ограничении доступа (регион источника или доступность). Сеть и DNS тут ни при чём: доступ режет сервер по IP клиента.".to_string()
         }
 
         Verdict::WwwOnly => {
@@ -355,9 +388,11 @@ fn probable_cause(verdict: Verdict, ctx: &CauseContext) -> String {
     }
 }
 
-/// Текст первопричины для отравленного DNS. Различает два разных случая, потому
-/// что лечение у них разное: при найденном рабочем адресе лечение — hosts, при
-/// отсутствии — только смена DNS-сервера, и советовать hosts там нельзя.
+/// Текст первопричины для отравленного DNS. Различает три разных случая,
+/// потому что лечение у них разное:
+/// - найти рабочий адрес (лечится hosts);
+/// - не найти адрес, но HTTP:80 подтвердил живой транспорт (лечится обходом);
+/// - не найти адрес вообще (сначала смена DNS, hosts советовать нельзя).
 fn dns_poisoned_cause(ctx: &CauseContext) -> String {
     let apex = ctx.apex_ip.unwrap_or("?");
     match ctx.doh_working_ip {
@@ -365,10 +400,28 @@ fn dns_poisoned_cause(ctx: &CauseContext) -> String {
             "DNS подменён: системный DNS отдал для «{}» адрес {}, но настоящие адреса сайта лежат на другом сервере. Через подменённый адрес сайт не открывается, а через проверенный адрес {} — открывается. Лечение — записать этот адрес в файл hosts.",
             ctx.host, apex, ip
         ),
-        None => format!(
-            "DNS подменён: системный DNS отдал для «{}» адрес {}, который не принадлежит сайту. Настоящие адреса через защищённый канал найти не удалось, поэтому подсказать, что именно писать в hosts, нечем — сначала нужно сменить DNS-сервер на тот, что работает по HTTPS.",
+        None if ctx.doh_http80_hint => format!(
+            "DNS подменён: системный DNS отдал для «{}» адрес {}, который сайту не принадлежит. Настоящий адрес через защищённый канал найден, но TLS до него обрывается (по обычному HTTP:80 сайт отвечает — транспорт до него жив, режется именно TLS/SNI). Такой режим лечится обходом DPI (winws) для этого домена либо записью настоящего адреса в hosts.",
             ctx.host, apex
         ),
+        None => {
+            let note = ctx
+                .probe_fail_note
+                .as_deref()
+                .map(|n| format!(" (причина: {})", n))
+                .unwrap_or_default();
+            if ctx.doh_candidates.is_empty() {
+                format!(
+                    "DNS подменён: системный DNS отдал для «{}» адрес {}, который не принадлежит сайту. Настоящие адреса через защищённый канал найти не удалось, поэтому рабочую hosts-строку подсказать нечем — сначала смените DNS-сервер на тот, что работает по HTTPS.",
+                    ctx.host, apex
+                )
+            } else {
+                format!(
+                    "DNS подменён: системный DNS отдал для «{}» адрес {}, который сайту не принадлежит. Настоящие адреса через защищённый канал найдены, но HTTPS-проба по ним не подтвердила ни один{} — заранее проверенной hosts-строки нет, кандидаты перечислены в блоке «ЧТО СДЕЛАТЬ» (это может быть цензор, а может и погрешность приложения). Сначала смените DNS-сервер на работающий по HTTPS.",
+                    ctx.host, apex, note
+                )
+            }
+        }
     }
 }
 
@@ -422,6 +475,25 @@ fn collect_actions(verdict: Verdict, ctx: &CauseContext, d: &mut Diagnosis) {
             );
             d.wont_help.push(
                 "Ни смена DNS, ни запись в hosts: адрес верный, но сервер отказывает этому региону."
+                    .to_string(),
+            );
+            d.wont_help.push(
+                "Исключения обхода не нужны: ломать тут нечего — обход ни при чём."
+                    .to_string(),
+            );
+        }
+
+        Verdict::ServiceRestricted => {
+            d.do_this.push(
+                "Попробуйте VPN или прокси-шлюз — смените исходный IP клиента: ограничение ставит сам сервис по региону источника."
+                    .to_string(),
+            );
+            d.wont_help.push(
+                "Ни смена DNS, ни запись в hosts: адреса верные, но сервис проверяет регион КЛИЕНТА — целевой IP не влияет."
+                    .to_string(),
+            );
+            d.wont_help.push(
+                "Обход winws не поможет: соединение доходит до сервера, и запрещает сам сервис."
                     .to_string(),
             );
             d.wont_help.push(
@@ -514,15 +586,39 @@ fn dns_poisoned_actions(ctx: &CauseContext, d: &mut Diagnosis) {
             );
         }
         None => {
+            // TLS рвётся цензором, а транспорт жив — обходим через winws.
+            if ctx.doh_http80_hint {
+                d.do_this.insert(
+                    0,
+                    "Включите профиль обхода и откройте сайт снова: TLS до настоящего адреса режется цензором, по обычному HTTP:80 сайт отвечает."
+                        .to_string(),
+                );
+            }
+            // Честность (core §2.2): найденные DoH-адреса нельзя прятать только
+            // потому, что приложение само не сумело их проверить. Показываем
+            // как КАНДИДАТОВ с реальной причиной неудачи.
+            if !ctx.doh_candidates.is_empty() {
+                let reason = ctx
+                    .probe_fail_note
+                    .as_deref()
+                    .map(|n| format!(", причина неудачи пробы: {}", n))
+                    .unwrap_or_else(|| ", HTTP-проба по ним результата не дала".to_string());
+                d.do_this.push(format!(
+                    "Кандидаты из защищённого DNS (приложение их работу не подтвердило{}): {}. Можно попробовать записью в hosts строкой «<адрес> <имя>» — если сайт не откроется, строку удалите.",
+                    reason,
+                    ctx.doh_candidates.join(", ")
+                ));
+            }
             d.do_this.push(
                 "Смените DNS-сервер на работающий по HTTPS (шифрованный): обычный DNS-трафик в вашей сети перехватывается и подменяется."
                     .to_string(),
             );
             d.do_this
                 .push("После смены DNS повторите анализ — адреса станут настоящими.".to_string());
-            // Ключевая честность: без проверенного адреса писать в hosts нечего.
+            // Ключевая честность: без проверенного адреса запись в hosts —
+            // риск вместо решения (точнее кандидатов только выше, с пометкой).
             d.wont_help.push(
-                "Запись в hosts сейчас не поможет: подтверждённо рабочий адрес найти не удалось, а подменённый адрес точно не подходит."
+                "Подтверждённо рабочей строки для hosts нет: приложение не сумело открыть сайт ни по одному найденному адресу, а подменённый адрес точно не подходит."
                     .to_string(),
             );
         }
@@ -546,6 +642,9 @@ mod tests {
             doh_working_ip: None,
             same_host_alt_ip_works: false,
             isp_redirect: None,
+            doh_http80_hint: false,
+            doh_candidates: Vec::new(),
+            probe_fail_note: None,
         }
     }
 
@@ -555,6 +654,54 @@ mod tests {
         f.system_http = Some(HttpResult::Ok(200));
         f.any_tcp_ok = true;
         assert_eq!(classify(&f), Verdict::Open);
+    }
+
+    /// 200-ответ с маркером регионального ограничения в теле — НЕ «открыт»:
+    /// сервис ограничивает сам (кейс AI-студий).
+    #[test]
+    fn region_marker_in_200_body_is_service_restricted() {
+        let mut f = facts();
+        f.system_http = Some(HttpResult::ServiceRestrict);
+        f.any_tcp_ok = true;
+        assert_eq!(classify(&f), Verdict::ServiceRestricted);
+    }
+
+    /// Под доказанной подменой DNS телу маркера верить нельзя — адрес чужой.
+    #[test]
+    fn spoofed_beats_region_marker() {
+        let mut f = facts();
+        f.dns_spoofed = true;
+        f.system_http = Some(HttpResult::ServiceRestrict);
+        f.any_tcp_ok = true;
+        assert_eq!(classify(&f), Verdict::DnsBlocked);
+    }
+
+    /// ServiceRestricted: VPN-советы, явный запрет hosts/обхода.
+    #[test]
+    fn service_restricted_advises_vpn_and_forbids_hosts() {
+        let d = explain(Verdict::ServiceRestricted, &ctx("example.com"));
+        assert!(d.do_this.iter().any(|a| a.contains("VPN")), "{:?}", d.do_this);
+        assert!(
+            d.wont_help.iter().any(|a| a.contains("hosts")),
+            "{:?}",
+            d.wont_help
+        );
+        assert!(
+            d.probable_cause.contains("сам сервис"),
+            "{}",
+            d.probable_cause
+        );
+    }
+
+    /// Оговорка при «Open»: одно открытие страницы не значит «сервис работоспособен».
+    #[test]
+    fn open_cause_has_page_level_caveat() {
+        let d = explain(Verdict::Open, &ctx("example.com"));
+        assert!(
+            d.probable_cause.contains("Проверено только открытие самой страницы"),
+            "{}",
+            d.probable_cause
+        );
     }
 
     /// Главный случай пользователя: подменённый адрес отдаёт чужой
@@ -625,15 +772,27 @@ fn clean_dns_site_opens_via_system_is_open() {
     assert_eq!(classify(&f), Verdict::Open);
 }
 
-    /// Подмена доказана, но проверенных адресов нет: о вердикте «сертификат
-    /// невалиден» говорить нельзя — этот вывод сделан по подозрительному адресу.
+    /// Подмена доказана, DoH ничего не дал: вердикт обязан быть DnsBlocked,
+    /// а не Unknown — первопричина установлена точно даже без рабочего адреса.
+    /// Раньше этот кейс выдавал «причину не ясна» (баг turboimagehost).
     #[test]
-    fn poisoned_dns_without_doh_ips_is_not_bad_cert() {
+    fn spoofed_doh_failed_is_dns_blocked_not_unknown() {
+        let mut f = facts();
+        f.dns_spoofed = true;
+        f.system_http = Some(HttpResult::Rst);
+        f.doh_http = None;
+        assert_eq!(classify(&f), Verdict::DnsBlocked);
+    }
+
+    /// То же для чужого сертификата на подменённом адресе: судить о сайте
+    /// по подозрительному адресу нельзя, вердикт — DnsBlocked.
+    #[test]
+    fn spoofed_badcert_doh_none_is_dns_blocked() {
         let mut f = facts();
         f.dns_spoofed = true;
         f.system_http = Some(HttpResult::BadCert);
         f.doh_http = None;
-        assert_eq!(classify(&f), Verdict::Unknown);
+        assert_eq!(classify(&f), Verdict::DnsBlocked);
     }
 
     /// Без доказанной подмены BadCert остаётся BadCert — прежняя логика сохранена.
@@ -770,6 +929,69 @@ fn clean_dns_site_opens_via_system_is_open() {
         );
     }
 
+    /// HTTP:80 подтвердил живой транспорт: причина говорит об обходе/резке
+    /// TLS, но НЕ декларирует, что сайт мёртв.
+    #[test]
+    fn spoofed_http80_hint_upgrades_tls_note() {
+        let mut c = ctx("example.com");
+        c.dns_spoofed = true;
+        c.apex_ip = Some("188.186.154.88");
+        c.doh_http80_hint = true;
+        let d = explain(Verdict::DnsBlocked, &c);
+        assert!(
+            d.probable_cause.contains("подменён"),
+            "{}",
+            d.probable_cause
+        );
+        assert!(
+            d.probable_cause.contains("TLS"),
+            "{}",
+            d.probable_cause
+        );
+        assert!(
+            !d.probable_cause.contains("сайт мёртв"),
+            "{}",
+            d.probable_cause
+        );
+        assert!(
+            d.do_this.iter().any(|a| a.contains("обхода")),
+            "{:?}",
+            d.do_this
+        );
+    }
+
+    /// Скрыть DoH-адреса-кандидаты нельзя (core §2.2): они попадают в
+    /// «ЧТО СДЕЛАТЬ» с честной пометкой «не подтверждено» и причиной.
+    #[test]
+    fn dns_blocked_candidates_shown_with_fail_note() {
+        let mut c = ctx("example.com");
+        c.dns_spoofed = true;
+        c.doh_candidates = vec!["104.21.20.243".to_string(), "172.67.194.226".to_string()];
+        c.probe_fail_note = Some("сервер отдал сертификат, не принадлежащий домену сайта".to_string());
+        let d = explain(Verdict::DnsBlocked, &c);
+        assert!(
+            d.do_this.iter().any(|a| a.contains("104.21.20.243")),
+            "{:?}",
+            d.do_this
+        );
+        assert!(
+            d.do_this
+                .iter()
+                .any(|a| a.contains("не подтвердило") && a.contains("сертификат")),
+            "{:?}",
+            d.do_this
+        );
+        // Но при пустом списке кандидатов никакой hosts-подсказки не появится.
+        let mut empty = ctx("example.com");
+        empty.dns_spoofed = true;
+        let d = explain(Verdict::DnsBlocked, &empty);
+        assert!(
+            !d.do_this.iter().any(|a| a.contains("hosts")),
+            "{:?}",
+            d.do_this
+        );
+    }
+
     #[test]
     fn bad_cert_tells_hosts_wont_help() {
         let d = explain(Verdict::BadCert, &ctx("example.com"));
@@ -848,14 +1070,15 @@ fn clean_dns_site_opens_via_system_is_open() {
         assert_eq!(classify(&f), Verdict::GeoBlocked);
     }
 
-    /// Подмена DNS важнее голого 403: по чужому адресу о сервере судить нельзя.
+    /// Подмена DNS важнее голого 403: по чужому адресу о сервере судить нельзя,
+    /// но первопричина (подмена) установлена — вердикт DnsBlocked.
     #[test]
-    fn spoofed_forbidden_without_doh_ok_is_unknown() {
+    fn spoofed_forbidden_without_doh_ok_is_dns_blocked() {
         let mut f = facts();
         f.dns_spoofed = true;
         f.system_http = Some(HttpResult::Forbidden(403));
         f.any_tcp_ok = true;
-        assert_eq!(classify(&f), Verdict::Unknown);
+        assert_eq!(classify(&f), Verdict::DnsBlocked);
     }
 
     /// Открытие по DoH при подмене — всё ещё DNS-подмена, не гео-блок.
@@ -898,6 +1121,7 @@ fn clean_dns_site_opens_via_system_is_open() {
             Verdict::DnsBlocked,
             Verdict::BlockPage,
             Verdict::GeoBlocked,
+            Verdict::ServiceRestricted,
             Verdict::IspBlockRedirect,
             Verdict::NoPath,
             Verdict::Unknown,

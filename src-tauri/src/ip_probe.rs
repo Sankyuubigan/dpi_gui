@@ -103,6 +103,9 @@ fn first_line(s: &str) -> String {
 pub fn http_result_to_probe(h: &HttpResult) -> Probe {
     match h {
         HttpResult::Ok(_) | HttpResult::BlockPage | HttpResult::Forbidden(_) => Probe::Ok,
+        // Страница с сообщением об ограничении тоже «живой ответ»: путь цел,
+        // ограничивает сам сервис (как и Forbidden — вопрос сервера).
+        HttpResult::ServiceRestrict => Probe::Ok,
         HttpResult::BadCert => Probe::Ok, // рукопожатие прошло — DPI не рвал канал
         HttpResult::Rst => Probe::Broken("соединение сброшено (RST)".to_string()),
         HttpResult::Tls => Probe::Broken("ошибка TLS-рукопожатия".to_string()),

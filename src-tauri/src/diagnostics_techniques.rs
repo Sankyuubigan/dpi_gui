@@ -96,6 +96,7 @@ pub fn test_technique(app: &AppHandle, spec: &TechniqueSpec, domain: &str, game_
         HttpResult::Ok(s) => format!("OK ({})", s),
         HttpResult::BadCert => "SSL-сертификат невалиден — desync-техника здесь не поможет".to_string(),
         HttpResult::Forbidden(s) => format!("Отказ сервера HTTP {} без признаков подмены (возможно, региональное ограничение — desync тут не поможет)", s),
+        HttpResult::ServiceRestrict => "Сервис отдал страницу с сообщением об ограничении (регион) — desync тут не поможет".to_string(),
         other => format!("{:?}", other),
     };
     (passed, detail)

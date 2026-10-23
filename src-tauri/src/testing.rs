@@ -27,6 +27,7 @@ fn verdict_from_http(r: &diagnostics_probe::HttpResult) -> (bool, String) {
         diagnostics_probe::HttpResult::Ok(s) => (true, format!("УСПЕХ (HTTP {})", s)),
         diagnostics_probe::HttpResult::BlockPage => (false, "Страница блокировки (подставил оператор)".to_string()),
         diagnostics_probe::HttpResult::Forbidden(s) => (false, format!("Отказ сервера HTTP {} (возможно, региональное ограничение — проверьте через VPN)", s)),
+        diagnostics_probe::HttpResult::ServiceRestrict => (false, "Сервис вернул страницу с сообщением об ограничении (регион/доступность) — профиль не при чём, нужен VPN".to_string()),
         diagnostics_probe::HttpResult::Dns => (false, "DNS не резолвится (NXDOMAIN / DNS-цензура)".to_string()),
         diagnostics_probe::HttpResult::Rst => (false, "RST — соединение сброшено (типично для DPI)".to_string()),
         diagnostics_probe::HttpResult::Tls => (false, "TLS-рукопожатие рвётся".to_string()),
