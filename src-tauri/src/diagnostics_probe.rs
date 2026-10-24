@@ -537,6 +537,23 @@ pub struct DohAnswers {
     /// Замечания о конфигурации (мусорные строки файла, отсутствие файла
     /// при использовании встроенного дефолта). Не ошибка прохода.
     pub warnings: Vec<String>,
+    /// Собственные IP-адреса DoH-сервисов (их A-записи). Обходные DoH для
+    /// заблокированных имён отдают адреса СВОИХ SNI-прокси-шлюзов: проба
+    /// через такой адрес даёт HTTP 200, а браузер пользователя по нему сайт
+    /// не открывает. Эти адреса обязаны отличаться от адресов сайта.
+    pub own_ips: Vec<(String, Vec<IpAddr>)>,
+}
+
+impl DohAnswers {
+    /// Какому DoH-сервису принадлежит адрес (его собственная инфраструктура).
+    /// `None` — адрес не совпадает ни с одной A-записью сервисов.
+    pub fn gateway_owner(&self, ip: &IpAddr) -> Option<String> {
+        self.own_ips
+            .iter()
+            .filter(|(_, ips)| ips.contains(ip))
+            .map(|(svc, _)| svc.clone())
+            .next()
+    }
 }
 
 impl DohAnswers {
@@ -666,11 +683,45 @@ pub fn resolve_doh_all(domain: &str) -> DohAnswers {
         })
         .collect();
 
+    // Собственные адреса сервисов резолвим тем же бутстрапом, что и DoH-запрос:
+    // это A-записи имён из списка (xbox-dns.ru и т.п.). С ними отчёт отличает
+    // «адрес сайта» от «адрес прокси-шлюза DoH-сервиса» (кейс openrouter.ai:
+    // 80.74.30.162 — инфраструктура dns.comss.one, а не сайта).
+    let own_ips = doh_own_ips(&services);
+
     DohAnswers {
         answers,
         config_error,
         warnings,
+        own_ips,
     }
+}
+
+/// Собственные IP всех DoH-сервисов (A-записи их имён) — параллельно, с общим
+/// дедлайном. Единственный источник карты «сервис → его инфраструктура»:
+/// её используют и анализ (отличать адрес сайта от SNI-шлюза сервиса),
+/// и проверка hosts-IP перед ручной записью.
+pub fn doh_own_ips(services: &[String]) -> Vec<(String, Vec<IpAddr>)> {
+    let (tx, rx) = mpsc::channel::<(String, Vec<IpAddr>)>();
+    for svc in services {
+        let tx = tx.clone();
+        let svc = svc.clone();
+        thread::spawn(move || {
+            let ips = resolve_system(&svc);
+            let _ = tx.send((svc, ips));
+        });
+    }
+    drop(tx);
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    let mut out = Vec::new();
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(deadline - std::time::Instant::now()) {
+            Ok((svc, ips)) if !ips.is_empty() => out.push((svc, ips)),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    out
 }
 
 /// Есть ли у пользователя рабочий IPv6 до целевого домена (winws только IPv4).
@@ -963,5 +1014,38 @@ mod tests {
         for body in ["Welcome to our site!", "Loading…", "error code: 1034"] {
             assert!(!body_looks_region_restricted(&body.to_lowercase()), "{}", body);
         }
+    }
+
+    /// Адрес собственной инфраструктуры DoH-сервиса опознаётся владельцем:
+    /// кейс openrouter.ai — 80.74.30.162 это шлюз dns.comss.one, а не сайта.
+    #[test]
+    fn gateway_owner_recognizes_own_ips() {
+        let answers = DohAnswers {
+            own_ips: vec![(
+                "dns.comss.one".to_string(),
+                vec![
+                    "80.74.30.162".parse().unwrap(),
+                    "206.223.242.94".parse().unwrap(),
+                ],
+            )],
+            ..Default::default()
+        };
+        assert_eq!(
+            answers.gateway_owner(&"80.74.30.162".parse().unwrap()),
+            Some("dns.comss.one".to_string())
+        );
+        assert_eq!(
+            answers.gateway_owner(&"104.18.2.115".parse().unwrap()),
+            None,
+            "адрес сайта не должен считаться шлюзом"
+        );
+    }
+
+    /// Пустая карта собственных адресов (ни один сервис не зарезолвился)
+    /// не должна паниковать и ни на что не указывает.
+    #[test]
+    fn gateway_owner_empty_map_is_none() {
+        let answers = DohAnswers::default();
+        assert_eq!(answers.gateway_owner(&"1.2.3.4".parse().unwrap()), None);
     }
 }

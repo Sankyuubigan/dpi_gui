@@ -148,3 +148,170 @@ pub fn find_bypass_matches(discovered: &[String], bypass: &BypassMap) -> Vec<(St
     matches.sort_by(|a, b| a.0.cmp(&b.0));
     matches
 }
+
+/// Какой юзерский список правит [`add_domains`]. Дефолтные файлы (defaults/)
+/// здесь не участвуют: они перезаписываются при каждом старте (контракт
+/// владельца), правки туда терялись бы.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetList {
+    /// lists/list-general.txt — домены для обхода.
+    Bypass,
+    /// lists/list-exclude.txt — домены, исключённые из обхода.
+    Exclude,
+}
+
+impl TargetList {
+    fn user_file(&self) -> PathBuf {
+        let lists_dir = config::get_app_dir().join("lists");
+        match self {
+            TargetList::Bypass => lists_dir.join("list-general.txt"),
+            TargetList::Exclude => lists_dir.join("list-exclude.txt"),
+        }
+    }
+
+    /// Что уже есть в списке (lowercase-записи, только юзерский файл).
+    fn existing_entries(&self) -> HashSet<String> {
+        let mut set = HashSet::new();
+        if let Ok(content) = fs::read_to_string(self.user_file()) {
+            for raw in content.lines() {
+                let line = raw.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                set.insert(line.to_lowercase());
+            }
+        }
+        set
+    }
+}
+
+/// Нормализация домена для списка: lowercase, без схемы/пути/порта/
+/// завершающей точки. Пустая строка — домен не распознан.
+fn normalize_for_list(raw: &str) -> Option<String> {
+    let mut d = raw.trim().to_lowercase();
+    for prefix in ["https://", "http://"] {
+        if let Some(rest) = d.strip_prefix(prefix) {
+            d = rest.to_string();
+        }
+    }
+    if let Some(pos) = d.find('/') {
+        d.truncate(pos);
+    }
+    if let Some(pos) = d.find(':') {
+        d.truncate(pos);
+    }
+    let d = d.trim_end_matches('.').to_string();
+    if d.is_empty() || !d.contains('.') {
+        return None;
+    }
+    d.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-').then_some(d)
+}
+
+/// Добавляет домены в юзерский список (обход или исключения). Каждый домен
+/// нормализуется; уже покрытые записи (точное совпадение или субдомен
+/// существующей записи) не дублируются. Возвращает прочитанный отчёт:
+/// что добавлено, что уже было, что отброшено как мусор — без молчаливых
+/// пропусков (core rules §2.2).
+pub fn add_domains(target: TargetList, domains: &[String]) -> Result<String, String> {
+    if domains.is_empty() {
+        return Err("список доменов пуст — добавлять нечего".to_string());
+    }
+    let path = target.user_file();
+    let mut existing = target.existing_entries();
+
+    let mut added: Vec<String> = Vec::new();
+    let mut skipped_present: Vec<String> = Vec::new();
+    let mut skipped_invalid: Vec<String> = Vec::new();
+    for raw in domains {
+        let Some(d) = normalize_for_list(raw) else {
+            skipped_invalid.push(raw.clone());
+            continue;
+        };
+        if is_excluded(&d, &existing).is_some() {
+            skipped_present.push(d);
+            continue;
+        }
+        added.push(d.clone());
+        existing.insert(d);
+    }
+
+    if !added.is_empty() {
+        let mut content = fs::read_to_string(&path).unwrap_or_default();
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        // Пометка-маркер, чтобы юзер видел, что дописано автоматически.
+        content.push_str("# DPI_GUI auto-added\n");
+        for d in &added {
+            content.push_str(d);
+            content.push('\n');
+        }
+        // Атомарная запись: temp + rename, как в hosts.rs.
+        let tmp = path.with_extension("txt.tmp");
+        fs::write(&tmp, content)
+            .map_err(|e| format!("не удалось записать {}: {e}", tmp.display()))?;
+        fs::rename(&tmp, &path)
+            .map_err(|e| format!("не удалось заменить {}: {e}", path.display()))?;
+    }
+
+    let mut report = format!("Добавлено {} домен(ов) в {}", added.len(), list_name(target));
+    if !added.is_empty() {
+        report.push_str(&format!(": {}", added.join(", ")));
+    }
+    if !skipped_present.is_empty() {
+        report.push_str(&format!(
+            "; уже покрыты списком (не дублируются): {}",
+            skipped_present.join(", ")
+        ));
+    }
+    if !skipped_invalid.is_empty() {
+        report.push_str(&format!(
+            "; отброшены как не домены: {}",
+            skipped_invalid.join(", ")
+        ));
+    }
+    Ok(report)
+}
+
+fn list_name(t: TargetList) -> &'static str {
+    match t {
+        TargetList::Bypass => "список обхода (list-general.txt)",
+        TargetList::Exclude => "список исключений (list-exclude.txt)",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(v: &[&str]) -> HashSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Тонкая обёртка над is_excluded для читаемости тестов.
+    fn is_excluded_by_entries(host: &str, entries: &HashSet<String>) -> bool {
+        is_excluded(host, entries).is_some()
+    }
+
+    /// Нормализация: схема, путь, порт, точка в конце, регистр.
+    #[test]
+    fn normalize_for_list_strips_noise() {
+        assert_eq!(
+            normalize_for_list("HTTPS://Sub.Example.COM/path?q=1:80"),
+            Some("sub.example.com".to_string())
+        );
+        assert_eq!(normalize_for_list("Example.RU."), Some("example.ru".to_string()));
+        assert_eq!(normalize_for_list("  дуршлаг  "), None);
+        assert_eq!(normalize_for_list("localhost"), None, "без точки — не домен списка");
+        assert_eq!(normalize_for_list(""), None);
+    }
+
+    /// Субдомен уже покрытой записи не дублируется.
+    #[test]
+    fn is_excluded_by_entries_matches_suffix() {
+        let entries = set(&["example.com"]);
+        assert!(is_excluded_by_entries("example.com", &entries));
+        assert!(is_excluded_by_entries("sub.example.com", &entries));
+        assert!(!is_excluded_by_entries("notexample.com", &entries));
+    }
+}

@@ -26,6 +26,20 @@ export interface Suspicion {
   count: number; // сколько событий по этому домену было (дедуп по домену)
 }
 
+/// Найденное решение анализа (кнопка «Починить сайт»). Контракт serde —
+/// в src-tauri/src/site_solution.rs (SSOT), поля в camelCase.
+export type SolutionAction =
+  | { type: "addToBypassList"; domains: string[] }
+  | { type: "addToExcludeList"; domains: string[] }
+  | { type: "writeHosts"; ip: string; domain: string };
+
+export interface SiteSolution {
+  found: boolean;
+  actions: SolutionAction[];
+  summary: string;
+  noneReason: string | null;
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState("control");
   const [isRunning, setIsRunning] = useState(false);
@@ -34,6 +48,9 @@ export default function App() {
   const [testingLog, setTestingLog] = useState<LogEntry[]>([]);
   const [testingUrl, setTestingUrl] = useState("youtube.com");
   const [testingIsTesting, setTestingIsTesting] = useState(false);
+  // Решение последнего анализа (кнопка «Починить сайт»). null = анализа ещё
+  // не было / решение неприменимо. Живёт здесь же, чтобы переживать смену вкладки.
+  const [siteSolution, setSiteSolution] = useState<SiteSolution | null>(null);
 
   // Лог и список подозрений живут ЗДЕСЬ, в App, а НЕ в ControlTab:
   // App никогда не размонтируется при смене вкладок, поэтому лог сохраняется
@@ -197,6 +214,8 @@ export default function App() {
             setUrl={setTestingUrl}
             isTesting={testingIsTesting}
             setIsTesting={setTestingIsTesting}
+            solution={siteSolution}
+            setSolution={setSiteSolution}
           />
         )}
       </div>

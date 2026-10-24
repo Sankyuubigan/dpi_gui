@@ -1,19 +1,23 @@
 import { useState, type Dispatch, type SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Search, Globe, ShieldQuestion, FileEdit, Trash2 } from "lucide-react";
+import { Search, Globe, ShieldQuestion, FileEdit, Trash2, Wrench } from "lucide-react";
 import TestingLogPanel, { type LogEntry } from "./TestingLogPanel";
 import { useTestingLog } from "./useTestingLog";
+import type { SiteSolution } from "../App";
 
 /// Вкладка «Починка сайтов»: анализ одного домена, тест подмены DNS по
 /// всему списку DoH и точечная правка hosts. Тесты профилей и диагностика
 /// живут на отдельной вкладке «Профили обхода».
-export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsTesting }: {
+export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsTesting, solution, setSolution }: {
   log: LogEntry[];
   setLog: Dispatch<SetStateAction<LogEntry[]>>;
   url: string;
   setUrl: Dispatch<SetStateAction<string>>;
   isTesting: boolean;
   setIsTesting: Dispatch<SetStateAction<boolean>>;
+  /// Решение последнего анализа (null — анализ ещё не запускался).
+  solution: SiteSolution | null;
+  setSolution: Dispatch<SetStateAction<SiteSolution | null>>;
 }) {
   const [hostsIp, setHostsIp] = useState("");
   const { appendEntry, appendLog } = useTestingLog(setLog);
@@ -21,16 +25,39 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
   const runDeepAnalysis = async () => {
     if (!url) return;
     setIsTesting(true);
+    setSolution(null); // старое решение к новому анализу неприменимо
     setLog([
       { text: `[Анализ] Запуск анализа для: ${url}...`, kind: "info" },
       { text: "Идёт анализ: пробы соединения (с обходом/без), поиск кандидатов в списках (до ~30 сек)...", kind: "info" }
     ]);
 
     try {
-      const result: string = await invoke("run_domain_analysis", { url });
-      appendLog(result);
+      // Бэкенд возвращает { report, solution }: текст отчёта уже содержит
+      // блок «ИТОГ АНАЛИЗА» (те же данные, что в solution).
+      const outcome: { report: string; solution: SiteSolution } = await invoke("run_domain_analysis", { url });
+      appendLog(outcome.report);
+      setSolution(outcome.solution ?? null);
     } catch (e: any) {
       appendLog(`[Ошибка анализа]: ${e}`);
+    } finally {
+      setIsTesting(false);
+    }
+  };
+
+  // «Починить сайт»: применяет найденное решение (списки обхода/исключений,
+  // hosts). Активна только когда анализ реально нашёл решение.
+  const applySolution = async () => {
+    if (!solution?.found) return;
+    setIsTesting(true);
+    appendEntry(`[Починка] Применяю найденное решение: ${solution.summary}...`, "info");
+    try {
+      const result: string = await invoke("apply_solution", { solution });
+      for (const line of result.split("\n")) {
+        const kind = line.startsWith("⚠️") ? "fail" : line.startsWith("♻️") || line.startsWith("🛡️") || line.startsWith("⛔") || line.startsWith("📄") ? "ok" : "info";
+        appendEntry(line, kind);
+      }
+    } catch (e: any) {
+      appendEntry(`[Починка] Ошибка применения решения: ${e}`, "fail");
     } finally {
       setIsTesting(false);
     }
@@ -180,6 +207,33 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
               <Search size={18} /> Анализ сайта / IP
             </button>
           </div>
+
+          {/* Кнопка «Починить сайт»: активна ТОЛЬКО когда анализ нашёл решение.
+              Текст-подсказка объясняет, почему кнопка неактивна. */}
+          <div className="flex gap-3">
+            <button
+              onClick={applySolution}
+              disabled={isTesting || !solution?.found}
+              className="flex-1 flex items-center justify-center gap-2 bg-orange-600 hover:bg-orange-700 disabled:bg-gray-200 disabled:text-gray-400 text-white py-2 rounded-lg font-bold transition"
+              title={
+                solution?.found
+                  ? `Применить решение: ${solution.summary}`
+                  : "Сначала запустите «Анализ сайта / IP» — кнопка активируется, если для сайта найдено решение"
+              }
+            >
+              <Wrench size={18} /> Починить сайт
+            </button>
+          </div>
+          {solution && !solution.found && solution.noneReason && (
+            <p className="text-xs text-gray-500 -mt-1 px-1">
+              Решение не найдено: {solution.noneReason}
+            </p>
+          )}
+          {solution?.found && (
+            <p className="text-xs text-green-700 -mt-1 px-1">
+              Будет применено: {solution.summary}
+            </p>
+          )}
 
           <div className="flex gap-3 mt-2 border-t border-gray-100 pt-4">
             <button

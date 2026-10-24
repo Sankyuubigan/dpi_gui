@@ -26,7 +26,7 @@ pub struct ReportMeta {
     /// Разбор первопричины недоступности главного домена: разновидность 403,
     /// транспорт-блок цензором + скан CIDR Cloudflare (Заполнен, когда сайт
     /// не открывается: см. `ip_range_scan::block_diagnose`).
-    pub block_scan: Option<(String, crate::ip_range_scan::BlockScanReport)>,
+    pub block_scan: Option<crate::ip_range_scan::BlockScanReport>,
 }
 
 /// Путь к пользовательскому general-листу (для подсказок «добавьте в обход»).
@@ -44,13 +44,23 @@ fn is_builtin(p: &PathBuf) -> bool {
     p.to_string_lossy().replace("\\", "/").contains("defaults/")
 }
 
+/// Имя главного домена из пробы (для заголовков секций).
+impl ReportMeta {
+    pub fn main_host_name(&self) -> String {
+        self.main_probe
+            .as_ref()
+            .map(|p| p.host.clone())
+            .unwrap_or_default()
+    }
+}
+
 pub fn build_report(meta: &ReportMeta, c: &Classification) -> String {
     let mut log = String::new();
     log.push_str(&format!("=== АНАЛИЗ ДОМЕНОВ: {} ===\n\n", meta.target_url));
 
     // Диагноз идёт ПЕРВЫМ: пользователь должен сразу понять причину, а не
     // продираться через детали, чтобы её найти.
-    write_diagnosis(&mut log, meta);
+    write_diagnosis(&mut log, meta, c);
 
     // Факты по главному домену (DNS, IP, матрица проб).
     write_main_domain(&mut log, meta);
@@ -139,11 +149,37 @@ pub fn build_report(meta: &ReportMeta, c: &Classification) -> String {
     log
 }
 
-fn write_diagnosis(log: &mut String, meta: &ReportMeta) {
+fn write_diagnosis(log: &mut String, meta: &ReportMeta, c: &Classification) {
     let probe = match &meta.main_probe {
         Some(p) => p,
         None => return,
     };
+
+    // АРБИТРАЖ (кейс sostav.ru): классификация доказала «сайт работает без
+    // обхода, с обходом обрывается». Это первопричина для пользователя — его
+    // браузер ходит С обходом. Фактовая диагностика (probe_domain), собранная
+    // в чистом окне, при этом честно видит «ДОСТУПЕН» — но печатать её
+    // верхней строкой значило бы сказать пользователю с включённым профилем
+    // «сайт работает», что для него ложь.
+    let main_broken_by_bypass = meta.bypass_on
+        && c.bypass_breaks.iter().any(|(h, _)| h == &probe.host);
+    if main_broken_by_bypass {
+        let broken = &probe.host;
+        log.push_str(&format!(
+            "🚫 ВЕРОЯТНАЯ ПРИЧИНА (САЙТ ЛОМАЕТ ВКЛЮЧЁННЫЙ ОБХОД):\n"
+        ));
+        log.push_str(&format!(
+            "  Домен «{broken}» открывается БЕЗ обхода, но с включённым профилем winws соединение обрывается.\n"
+        ));
+        log.push_str(
+            "  DNS и сервер здесь ни при чём — текущий профиль обхода ломает этот сайт.\n",
+        );
+        log.push_str("\n  ✅ ЧТО СДЕЛАТЬ:\n");
+        log.push_str("     • Добавьте домен в список исключений (list-exclude.txt) — кнопка «Починить сайт» ниже сделает это автоматически.\n");
+        log.push_str("\n  ❌ ЧТО НЕ ПОМОЖЕТ:\n");
+        log.push_str("     • Ни hosts, ни смена DNS, ни подбор IP: без обхода сайт и так открывается.\n\n");
+        return;
+    }
 
     // Если сайт открыт — короткий подтверждающий блок. Но ЧЕСТНЫЙ:
     // «доступен» означает «страница отдалась», а не «сервис работоспособен»,
@@ -408,6 +444,21 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
             .join("; ");
         log.push_str(&format!("  IP через DoH (проверенные): {}\n", labeled));
     }
+    // Собственные адреса DoH-сервисов (прокси-шлюзы). Скрывать их нельзя
+    // (core §2.2), но называть адресами сайта — тоже: они не открывают сайт
+    // в браузере, их запись в hosts была ложным решением (кейс openrouter.ai).
+    if !probe.doh_gateway_ips.is_empty() {
+        let gateways = probe
+            .doh_gateway_ips
+            .iter()
+            .map(|(ip, owner)| format!("{} ← собственный адрес «{}»", ip, owner))
+            .collect::<Vec<_>>()
+            .join("; ");
+        log.push_str(&format!(
+            "  ⚠️ Адреса-шлюзы DoH-сервисов (это НЕ адреса сайта, в hosts не писать): {}\n",
+            gateways
+        ));
+    }
     if let Some(wh) = &probe.www_host {
         let www = if probe.www_ips.is_empty() {
             "(не резолвится)".to_string()
@@ -528,11 +579,11 @@ fn dns_label(ips: &[std::net::IpAddr], state: DnsState) -> String {
 /// ЕДИНОГО места — `ip_range_scan::build_report_lines` (как и hosts-строки
 /// выше берутся из `site_probe::hosts_entries`).
 fn write_block_scan(log: &mut String, meta: &ReportMeta) {
-    let Some((host, report)) = &meta.block_scan else {
+    let Some(report) = &meta.block_scan else {
         return;
     };
     log.push('\n');
-    for line in crate::ip_range_scan::build_report_lines(host, report) {
+    for line in crate::ip_range_scan::build_report_lines(&meta.main_host_name(), report) {
         log.push_str(&line);
         log.push('\n');
     }
@@ -599,7 +650,8 @@ fn write_dns_substitution(log: &mut String, meta: &ReportMeta) {
 
 /// Фоновый домен (трекер/телеметрия/аналитика): на доступность сайта не
 /// влияет, советовать его в обход — ложь (кейс cloudflareinsights).
-fn is_background_host(h: &str) -> bool {
+/// Публично: единый источник признака и для механики «найденное решение».
+pub fn is_background_host(h: &str) -> bool {
     let low = h.to_ascii_lowercase();
     [
         "cloudflareinsights",
@@ -880,6 +932,7 @@ mod tests {
             dns,
             primary_ips: vec!["216.150.1.1".to_string()],
             doh_ips: vec![],
+            doh_gateway_ips: vec![],
             doh_ip_services: vec![],
             working_ip: None,
             working_ip_source: None,
@@ -1194,6 +1247,7 @@ let log = build_report(&meta_with(p), &empty_classification());
             dns,
             primary_ips: vec!["188.186.146.207".to_string()],
             doh_ips: vec!["104.21.95.93".to_string()],
+            doh_gateway_ips: Vec::new(),
             doh_ip_services: Vec::new(),
             working_ip: Some("104.21.95.93".to_string()),
             working_ip_source: Some(IpSource::Doh),
@@ -1250,6 +1304,7 @@ let log = build_report(&meta_with(p), &empty_classification());
             dns,
             primary_ips: vec!["188.186.146.207".to_string()],
             doh_ips: vec![],
+            doh_gateway_ips: Vec::new(),
             doh_ip_services: Vec::new(),
             working_ip: None,
             working_ip_source: None,
@@ -1350,6 +1405,7 @@ let log = build_report(&meta_with(p), &empty_classification());
             dns,
             primary_ips: vec!["64.29.17.131".to_string()],
             doh_ips: vec!["216.198.79.195".to_string()],
+            doh_gateway_ips: Vec::new(),
             doh_ip_services: Vec::new(),
             working_ip: Some("216.198.79.195".to_string()),
             working_ip_source: Some(IpSource::Doh),
@@ -1453,6 +1509,7 @@ let log = build_report(&meta_with(p), &empty_classification());
             dns,
             primary_ips: vec!["34.96.76.122".to_string()],
             doh_ips: vec![],
+            doh_gateway_ips: Vec::new(),
             doh_ip_services: Vec::new(),
             working_ip: Some("34.96.76.122".to_string()),
             working_ip_source: Some(IpSource::SystemDns),

@@ -13,6 +13,7 @@ mod ip_candidates;
  mod ip_range_scan;
 mod ip_target;
 mod site_probe;
+mod site_solution;
 mod site_verdict;
 mod testing;
 mod bypass_lists;
@@ -86,9 +87,59 @@ fn check_status() -> bool {
 
 // Оборачиваем долгие команды в асинхронные таски, чтобы не вешать UI-поток
 #[tauri::command]
-async fn run_domain_analysis(app: AppHandle, url: String) -> Result<String, String> {
+async fn run_domain_analysis(app: AppHandle, url: String) -> Result<analyzer::DomainAnalysisOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
         analyzer::analyze_url(&app, &url)
+    }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
+}
+
+/// Применяет найденное решение (кнопка «Починить сайт»): правит списки
+/// обхода/исключений и/или hosts. При работающем обходе правка списков
+/// требует перезапуска winws — списки читаются процессом только на старте.
+#[tauri::command]
+async fn apply_solution(app: AppHandle, solution: site_solution::SiteSolution) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut report_lines: Vec<String> = Vec::new();
+        let mut lists_changed: bool = false;
+
+        for action in &solution.actions {
+            match action {
+                site_solution::SolutionAction::AddToBypassList { domains } => {
+                    let r = bypass_lists::add_domains(bypass_lists::TargetList::Bypass, domains)?;
+                    report_lines.push(format!("🛡️ {}", r));
+                    lists_changed = true;
+                }
+                site_solution::SolutionAction::AddToExcludeList { domains } => {
+                    let r = bypass_lists::add_domains(bypass_lists::TargetList::Exclude, domains)?;
+                    report_lines.push(format!("⛔ {}", r));
+                    lists_changed = true;
+                }
+                site_solution::SolutionAction::WriteHosts { ip, domain } => {
+                    let r = hosts::apply_hosts_entry(ip, domain)?;
+                    report_lines.push(format!("📄 {}", r));
+                }
+            }
+        }
+
+        if lists_changed {
+            // winws читает hostlist-файлы только при старте: чтобы решение
+            // заработало сразу, перезапускаем обход тем же профилем
+            // (логика SSOT — bypass_toggle, как в анализе).
+            if process::is_winws_running() {
+                let saved = bypass_toggle::capture_active();
+                bypass_toggle::stop_bypass();
+                let note = bypass_toggle::restore_bypass(&app, &saved)
+                    .unwrap_or_else(|| "Обход не перезапускался: профиль не был активен.".to_string());
+                report_lines.push(format!("♻️ Правки списков применены; {}", note));
+            } else {
+                report_lines.push("ℹ️ Обход сейчас выключен: правки вступят в силу при следующем старте профиля.".to_string());
+            }
+        }
+
+        if report_lines.is_empty() {
+            return Err("в решении нет ни одного действия — применять нечего".to_string());
+        }
+        Ok(report_lines.join("\n"))
     }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
 }
 
@@ -123,6 +174,16 @@ fn remove_hosts_entry(domain: String) -> Result<String, String> {
     hosts::remove_hosts_entry(&domain)
 }
 
+/// Чей это собственный IP-шлюз среди DoH-сервисов (для предупреждения перед
+/// записью в hosts). `None` — адрес не принадлежит инфраструктуре сервисов.
+fn doh_gateway_owner_of(ip: &std::net::IpAddr) -> Option<String> {
+    let (services, _, _) = diagnostics_probe::load_doh_resolvers();
+    diagnostics_probe::doh_own_ips(&services)
+        .into_iter()
+        .find(|(_, ips)| ips.contains(ip))
+        .map(|(svc, _)| svc)
+}
+
 /// Авто-проверка после записи в hosts: реально ли сайт открывается через этот IP.
 #[tauri::command]
 fn verify_site_via_ip(host: String, ip: String) -> Result<String, String> {
@@ -131,37 +192,52 @@ fn verify_site_via_ip(host: String, ip: String) -> Result<String, String> {
     let ip = IpAddr::from_str(ip.trim())
         .map_err(|_| format!("«{}» — не похоже на IP-адрес", ip))?;
     let host = hosts::normalize_domain_public(&host)?;
-    match site_probe::probe_https_by_ip(&host, ip) {
+    // Честность (core §2.2): проба через SNI-прокси DoH-сервиса реально даёт
+    // HTTP 200, а сайт в браузере по такому адресу не открывается (кейс
+    // openrouter.ai). Молча проверять шлюз — значит выдать ложный «успех».
+    let gateway_note = match doh_gateway_owner_of(&ip) {
+        Some(svc) => format!(
+            "⚠️ ВНИМАНИЕ: {} — собственный IP DoH-сервиса «{}» (прокси-шлюз), а не адрес сайта. Проба через него может пройти, но браузер по нему сайт НЕ откроет.\n",
+            ip, svc
+        ),
+        None => String::new(),
+    };
+    let text = match site_probe::probe_https_by_ip(&host, ip) {
         crate::diagnostics_probe::HttpResult::Ok(code) => {
-            Ok(format!("✅ Сайт {} открывается через {} (HTTP {})", host, ip, code))
+            format!("✅ Сайт {} открывается через {} (HTTP {})", host, ip, code)
         }
         crate::diagnostics_probe::HttpResult::BlockPage => {
-            Ok(format!("⚠️ {} через {} — страница блокировки (подставил оператор)", ip, host))
+            format!("⚠️ {} через {} — страница блокировки (подставил оператор)", ip, host)
         }
         crate::diagnostics_probe::HttpResult::Forbidden(code) => {
-            Ok(format!("🌍 {} через {} — отказ сервера HTTP {} без признаков подмены (возможно, региональное ограничение — проверьте через VPN)", ip, host, code))
+            format!("🌍 {} через {} — отказ сервера HTTP {} без признаков подмены (возможно, региональное ограничение — проверьте через VPN)", ip, host, code)
         }
         crate::diagnostics_probe::HttpResult::ServiceRestrict => {
-            Ok(format!("⚠️ {} через {} — сайт отдался, но сервис сам сообщает об ограничении (регион источника): сеть здесь не при чём, нужен VPN", ip, host))
+            format!("⚠️ {} через {} — сайт отдался, но сервис сам сообщает об ограничении (регион источника): сеть здесь не при чём, нужен VPN", ip, host)
         }
         crate::diagnostics_probe::HttpResult::Rst => {
-            Ok(format!("🚫 {} — HTTPS сброшен (RST). Блок по SNI/IP: подмена в hosts не поможет, нужен обход (winws).", ip))
+            format!("🚫 {} — HTTPS сброшен (RST). Блок по SNI/IP: подмена в hosts не поможет, нужен обход (winws).", ip)
         }
         crate::diagnostics_probe::HttpResult::Tls => {
-            Ok(format!("🔐 {} — TLS-рукопожатие сломалось", ip))
+            format!("🔐 {} — TLS-рукопожатие сломалось", ip)
         }
         crate::diagnostics_probe::HttpResult::BadCert => {
-            Ok(format!("⚠️ {} — сертификат невалиден для {}", ip, host))
+            format!("⚠️ {} — сертификат невалиден для {}", ip, host)
         }
         crate::diagnostics_probe::HttpResult::Timeout => {
-            Ok(format!("⏳ {} — таймаут соединения", ip))
+            format!("⏳ {} — таймаут соединения", ip)
         }
         crate::diagnostics_probe::HttpResult::Dns => {
-            Ok(format!("ℹ️ {} — DNS-ошибка", ip))
+            format!("ℹ️ {} — DNS-ошибка", ip)
         }
         crate::diagnostics_probe::HttpResult::Other(m) => {
-            Ok(format!("ℹ️ {} — {}", ip, m))
+            format!("ℹ️ {} — {}", ip, m)
         }
+    };
+    if gateway_note.is_empty() {
+        Ok(text)
+    } else {
+        Ok(format!("{}{}", gateway_note, text))
     }
 }
 
@@ -182,6 +258,7 @@ fn main() {
             stop_bypass,
             check_status,
             run_domain_analysis,
+            apply_solution,
             test_profile,
             test_dns,
             run_diagnostics,

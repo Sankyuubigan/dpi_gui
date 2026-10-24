@@ -83,6 +83,10 @@ pub enum BlockScanReport {
     ServerFault { status: u16 },
     /// Транспорт к родным IP не работал — выполнен скан CIDR-диапазонов.
     RangesScanned(RangeScanOutcome),
+    /// Родные IP сайта вне диапазонов Cloudflare: скан CF-пула неприменим
+    /// (кейс sostav.ru — скан чужого диапазона давал ложную картину
+    /// «цензор закрывает весь пул»).
+    NotCloudflare { native_ips: Vec<String> },
     /// Разбор не состоялся (нет адресов/не классифицировался ответ).
     NoPath { why: String },
 }
@@ -156,6 +160,21 @@ fn parse_cidr(s: &str) -> Result<Cidr, String> {
         base: u32::from(base),
         bits,
     })
+}
+
+/// Входит ли IPv4-адрес хотя бы в один из диапазонов. Чистая функция.
+fn ip_in_cidrs(ip: &IpAddr, cidrs: &[Cidr]) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let num = u32::from(*v4);
+            cidrs.iter().any(|c| {
+                let host_bits = 32 - c.bits;
+                num >> host_bits == c.base >> host_bits
+            })
+        }
+        // Скан CF-пула только по IPv4.
+        IpAddr::V6(_) => false,
+    }
 }
 
 fn now_seed() -> u64 {
@@ -492,10 +511,10 @@ pub fn block_diagnose(app: &AppHandle, host: &str) -> BlockScanReport {
         app_log(
             app,
             format!(
-                "[IPSCAN] родные IP не отвечают ({last_err}) — запускаю скан CIDR-диапазонов"
+                "[IPSCAN] родные IP не отвечают ({last_err}) — проверяю принадлежность Cloudflare"
             ),
         );
-        return BlockScanReport::RangesScanned(scan_ranges(app, host));
+        return decide_range_scan(app, host, &native_ips);
     }
 
     let mut working: Option<u16> = None;
@@ -564,31 +583,37 @@ pub fn block_diagnose(app: &AppHandle, host: &str) -> BlockScanReport {
         if any_http {
             app_log(
                 app,
-                "[IPSCAN] родные IP отдали только «чужой VIP» 403 — уточняю сканом CIDR",
+                "[IPSCAN] родные IP отдали только «чужой VIP» 403 — уточняю сканом CF-пула",
             );
         } else {
             app_log(
                 app,
                 format!(
-                    "[IPSCAN] родные IP не классифицированы ({}) — уточняю сканом CIDR",
+                    "[IPSCAN] родные IP не классифицированы ({}) — уточняю сканом CF-пула",
                     native_notes.join("; ")
                 ),
             );
         }
-        return BlockScanReport::RangesScanned(scan_ranges(app, host));
+        return decide_range_scan(app, host, &native_ips);
     }
     BlockScanReport::NoPath { why: "не удалось классифицировать ответ родных IP".to_string() }
 }
 
 // --- Скан CIDR-диапазонов --------------------------------------------------
 
-fn scan_ranges(app: &AppHandle, host: &str) -> RangeScanOutcome {
-    let t0 = Instant::now();
+/// Решает, применим ли скан CF-диапазонов, и выполняет его.
+///
+/// Скан чужого пула — ложь в отчёте: для сайта не на Cloudflare вывод
+/// «цензор закрывает весь проанализированный пул» не основан ни на чём
+/// (кейс sostav.ru — сайт на 185.71.x.x, а сканировались адреса CF).
+/// Чистая граница: сначала принадлежность родных IP диапазонам CF,
+/// и только для CF-сайтов — сам скан.
+fn decide_range_scan(app: &AppHandle, host: &str, native_ips: &[IpAddr]) -> BlockScanReport {
     let (cidr_text, source) = match fetch_cidrs() {
         Ok(v) => v,
         Err(e) => {
             app_log(app, format!("[IPSCAN] список CIDR не получен: {e}"));
-            return RangeScanOutcome {
+            return BlockScanReport::RangesScanned(RangeScanOutcome {
                 ranges_source: Err(e),
                 pool_size: 0,
                 probed: 0,
@@ -597,11 +622,9 @@ fn scan_ranges(app: &AppHandle, host: &str) -> RangeScanOutcome {
                 waf_refusal_count: 0,
                 other_status_count: 0,
                 working: Vec::new(),
-            };
+            });
         }
     };
-    app_log(app, format!("[IPSCAN] CIDR: {} шт с {}", cidr_text.len(), source));
-
     let mut parsed = Vec::new();
     for c in &cidr_text {
         match parse_cidr(c) {
@@ -609,15 +632,38 @@ fn scan_ranges(app: &AppHandle, host: &str) -> RangeScanOutcome {
             Err(e) => app_log(app, format!("[IPSCAN] CIDR пропущен ({e}): {c}")),
         }
     }
+
+    if !native_ips.iter().any(|ip| ip_in_cidrs(ip, &parsed)) {
+        app_log(
+            app,
+            "[IPSCAN] родные IP вне диапазонов Cloudflare — скан CF-пула неприменим",
+        );
+        return BlockScanReport::NotCloudflare {
+            native_ips: native_ips
+                .iter()
+                .take(NATIVE_PROBE_LIMIT)
+                .map(|i| i.to_string())
+                .collect(),
+        };
+    }
+
+    app_log(app, format!("[IPSCAN] сайт на Cloudflare ({source}) — скан диапазонов"));
+    BlockScanReport::RangesScanned(scan_ranges(app, host, &parsed, cidr_text.len()))
+}
+
+fn scan_ranges(app: &AppHandle, host: &str, parsed: &[Cidr], ranges_count: usize) -> RangeScanOutcome {
+    let t0 = Instant::now();
+    app_log(app, format!("[IPSCAN] CIDR: {} шт", ranges_count));
+
     let mut seed = now_seed();
-    let pool = sample_pool(&parsed, &mut seed);
+    let pool = sample_pool(parsed, &mut seed);
     app_log(
         app,
         format!("[IPSCAN] пул: {} IP (по {PER_CIDR} из каждого), бюджет {} сек", pool.len(), SCAN_BUDGET.as_secs()),
     );
 
     let mut res = RangeScanOutcome {
-        ranges_source: Ok(cidr_text.len()),
+        ranges_source: Ok(ranges_count),
         pool_size: pool.len(),
         probed: 0,
         alive_count: 0,
@@ -811,6 +857,22 @@ pub fn build_report_lines(host: &str, r: &BlockScanReport) -> Vec<String> {
                 }
             }
         }
+        BlockScanReport::NotCloudflare { native_ips } => {
+            lines.push(format!(
+                "ℹ️ Сайт НЕ на Cloudflare (родные IP: {}), поэтому скан CF-диапазонов к нему неприменим.",
+                if native_ips.is_empty() {
+                    "нет данных".to_string()
+                } else {
+                    native_ips.join(", ")
+                }
+            ));
+            lines.push(
+                "    Поиск «соседнего рабочего IP» возможен только внутри CDN сайта;".to_string(),
+            );
+            lines.push(
+                "    для обычного хостинга причина недоступности — в блоках выше.".to_string(),
+            );
+        }
         BlockScanReport::NoPath { why } => {
             lines.push(format!("⚠️ Разбор блока не состоялся: {why}"));
         }
@@ -832,6 +894,26 @@ mod tests {
         assert!(parse_cidr("104.16.0.0/40").is_err());
         assert!(parse_cidr("172.64.0.0").is_err());
         assert!(parse_cidr("1.2.3.p/24").is_err());
+    }
+
+    /// Кейс sostav.ru: сайт 185.71.67.130 не на Cloudflare — скан CF-пула
+    /// к нему неприменим (раньше давал ложь «цензор закрывает весь пул»).
+    #[test]
+    fn cf_membership_check() {
+        let cf = ["104.16.0.0/12", "172.64.0.0/16"]
+            .iter()
+            .map(|s| parse_cidr(s).unwrap())
+            .collect::<Vec<_>>();
+        // Границы диапазона 104.16/12: 104.16.0.0 — 104.31.255.255.
+        assert!(ip_in_cidrs(&"104.18.2.115".parse().unwrap(), &cf));
+        assert!(ip_in_cidrs(&"104.16.0.1".parse().unwrap(), &cf));
+        assert!(ip_in_cidrs(&"104.31.255.254".parse().unwrap(), &cf));
+        assert!(!ip_in_cidrs(&"104.32.0.1".parse().unwrap(), &cf));
+        // Кейс sostav.ru.
+        assert!(!ip_in_cidrs(&"185.71.67.130".parse().unwrap(), &cf));
+        assert!(!ip_in_cidrs(&"8.8.8.8".parse().unwrap(), &cf));
+        // IPv6 в IPv4-скан не входит.
+        assert!(!ip_in_cidrs(&"2606:4700::1111".parse().unwrap(), &cf));
     }
 
     #[test]

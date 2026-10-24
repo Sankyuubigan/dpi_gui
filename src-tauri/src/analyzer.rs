@@ -17,6 +17,7 @@ use crate::ip_probe;
 use crate::analyzer_ip_report;
 use crate::ip_target;
 use crate::site_probe;
+use crate::site_solution;
 
 // Скрывает КОНСОЛЬНЫЕ окна, которые порождает headless Chrome на Windows.
 // headless_chrome ставит CREATE_NO_WINDOW главному процессу, но Chrome сам внутри
@@ -121,24 +122,47 @@ fn extract_value(s: &str, key: &str) -> Option<String> {
     None
 }
 
-pub fn analyze_url(app: &AppHandle, url: &str) -> Result<String, String> {
+/// Итог анализа: текстовый отчёт + структурированное решение
+/// (для кнопки «Починить сайт» на фронтенде).
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DomainAnalysisOutcome {
+    pub report: String,
+    /// Готовое решение: что применит кнопка «Починить сайт» (или честная
+    /// причина, почему решения нет). Данные и текст блока «ИТОГ АНАЛИЗА» —
+    /// один источник (site_solution).
+    pub solution: site_solution::SiteSolution,
+}
+
+pub fn analyze_url(app: &AppHandle, url: &str) -> Result<DomainAnalysisOutcome, String> {
     // Единая точка распознавания цели (SSOT в ip_target).
     // IP/IP:port уходит в собственный IP-режим: браузер и сбор доменов
     // для IP-цели бессмысленны (сайту к IP нечего открывать).
     match ip_target::parse_target(url) {
         ip_target::AnalysisTarget::Ip { ip, port } => {
             let facts = ip_probe::analyze_ip(app, ip, port);
-            Ok(analyzer_ip_report::build_ip_report(ip, port, &facts))
+            let report = analyzer_ip_report::build_ip_report(ip, port, &facts);
+            // Автоматических действий для IP-цели не подбираем: советы отчёта
+            // вручную (профили, списки) — честный ответ вместо выдумки.
+            let solution = site_solution::SiteSolution {
+                found: false,
+                actions: Vec::new(),
+                summary: String::new(),
+                none_reason: Some(
+                    "для IP-цели автоматическое решение не подбирается — примените советы отчёта вручную"
+                        .to_string(),
+                ),
+            };
+            let mut report = report;
+            report.push_str(&site_solution::report_block(&solution));
+            Ok(DomainAnalysisOutcome { report, solution })
         }
         ip_target::AnalysisTarget::Domain { host } => analyze_domain(app, url, host),
     }
 }
 
-fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<String, String> {
-    // Диагностика главного домена: DNS + поиск рабочего IP + первопричина.
-    // Делаем сразу, чтобы отчёт начинался с главного: «сайт не открывается, вот почему».
+fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<DomainAnalysisOutcome, String> {
     let target_url = ip_target::target_url_of(url);
-    let main_probe = site_probe::probe_domain(&main_host);
 
     // Используем НОВЫЙ headless-режим (--headless=new). В отличие от старого
     // --headless, в новом режиме Chrome не спавнит отдельные консольные дочерние
@@ -309,14 +333,18 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Strin
     let mut bypass_toggled = false;
     let mut restore_note: Option<String> = None;
 
-    let classification = if bypass_on && !broken_on.is_empty() {
-        // Запоминаем активный профиль, чтобы восстановить обход после проверки.
+    // === Окно «обход выключен» ===
+    // Все фактовые пробы (диагностика главного домена, подмена DNS, разбор блока)
+    // обязаны идти БЕЗ активного winws: обход перехватывает ВЕСЬ трафик процесса,
+    // и при включённом профиле, который ломает сайт, отчёт получал ложные
+    // «IP не отвечает / фильтрация маршрута» вместо правды (кейс sostav.ru).
+    let (classification, main_probe, main_dns_sub, dns_fail_sub, block_scan) = if bypass_on {
         let saved = bypass_toggle::capture_active();
 
-        // Выключаем обход и перепроверяем сломанные домены без него.
         bypass_toggle::stop_bypass();
         bypass_toggled = true;
 
+        // Проба #2 без обхода: только домены, сломанные при обходе.
         let results_off = analyzer_probe::probe_all(&broken_on);
         let mut broken_off: HashSet<String> = HashSet::new();
         let mut dns_off: HashSet<String> = HashSet::new();
@@ -338,55 +366,86 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Strin
             }
         }
 
-        // Авто-восстановление обхода прежним профилем (общая логика SSOT).
-        restore_note = bypass_toggle::restore_bypass(app, &saved);
-
-        analyzer_probe::classify_dual(
+        let classification = analyzer_probe::classify_dual(
             results_on,
             &broken_off,
             &dns_off,
             &dead_off,
             &browser_failed_set,
-        )
-    } else {
-        // Обход был выключен изначально (или обрывов нет) — одиночная классификация.
-        analyzer_probe::classify_single(results_on, &browser_failed_set)
-    };
+        );
 
-    // Автопроверка «подмены DNS». Обычный DNS (системный/публичные UDP:53) может
-    // быть отравлен или перехвачен, и тогда сайт не открывается, хотя сам не
-    // заблокирован. Если главный домен не открывается — резолвим его через
-    // DoH-сервисы xbox-dns.ru/geohide.ru и ищем рабочий IP для подмены.
-    // При WwwOnly проверка бессмысленна: рабочее имя уже найдено.
-    let main_dns_sub = if main_probe.verdict.site_broken()
-        && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
-    {
-        site_probe::check_dns_substitution(&main_host, true)
-    } else {
-        Vec::new()
-    };
+        // Фактовая диагностика главного домена — в чистом окне без обхода.
+        let main_probe = site_probe::probe_domain(&main_host);
 
-    // Домены, «не резолвящиеся» по классификации, тоже прогоняем через подмену
-    // (до 5 штук, лёгкая проверка — без полного HTTPS-прогона).
-    let dns_fail_sub: Vec<(String, Vec<site_probe::DnsSubstitution>)> = classification
-        .dns_fail
-        .iter()
-        .take(5)
-        .map(|h| (h.clone(), site_probe::check_dns_substitution(h, false)))
-        .collect();
+        // Автопроверка «подмены DNS». Обычный DNS (системный/публичные UDP:53) может
+        // быть отравлен или перехвачен, и тогда сайт не открывается, хотя сам не
+        // заблокирован. Если главный домен не открывается — резолвим его через
+        // DoH-сервисы и ищем рабочий IP для подмены.
+        // При WwwOnly проверка бессмысленна: рабочее имя уже найдено.
+        let main_dns_sub = if main_probe.verdict.site_broken()
+            && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
+        {
+            site_probe::check_dns_substitution(&main_host, true)
+        } else {
+            Vec::new()
+        };
 
-    // Разбор первопричины для главного домена: разновидности 403 (чужой VIP /
-    // WAF-гео / голый отказ), транспорт-блок цензором и — только если транспорт
-    // к родным IP не работает — скан CIDR-диапазонов с поиском рабочего IP.
-    // Условие совпадает с блоком подмены DNS: сайт открывается или найдено
-    // рабочее имя (WwwOnly) — разбирать нечего.
-    let block_scan = if main_probe.verdict.site_broken()
-        && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
-    {
-        let report = crate::ip_range_scan::block_diagnose(app, &main_host);
-        Some((main_host, report))
+        // Разбор первопричины для главного домена: разновидности 403 (чужой VIP /
+        // WAF-гео / голый отказ), транспорт-блок цензором и — только если транспорт
+        // к родным IP не работает — скан CIDR-диапазонов с поиском рабочего IP.
+        // Условие совпадает с блоком подмены DNS: сайт открывается или найдено
+        // рабочее имя (WwwOnly) — разбирать нечего.
+        let block_scan = if main_probe.verdict.site_broken()
+            && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
+        {
+            Some(crate::ip_range_scan::block_diagnose(app, &main_host))
+        } else {
+            None
+        };
+
+        // Авто-восстановление обхода прежним профилем (общая логика SSOT) —
+        // только после того, как все фактовые пробы собрались в чистом окне.
+        // Сюда же — лёгкая подмена DNS для «не резолвящихся» доменов (до 5):
+        // их TCP-пробы тоже не должны идти через активный обход.
+        let dns_fail_sub: Vec<(String, Vec<site_probe::DnsSubstitution>)> = classification
+            .dns_fail
+            .iter()
+            .take(5)
+            .map(|h| (h.clone(), site_probe::check_dns_substitution(h, false)))
+            .collect();
+
+        restore_note = bypass_toggle::restore_bypass(app, &saved);
+
+        (classification, Some(main_probe), main_dns_sub, dns_fail_sub, block_scan)
     } else {
-        None
+        // Обход был выключен изначально — весь анализ и так шёл в чистом окне.
+        let classification =
+            analyzer_probe::classify_single(results_on, &browser_failed_set);
+
+        let main_probe = site_probe::probe_domain(&main_host);
+        let main_dns_sub = if main_probe.verdict.site_broken()
+            && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
+        {
+            site_probe::check_dns_substitution(&main_host, true)
+        } else {
+            Vec::new()
+        };
+        let block_scan = if main_probe.verdict.site_broken()
+            && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
+        {
+            Some(crate::ip_range_scan::block_diagnose(app, &main_host))
+        } else {
+            None
+        };
+
+        let dns_fail_sub: Vec<(String, Vec<site_probe::DnsSubstitution>)> = classification
+            .dns_fail
+            .iter()
+            .take(5)
+            .map(|h| (h.clone(), site_probe::check_dns_substitution(h, false)))
+            .collect();
+
+        (classification, Some(main_probe), main_dns_sub, dns_fail_sub, block_scan)
     };
 
     let meta = ReportMeta {
@@ -396,12 +455,18 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Strin
         bypass_toggled,
         restore_note,
         had_browser_failures,
-        main_probe: Some(main_probe),
+        main_probe,
         main_dns_sub,
         dns_fail_sub,
         block_scan,
     };
 
-    Ok(analyzer_report::build_report(&meta, &classification))
+    let mut report = analyzer_report::build_report(&meta, &classification);
+    // «Найденное решение» — из тех же фактов, что и отчёт (SSOT):
+    // decide() читает meta/classification, report_block печатает тот же итог.
+    let solution = site_solution::decide(&meta, &classification);
+    report.push_str(&site_solution::report_block(&solution));
+
+    Ok(DomainAnalysisOutcome { report, solution })
 }
 

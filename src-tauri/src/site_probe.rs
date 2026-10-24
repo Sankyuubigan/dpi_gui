@@ -38,8 +38,14 @@ pub struct DomainProbe {
     pub host: String,
     pub dns: DnsInfo,
     pub primary_ips: Vec<String>,
-    /// Адреса, найденные через DoH (проверенный канал).
+    /// Адреса, найденные через DoH (проверенный канал). Адреса-прокси-шлюзы
+    /// самих DoH-сервисов сюда НЕ попадают — они в `doh_gateway_ips`.
     pub doh_ips: Vec<String>,
+    /// Собственные адреса DoH-сервисов, отданные в ответе вместо адреса сайта.
+    /// Не участвуют ни в пробах, ни в вердикте, ни в hosts-советах: проба через
+    /// такой SNI-прокси может дать HTTP 200, а браузер пользователя по нему
+    /// сайт не откроет (кейс openrouter.ai / dns.comss.one).
+    pub doh_gateway_ips: Vec<(String, String)>,
     /// Карта «адрес из `doh_ips` → сервисы DoH, которые его вернули».
     /// Пусто при пустом `doh_ips`. Нужна отчёту: адрес, который отдал
     /// только один сервис и которого нет у системного DNS, — кандидат
@@ -91,6 +97,42 @@ fn registrable_domain(host: &str) -> String {
         return host.to_ascii_lowercase();
     }
     labels[labels.len() - 2..].join(".").to_ascii_lowercase()
+}
+
+/// Разделяет адреса DoH на «адреса сайта» и «адреса-прокси-шлюзы сервисов».
+///
+/// Шлюз — адрес из ответа DoH, совпавший с собственной A-записью какого-то
+/// DoH-сервиса: проба через такой SNI-прокси может вернуть HTTP 200, а браузер
+/// пользователя по нему сайт не откроет (кейс openrouter.ai: 80.74.30.162 —
+/// инфраструктура dns.comss.one). Чистая функция — покрыта юнит-тестами.
+fn split_doh_ips(
+    doh_addr_ips: &[IpAddr],
+    primary_ips: &[String],
+    gateway_owner: &dyn Fn(&IpAddr) -> Option<String>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let primary_set: HashSet<&String> = primary_ips.iter().collect();
+    let mut site_ips: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut gateways: Vec<(String, String)> = Vec::new();
+    let mut gw_seen: HashSet<String> = HashSet::new();
+
+    for ip in doh_addr_ips {
+        let s = ip.to_string();
+        if let Some(owner) = gateway_owner(ip) {
+            if primary_set.contains(&s) {
+                // Шлюз совпал с системным адресом — отдельной строкой не дублируем.
+                continue;
+            }
+            if gw_seen.insert(s.clone()) {
+                gateways.push((s, owner));
+            }
+            continue;
+        }
+        if seen.insert(s.clone()) {
+            site_ips.push(s);
+        }
+    }
+    (site_ips, gateways)
 }
 
 /// Сверка системного DNS (UDP:53) с DoH: доказательство перехвата UDP:53 и
@@ -343,14 +385,12 @@ pub fn probe_domain(host: &str) -> DomainProbe {
     let primary_ips = dedup_ips(dns.system.iter().copied());
     // Адреса из DoH вычитаем из системных: один и тот же адрес не имеет смысла
     // проверять дважды — он и так проверен тем же HTTPS-запросом.
-    let primary_set: HashSet<&String> = primary_ips.iter().collect();
-    let doh_ips = dedup_ips(
-        doh_addr_ips
-            .iter()
-            .copied()
-            .filter(|ip| !primary_set.contains(&ip.to_string())),
+    let (doh_ips, doh_gateway_ips) = split_doh_ips(
+        &doh_addr_ips,
+        &primary_ips,
+        &|ip| doh_answers.gateway_owner(ip),
     );
-    // Карта «адрес → сервисы DoH» — строится из фактических ответов сервисов
+    // Карта «адрес → сервисы» — строится из фактических ответов сервисов
     // (без повторных запросов), для честной адресной таблицы отчёта.
     let doh_ip_services = doh_answers.services_map(&doh_ips);
 
@@ -477,6 +517,7 @@ pub fn probe_domain(host: &str) -> DomainProbe {
         dns,
         primary_ips,
         doh_ips,
+        doh_gateway_ips,
         doh_ip_services,
         working_ip,
         working_ip_source,
@@ -578,8 +619,36 @@ pub fn probe_https_by_ip(host: &str, ip: IpAddr) -> HttpResult {
 pub fn check_dns_substitution(host: &str, probe_http: bool) -> Vec<DnsSubstitution> {
     let answers = resolve_doh_all(host);
     let mut out = Vec::new();
-    for a in answers.answers {
-        out.push(summarize_substitution(host, &a.service, &a.ips, a.error, probe_http));
+    for a in &answers.answers {
+        // Собственный адрес сервиса (SNI-прокси) — не решение: проба через него
+        // может дать 200, а сайт в браузере по нему не откроется.
+        let only_gateway = !a.ips.is_empty()
+            && a.ips.iter().all(|ip| answers.gateway_owner(ip).is_some());
+        if only_gateway {
+            out.push(DnsSubstitution {
+                service: a.service.clone(),
+                resolved: vec![],
+                working_ip: None,
+                http_note: format!(
+                    "сервис отдал собственный адрес-шлюз ({}) — это не адрес сайта",
+                    a.ips
+                        .iter()
+                        .take(3)
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                http_ok: false,
+            });
+            continue;
+        }
+        let real_ips: Vec<IpAddr> = a
+            .ips
+            .iter()
+            .copied()
+            .filter(|ip| answers.gateway_owner(ip).is_none())
+            .collect();
+        out.push(summarize_substitution(host, &a.service, &real_ips, a.error.clone(), probe_http));
     }
     out
 }
@@ -632,14 +701,15 @@ fn summarize_substitution(
     };
 
     if !probe_http {
-        // Лёгкий прогон (список dns_fail): HTTPS не гоняем, но и не называем
-        // IP «рабочим» — только кандидатом.
+        // Лёгкий прогон (список dns_fail): HTTPS не гоняем, поэтому честно
+        // помечаем как непроверенный — http_ok=true тут была ложью
+        // (core rules §2.2): TCP:443 отвечает и у заглушек цензора.
         return DnsSubstitution {
             service: service.to_string(),
             resolved: display,
             working_ip: Some(first.to_string()),
-            http_note: format!("TCP:443 отвечает ({})", first),
-            http_ok: true,
+            http_note: format!("TCP:443 отвечает ({}) — HTTPS не проверен", first),
+            http_ok: false,
         };
     }
 
@@ -766,6 +836,45 @@ mod tests {
         assert_eq!(ips, vec!["1.2.3.4".to_string(), "5.6.7.8".to_string()]);
     }
 
+    /// Кейс openrouter.ai: адрес dns.comss.one (80.74.30.162) уходит в шлюзы,
+    /// адреса сайта остаются в основном списке.
+    #[test]
+    fn split_doh_ips_separates_gateway_from_site() {
+        let doh_addrs: Vec<IpAddr> = vec![
+            "80.74.30.162".parse().unwrap(),
+            "104.18.2.115".parse().unwrap(),
+            "80.74.30.162".parse().unwrap(), // дубль шлюза
+        ];
+        let primary = vec!["104.18.3.115".to_string()];
+        let owner = |ip: &IpAddr| {
+            if ip.to_string() == "80.74.30.162" {
+                Some("dns.comss.one".to_string())
+            } else {
+                None
+            }
+        };
+        let (site, gateways) = split_doh_ips(&doh_addrs, &primary, &owner);
+        assert_eq!(site, vec!["104.18.2.115".to_string()]);
+        assert_eq!(
+            gateways,
+            vec![("80.74.30.162".to_string(), "dns.comss.one".to_string())],
+            "дубль шлюза не дублируется"
+        );
+    }
+
+    /// Шлюз, совпавший с системным адресом, не дублируется отдельной строкой:
+    /// он уже показан в списке системных.
+    #[test]
+    fn split_doh_ips_gateway_matching_system_is_not_duplicated() {
+        let doh_addrs: Vec<IpAddr> = vec!["80.74.30.162".parse().unwrap()];
+        let primary = vec!["80.74.30.162".to_string()];
+        let owner =
+            |ip: &IpAddr| (ip.to_string() == "80.74.30.162").then(|| "dns.comss.one".to_string());
+        let (site, gateways) = split_doh_ips(&doh_addrs, &primary, &owner);
+        assert!(site.is_empty());
+        assert!(gateways.is_empty());
+    }
+
     /// Реальный пользовательский случай целиком: системный DNS отравлен, DoH
     /// вернул рабочий адрес, в отчёте нет вранья.
     #[test]
@@ -779,6 +888,7 @@ mod tests {
             dns,
             primary_ips: vec!["188.186.154.88".to_string()],
             doh_ips: vec!["104.21.95.93".to_string()],
+            doh_gateway_ips: vec![],
             doh_ip_services: vec![(
                 "104.21.95.93".to_string(),
                 vec!["dns.comss.one".to_string()],
@@ -814,6 +924,7 @@ mod tests {
             dns: DnsInfo::new(),
             primary_ips: vec!["188.186.154.88".to_string()],
             doh_ips: vec![],
+            doh_gateway_ips: vec![],
             doh_ip_services: vec![],
             working_ip: Some("188.186.154.88".to_string()),
             working_ip_source: Some(IpSource::SystemDns),
