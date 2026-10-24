@@ -245,6 +245,7 @@ pub fn open_file_in_editor(file_type: &str) -> Result<(), std::io::Error> {
         "list_exclude" => app_dir.join("lists").join("list-exclude.txt"),
         "profiles" => app_dir.join("profiles.json"),
         "doh_services" => defaults_dir().join("doh-services.txt"),
+        "hosts" => crate::hosts::hosts_path(),
         _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Unknown file type")),
     };
 

@@ -11,7 +11,9 @@ const BACKUP_PATH: &str = r"C:\Windows\System32\drivers\etc\hosts.dpigui.bak";
 /// Метка, которой приложение помечает СВОИ строки в hosts. Удаляются только они.
 const MARKER: &str = "# DPI_GUI";
 
-fn hosts_path() -> PathBuf {
+/// Единственная точка знания пути к hosts (SSOT): используется и правкой
+/// файла, и кнопкой «Открыть файл hosts» на вкладке «Настройки».
+pub fn hosts_path() -> PathBuf {
     PathBuf::from(HOSTS_PATH)
 }
 
@@ -122,11 +124,6 @@ fn maps_domain(line: &str, domain: &str) -> bool {
     }
     t.split_whitespace()
         .any(|tok| tok.eq_ignore_ascii_case(domain))
-}
-
-/// Возвращает содержимое hosts (для отображения в UI).
-pub fn read_hosts() -> Result<String, String> {
-    fs::read_to_string(hosts_path()).map_err(|e| format!("Не удалось прочитать hosts: {}", e))
 }
 
 /// Атомарная запись: во временный файл в той же папке, затем rename поверх.

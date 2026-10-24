@@ -30,7 +30,9 @@ type Status =
 
 const REPO_URL = "https://github.com/Sankyuubigan/dpi_gui";
 
-export default function AboutTab() {
+/// Секция «О программе» (версия, репозиторий, обновления, откат).
+/// Раньше была отдельной вкладкой, теперь блок вверху вкладки «Настройки».
+export default function AboutSection() {
   const [version, setVersion] = useState<string>("");
   const [status, setStatus] = useState<Status>("idle");
   const [update, setUpdate] = useState<Update | null>(null);

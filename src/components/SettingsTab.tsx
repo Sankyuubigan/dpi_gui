@@ -1,7 +1,10 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { FolderOpen, Edit3, Eye } from "lucide-react";
+import { Edit3, Eye, FileText, ListFilter } from "lucide-react";
+import AboutSection from "./AboutSection";
 
+/// Вкладка «Настройки»: секция «О программе» сверху, ниже — управление
+/// файлами списков (General / Exclude / DoH / hosts) и режимом наблюдения.
 export default function SettingsTab() {
   const [config, setConfig] = useState<any>(null);
 
@@ -26,20 +29,22 @@ export default function SettingsTab() {
       console.error("save_config:", e);
     }
   };
-  
+
   const openFile = async (type: string) => {
-    try { await invoke("open_file", { fileType: type }); } 
+    try { await invoke("open_file", { fileType: type }); }
     catch (e) { console.error(e); }
   };
 
   return (
     <div className="flex flex-col gap-4">
+      <AboutSection />
+
       <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
         <h2 className="text-xl font-bold text-gray-800 mb-4">Управление списками</h2>
         <p className="text-gray-500 mb-6 text-sm">
           Списки сохраняются в защищенной директории AppData и используются активными профилями обхода.
         </p>
-        
+
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="flex items-center justify-between p-4 border rounded-lg bg-gray-50 hover:bg-gray-100 transition">
             <div>
@@ -63,11 +68,21 @@ export default function SettingsTab() {
 
           <div className="flex items-center justify-between p-4 border rounded-lg bg-gray-50 hover:bg-gray-100 transition">
             <div>
-              <h3 className="font-bold text-gray-700">Профили обхода</h3>
-              <p className="text-xs text-gray-500">Конфигурация аргументов winws.</p>
+              <h3 className="font-bold text-gray-700">DoH-серверы</h3>
+              <p className="text-xs text-gray-500">Список сервисов подмены DNS для «Теста подмены DNS».</p>
             </div>
-            <button onClick={() => openFile("profiles")} className="flex items-center gap-2 bg-gray-200 text-gray-800 px-4 py-2 rounded-md font-semibold hover:bg-gray-300">
-              <FolderOpen size={18} />
+            <button onClick={() => openFile("doh_services")} className="flex items-center gap-2 bg-blue-100 text-blue-700 px-4 py-2 rounded-md font-semibold hover:bg-blue-200">
+              <ListFilter size={18} />
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between p-4 border rounded-lg bg-gray-50 hover:bg-gray-100 transition">
+            <div>
+              <h3 className="font-bold text-gray-700">Файл hosts</h3>
+              <p className="text-xs text-gray-500">C:\Windows\System32\drivers\etc\hosts (записи приложения помечены DPI_GUI).</p>
+            </div>
+            <button onClick={() => openFile("hosts")} className="flex items-center gap-2 bg-blue-100 text-blue-700 px-4 py-2 rounded-md font-semibold hover:bg-blue-200">
+              <FileText size={18} />
             </button>
           </div>
         </div>

@@ -3,8 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import ControlTab from "./components/ControlTab";
 import SettingsTab from "./components/SettingsTab";
-import TestingTab, { type LogEntry } from "./components/TestingTab";
-import AboutTab from "./components/AboutTab";
+import ProfilesTab from "./components/ProfilesTab";
+import SiteFixTab from "./components/SiteFixTab";
+import type { LogEntry } from "./components/TestingLogPanel";
 
 const MAX_LOG_LINES = 5000; // лог живёт ВСЮ сессию приложения (PRP §7.1)
 const MAX_SUSPICIONS = 200; // список подозрений — рабочая память (PRP §7.2)
@@ -144,19 +145,19 @@ export default function App() {
           className={`px-4 py-3 font-semibold ${activeTab === "settings" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
           onClick={() => setActiveTab("settings")}
         >
-          Списки и Настройки
+          Настройки
         </button>
         <button
-          className={`px-4 py-3 font-semibold ${activeTab === "testing" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
-          onClick={() => setActiveTab("testing")}
+          className={`px-4 py-3 font-semibold ${activeTab === "profiles" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
+          onClick={() => setActiveTab("profiles")}
         >
-          Инструменты
+          Профили обхода
         </button>
         <button
-          className={`px-4 py-3 font-semibold ${activeTab === "about" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
-          onClick={() => setActiveTab("about")}
+          className={`px-4 py-3 font-semibold ${activeTab === "sitefix" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
+          onClick={() => setActiveTab("sitefix")}
         >
-          О программе
+          Починка сайтов
         </button>
       </div>
 
@@ -175,8 +176,8 @@ export default function App() {
           />
         )}
         {activeTab === "settings" && <SettingsTab />}
-        {activeTab === "testing" && (
-          <TestingTab
+        {activeTab === "profiles" && (
+          <ProfilesTab
             profiles={profiles}
             setProfiles={setProfiles}
             config={config}
@@ -188,7 +189,16 @@ export default function App() {
             setIsTesting={setTestingIsTesting}
           />
         )}
-        {activeTab === "about" && <AboutTab />}
+        {activeTab === "sitefix" && (
+          <SiteFixTab
+            log={testingLog}
+            setLog={setTestingLog}
+            url={testingUrl}
+            setUrl={setTestingUrl}
+            isTesting={testingIsTesting}
+            setIsTesting={setTestingIsTesting}
+          />
+        )}
       </div>
     </div>
   );

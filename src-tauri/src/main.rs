@@ -123,11 +123,6 @@ fn remove_hosts_entry(domain: String) -> Result<String, String> {
     hosts::remove_hosts_entry(&domain)
 }
 
-#[tauri::command]
-fn read_hosts() -> Result<String, String> {
-    hosts::read_hosts()
-}
-
 /// Авто-проверка после записи в hosts: реально ли сайт открывается через этот IP.
 #[tauri::command]
 fn verify_site_via_ip(host: String, ip: String) -> Result<String, String> {
@@ -192,7 +187,6 @@ fn main() {
             run_diagnostics,
             apply_hosts_entry,
             remove_hosts_entry,
-            read_hosts,
             verify_site_via_ip
         ])
         .on_window_event(|_window, event| {
