@@ -33,7 +33,11 @@ mod process_owner;
 use tauri::AppHandle;
 
 #[tauri::command]
-fn init_app() -> Result<(), String> {
+fn init_app(app: AppHandle) -> Result<(), String> {
+    // Порядок важен: чистим грязное состояние прошлого сеанса (остаточную
+    // службу WinDivert) ДО первого check_status из фронтенда, чтобы индикатор
+    // не показывал «ПРОЦЕСС АКТИВЕН» на мёртвом обходе.
+    process::cleanup_stale_windivert(&app);
     config::ensure_directories_and_files().map_err(|e| e.to_string())
 }
 

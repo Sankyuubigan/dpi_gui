@@ -192,21 +192,48 @@ pub fn stop_winws() -> Result<String, String> {
         .creation_flags(CREATE_NO_WINDOW)
         .output();
 
-    // Жёсткое убийство winws.exe не выгружает драйвер-службу WinDivert из ядра,
-    // и файл WinDivert64.sys остаётся заблокированным. Останавливаем службу явно,
-    // иначе установщик/обновление не смогут перезаписать .sys.
-    // Имя службы зависит от версии winws — гасим все известные варианты.
+    stop_windivert_services();
+
+    // Даём ядру время выгрузить драйвер и освободить .sys
+    thread::sleep(std::time::Duration::from_millis(800));
+
+    // Честность (core §2.2): результат остановки проверяем, а не предполагаем.
+    // Служба может не выгрузиться (медленное ядро, чужой открытый хендл) —
+    // молчать об этом нельзя: файл .sys останется заблокированным.
+    if is_windivert_service_running() {
+        return Ok("Процессы остановлены; ВНИМАНИЕ: служба WinDivert ещё не выгрузилась (файл WinDivert64.sys может быть занят)".to_string());
+    }
+
+    Ok("Процессы остановлены".to_string())
+}
+
+/// Жёсткое убийство winws.exe не выгружает драйвер-службу WinDivert из ядра,
+/// и файл WinDivert64.sys остаётся заблокированным. Останавливаем службу явно,
+/// иначе установщик/обновление не смогут перезаписать .sys.
+/// Имя службы зависит от версии winws — гасим все известные варианты.
+fn stop_windivert_services() {
     for svc in ["WinDivert", "WinDivert1.4", "windivert"] {
         let _ = Command::new("sc")
             .args(["stop", svc])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
     }
+}
 
-    // Даём ядру время выгрузить драйвер и освободить .sys
+/// Чистка грязного состояния после прошлого сеанса: winws-процессов нет, а
+/// драйвер-служба WinDivert осталась загруженной (приложение упало/убили,
+/// служба не успела выгрузиться при закрытии). Загруженный драйвер ничего
+/// не обходит — это мусор, блокирующий .sys, выгружаем его при старте.
+pub fn cleanup_stale_windivert(app: &AppHandle) {
+    if is_winws_running() || !is_windivert_service_running() {
+        return;
+    }
+    let _ = app.emit("log", "Обнаружен остаточный драйвер WinDivert (обход не активен) — выгружаю службу...".to_string());
+    stop_windivert_services();
     thread::sleep(std::time::Duration::from_millis(800));
-
-    Ok("Процессы остановлены".to_string())
+    if is_windivert_service_running() {
+        let _ = app.emit("log", "ВНИМАНИЕ: остаточная служба WinDivert не выгрузилась (возможно, её использует другой процесс).".to_string());
+    }
 }
 
 /// Загружена ли драйвер-служба WinDivert (может жить даже после смерти winws.exe).
@@ -226,15 +253,16 @@ fn is_windivert_service_running() -> bool {
     false
 }
 
+/// Активен ли обход. Честность (core §2.2): обход — это живой процесс winws.exe,
+/// и НИЧЕГО больше. Драйвер-служба WinDivert может пережить смерть winws
+/// (упавшее приложение, не успевшая выгрузиться служба), но загруженный драйвер
+/// сам ничего не обходит — считать его активностью значит лгать в UI
+/// («ПРОЦЕСС АКТИВЕН» на мёртвом обходе). Имя сравниваем точно: substring-поиск
+/// ловил бы чужие процессы с «winws» внутри имени.
 pub fn is_winws_running() -> bool {
     let mut sys = System::new_all();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
-    for (_, process) in sys.processes() {
-        if process.name().to_string_lossy().to_lowercase().contains("winws") {
-            return true;
-        }
-    }
-    // Процесс winws мог быть убит, но драйвер WinDivert ещё загружен —
-    // считаем обход активным, чтобы статус в UI не вводил в заблуждение.
-    is_windivert_service_running()
+    sys.processes().values().any(|process| {
+        process.name().to_string_lossy().to_lowercase() == WINWS_EXE
+    })
 }

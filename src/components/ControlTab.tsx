@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, type Dispatch, type SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Play, Square, Activity, Eye, Terminal, Trash2 } from "lucide-react";
+import { Play, Square, Activity, Eye, Terminal, Trash2, Search } from "lucide-react";
 import { reasonToHuman } from "./reasonText";
 import type { Suspicion } from "../App";
 
@@ -13,6 +13,7 @@ export default function ControlTab({
   suspicions,
   setSuspicions,
   logMsg,
+  onFixDomain,
 }: {
   isRunning: boolean;
   profiles: any[];
@@ -22,6 +23,8 @@ export default function ControlTab({
   suspicions: Suspicion[];
   setSuspicions: Dispatch<SetStateAction<Suspicion[]>>;
   logMsg: (msg: string) => void;
+  /// Перенести домен на вкладку «Починка сайтов» (подстановка в поле анализа).
+  onFixDomain: (domain: string) => void;
 }) {
   const logEndRef = useRef<HTMLDivElement>(null);
   // Выбранная позиция в списке ошибок (домен). null = ничего не выбрано.
@@ -43,6 +46,15 @@ export default function ControlTab({
     setSuspicions(prev => prev.filter(s => s.domain !== cleared));
     logMsg(`Ошибки сети: очищена позиция ${cleared}`);
     setSelectedDomain(null);
+  };
+
+  // «Анализ»: отправить выбранный домен на вкладку «Починка сайтов» —
+  // он подставится в поле анализа, юзер запускает «Анализ сайта / IP» сам.
+  const sendDomainToFix = () => {
+    if (!selectedDomain) return;
+    const domain = selectedDomain;
+    logMsg(`Ошибки сети: домен ${domain} отправлен на вкладку «Починка сайтов»`);
+    onFixDomain(domain);
   };
 
   const handleStart = async () => {
@@ -133,7 +145,8 @@ export default function ControlTab({
 
       {/* СПИСОК ОШИБОК СЕТИ: строка на домен, дедуп по домену, повтор
           обновляет счётчик/время строке. Клик по строке — выбор позиции;
-          кнопка «Очистить» удаляет ТОЛЬКО выбранную. Повторные ошибки
+          «Анализ» переносит выбранный домен на вкладку «Починка сайтов»,
+          «Очистить» удаляет ТОЛЬКО выбранную. Повторные ошибки
           того же домена снова появятся в списке — это норма. */}
       <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
         <div className="flex items-center justify-between gap-3 mb-3">
@@ -142,23 +155,42 @@ export default function ControlTab({
             <h3 className="font-bold text-gray-800">Ошибки сети ({suspicions.length})</h3>
           </div>
           {suspicions.length > 0 && (
-            <button
-              onClick={clearSelected}
-              disabled={!selectedDomain}
-              className={
-                "flex items-center gap-2 px-4 py-2 rounded-md font-bold text-sm transition-colors border " +
-                (selectedDomain
-                  ? "border-red-300 text-red-600 hover:bg-red-50"
-                  : "border-gray-200 text-gray-400 cursor-not-allowed")
-              }
-              title={
-                selectedDomain
-                  ? `Удалить выбранную позицию из списка: ${selectedDomain}`
-                  : "Сначала выберите позицию — кликните на строку списка"
-              }
-            >
-              <Trash2 size={16} /> Очистить
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={sendDomainToFix}
+                disabled={!selectedDomain}
+                className={
+                  "flex items-center gap-2 px-4 py-2 rounded-md font-bold text-sm transition-colors border " +
+                  (selectedDomain
+                    ? "border-purple-300 text-purple-600 hover:bg-purple-50"
+                    : "border-gray-200 text-gray-400 cursor-not-allowed")
+                }
+                title={
+                  selectedDomain
+                    ? `Перенести домен на вкладку «Починка сайтов» для анализа: ${selectedDomain}`
+                    : "Сначала выберите позицию — кликните на строку списка"
+                }
+              >
+                <Search size={16} /> Анализ
+              </button>
+              <button
+                onClick={clearSelected}
+                disabled={!selectedDomain}
+                className={
+                  "flex items-center gap-2 px-4 py-2 rounded-md font-bold text-sm transition-colors border " +
+                  (selectedDomain
+                    ? "border-red-300 text-red-600 hover:bg-red-50"
+                    : "border-gray-200 text-gray-400 cursor-not-allowed")
+                }
+                title={
+                  selectedDomain
+                    ? `Удалить выбранную позицию из списка: ${selectedDomain}`
+                    : "Сначала выберите позицию — кликните на строку списка"
+                }
+              >
+                <Trash2 size={16} /> Очистить
+              </button>
+            </div>
           )}
         </div>
         {suspicions.length === 0 ? (
@@ -182,8 +214,8 @@ export default function ControlTab({
                   }
                   title={
                     isSelected
-                      ? "Выбрано. Повторный клик — снять выбор"
-                      : "Клик — выбрать позицию, затем «Очистить» удалит её из списка"
+                      ? "Выбрано. Повторный клик — снять выбор; кнопки выше: «Анализ» перенесёт домен на «Починку сайтов», «Очистить» удалит позицию"
+                      : "Клик — выбрать позицию, затем «Анализ» перенесёт домен на «Починку сайтов», «Очистить» удалит её из списка"
                   }
                 >
                   <div className="min-w-0 flex-wrap">

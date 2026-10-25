@@ -148,6 +148,14 @@ export default function App() {
     await invoke("save_config", { config: newConfig });
   };
 
+  // Перенос домена из списка ошибок сети на вкладку «Починка сайтов»:
+  // подставляем его в поле анализа (testingUrl — SSOT, живёт здесь) и
+  // переключаем вкладку. SiteFixTab смонтируется с уже заполненным полем.
+  const sendToSiteFix = (domain: string) => {
+    setTestingUrl(domain);
+    setActiveTab("sitefix");
+  };
+
   return (
     <div className="flex flex-col h-full bg-gray-50">
       {/* Навигация */}
@@ -190,6 +198,7 @@ export default function App() {
             suspicions={suspicions}
             setSuspicions={setSuspicions}
             logMsg={logMsg}
+            onFixDomain={sendToSiteFix}
           />
         )}
         {activeTab === "settings" && <SettingsTab />}
