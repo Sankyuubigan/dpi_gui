@@ -236,6 +236,25 @@ pub fn cleanup_stale_windivert(app: &AppHandle) {
     }
 }
 
+/// Ждёт полной остановки обхода: процесс winws мёртв И служба WinDivert
+/// выгружена (или не дождались — вышел потолок). Нужен вместо слепого сна
+/// перед сетевыми пробами анализа: WinDivert перехватывает трафик, пока
+/// жив, и незавершённая выгрузка давала пробам ложные обрывы «без обхода»
+/// (кейс eu.aptabase.com: домен ложно Classified «сломан сам» → вредный
+/// совет «добавьте в обход»). Возвращает true, если выгрузка подтвердилась.
+pub fn wait_bypass_fully_stopped(timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if !is_winws_running() && !is_windivert_service_running() {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// Загружена ли драйвер-служба WinDivert (может жить даже после смерти winws.exe).
 fn is_windivert_service_running() -> bool {
     for svc in ["WinDivert", "WinDivert1.4", "windivert"] {

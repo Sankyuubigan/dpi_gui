@@ -167,10 +167,10 @@ export default function App() {
           Управление
         </button>
         <button
-          className={`px-4 py-3 font-semibold ${activeTab === "settings" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
-          onClick={() => setActiveTab("settings")}
+          className={`px-4 py-3 font-semibold ${activeTab === "sitefix" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
+          onClick={() => setActiveTab("sitefix")}
         >
-          Настройки
+          Починка сайтов
         </button>
         <button
           className={`px-4 py-3 font-semibold ${activeTab === "profiles" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
@@ -179,10 +179,10 @@ export default function App() {
           Профили обхода
         </button>
         <button
-          className={`px-4 py-3 font-semibold ${activeTab === "sitefix" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
-          onClick={() => setActiveTab("sitefix")}
+          className={`px-4 py-3 font-semibold ${activeTab === "settings" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
+          onClick={() => setActiveTab("settings")}
         >
-          Починка сайтов
+          Настройки
         </button>
       </div>
 
@@ -201,7 +201,18 @@ export default function App() {
             onFixDomain={sendToSiteFix}
           />
         )}
-        {activeTab === "settings" && <SettingsTab />}
+        {activeTab === "sitefix" && (
+          <SiteFixTab
+            log={testingLog}
+            setLog={setTestingLog}
+            url={testingUrl}
+            setUrl={setTestingUrl}
+            isTesting={testingIsTesting}
+            setIsTesting={setTestingIsTesting}
+            solution={siteSolution}
+            setSolution={setSiteSolution}
+          />
+        )}
         {activeTab === "profiles" && (
           <ProfilesTab
             profiles={profiles}
@@ -215,18 +226,7 @@ export default function App() {
             setIsTesting={setTestingIsTesting}
           />
         )}
-        {activeTab === "sitefix" && (
-          <SiteFixTab
-            log={testingLog}
-            setLog={setTestingLog}
-            url={testingUrl}
-            setUrl={setTestingUrl}
-            isTesting={testingIsTesting}
-            setIsTesting={setTestingIsTesting}
-            solution={siteSolution}
-            setSolution={setSiteSolution}
-          />
-        )}
+        {activeTab === "settings" && <SettingsTab />}
       </div>
     </div>
   );

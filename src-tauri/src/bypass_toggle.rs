@@ -41,12 +41,17 @@ pub fn capture_active() -> SavedBypass {
     SavedBypass { profile, game_filter }
 }
 
-/// Остановка обхода и пауза на выгрузку драйвера WinDivert
+/// Остановка обхода и ожидание выгрузки драйвера WinDivert
 /// (см. AGENTS.md п. 3: `stop_winws` делает `sc stop WinDivert`,
-/// драйверу нужно время на выгрузку).
+/// драйверу нужно время на выгрузку). Ждём ФАКТ выгрузки поллингом, а не
+/// фиксированную паузу: перехватывающий трафик драйвер после слепого сна
+/// давал пробам анализа ложные обрывы «без обхода» (кейс eu.aptabase.com).
+/// Потолок — щедрый (драйвер может выгружаться секундами), settle-пауза —
+/// на до-зачистку стека фильтров после того, как служба уже не RUNNING.
 pub fn stop_bypass() {
     let _ = process::stop_winws();
-    thread::sleep(Duration::from_millis(1200));
+    process::wait_bypass_fully_stopped(Duration::from_secs(8));
+    thread::sleep(Duration::from_millis(500));
 }
 
 /// Восстановление обхода сохранённым профилем. Возвращает готовый текст

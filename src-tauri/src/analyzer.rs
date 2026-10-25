@@ -349,25 +349,44 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         let mut broken_off: HashSet<String> = HashSet::new();
         let mut dns_off: HashSet<String> = HashSet::new();
         let mut dead_off: HashSet<String> = HashSet::new();
+        // Обрыв «без обхода» подтверждаем ретраем: сразу после остановки winws
+        // часть соединений ещё ловит до-зачистку драйвера/стека и обрывается
+        // ложно. Один ложный обрыв уводил домен в «сломан и без обхода» →
+        // «добавьте в обход» вместо «в исключения» (кейс eu.aptabase.com).
+        // Засчитываются только обрывы, увиденные ДВАЖДЫ; Ok или DNS-ошибка на
+        // ретрае — первый обрыв был ложным.
+        let mut to_retry: Vec<String> = Vec::new();
         for (h, p) in results_off {
             match p {
-                Probe::Broken(_) => {
-                    broken_off.insert(h);
-                }
+                Probe::Broken(_) | Probe::DeadIp => to_retry.push(h),
                 Probe::Dns => {
                     dns_off.insert(h);
-                }
-                // Без обхода сервер вообще не отвечает: домен недоступен сам по
-                // себе, ни обход, ни исключения тут не при чём.
-                Probe::DeadIp => {
-                    dead_off.insert(h);
                 }
                 Probe::Ok => {}
             }
         }
+        if !to_retry.is_empty() {
+            thread::sleep(Duration::from_secs(1));
+            for (h, p) in analyzer_probe::probe_all(&to_retry) {
+                match p {
+                    Probe::Broken(_) => {
+                        broken_off.insert(h);
+                    }
+                    Probe::Dns => {
+                        dns_off.insert(h);
+                    }
+                    // Без обхода сервер вообще не отвечает: домен недоступен сам
+                    // по себе, ни обход, ни исключения тут не при чём.
+                    Probe::DeadIp => {
+                        dead_off.insert(h);
+                    }
+                    Probe::Ok => {}
+                }
+            }
+        }
 
-        let classification = analyzer_probe::classify_dual(
-            results_on,
+        let mut classification = analyzer_probe::classify_dual(
+            results_on.clone(),
             &broken_off,
             &dns_off,
             &dead_off,
@@ -376,6 +395,19 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
 
         // Фактовая диагностика главного домена — в чистом окне без обхода.
         let main_probe = site_probe::probe_domain(&main_host);
+
+        // Арбитраж (кейс eu.aptabase.com): если сайт доказанно открывается без
+        // обхода, а классификация зовёт его в обход — верен вывод «обход его
+        // ломает» (в исключения), а не «добавьте в обход».
+        analyzer_probe::arbitrate_open_main_host(
+            &mut classification,
+            results_on
+                .iter()
+                .find(|(h, _)| h == &main_host)
+                .map(|(_, p)| p),
+            &main_host,
+            main_probe.verdict == crate::site_verdict::Verdict::Open,
+        );
 
         // Автопроверка «подмены DNS». Обычный DNS (системный/публичные UDP:53) может
         // быть отравлен или перехвачен, и тогда сайт не открывается, хотя сам не

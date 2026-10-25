@@ -73,6 +73,12 @@ pub fn decide(meta: &ReportMeta, c: &Classification) -> SiteSolution {
         .iter()
         .filter(|h| !is_background_host(h))
         .filter(|h| !is_main_fixed_by_hosts(meta, h))
+        // Сайт, доказанно открывающийся без обхода (вердикт Open из чистого
+        // окна), обходу не подлежит: обход не чинит работающий сайт — в этом
+        // кейсе он его ЛОМАЛ (кейс eu.aptabase.com). Арбитраж в analyzer.rs
+        // обычно убирает такой домен из need_bypass до decide(); фильтр —
+        // вторая линия обороны, чтобы вредный совет не воскрес.
+        .filter(|h| !is_main_open(meta, h))
         .cloned()
         .collect();
     if !bypass.is_empty() {
@@ -114,6 +120,15 @@ pub fn decide(meta: &ReportMeta, c: &Classification) -> SiteSolution {
             none_reason: None,
         }
     }
+}
+
+/// Главный домен открывается без обхода (вердикт Open) — в обход его
+/// советовать нельзя.
+fn is_main_open(meta: &ReportMeta, host: &str) -> bool {
+    meta.main_probe
+        .as_ref()
+        .map(|p| p.host == host && p.verdict == Verdict::Open)
+        .unwrap_or(false)
 }
 
 /// Главный домен лечится hosts (проверенный адрес найден) — в списки его
@@ -352,6 +367,31 @@ mod tests {
         let s = decide(&m, &c);
         assert!(s.found);
         assert!(matches!(s.actions[0], SolutionAction::AddToExcludeList { .. }));
+    }
+
+    /// Кейс eu.aptabase.com: главный домен открывается без обхода (вердикт
+    /// Open из чистого окна), а классификация звала его в обход. Действие
+    /// AddToBypassList для открытого сайта — вредная ложь, запрещено даже
+    /// если арбитраж выше по стеку не сработал.
+    #[test]
+    fn open_main_host_never_gets_bypass_action() {
+        let m = meta(probe(Verdict::Open, Some(HttpResult::Ok(200)), Some(IpSource::SystemDns)));
+        let mut c = empty_classification();
+        c.need_bypass = vec!["example.com".to_string()];
+        let s = decide(&m, &c);
+        assert!(
+            !s.actions
+                .iter()
+                .any(|a| matches!(a, SolutionAction::AddToBypassList { .. })),
+            "открытый сайт нельзя звать в обход: {:?}",
+            s.actions
+        );
+        assert!(!s.found, "{:?}", s);
+        assert!(
+            s.none_reason.as_ref().unwrap().contains("чинить нечего"),
+            "{:?}",
+            s.none_reason
+        );
     }
 
     /// Фоновые домены (трекеры) не попадают в решение.

@@ -1022,6 +1022,32 @@ let log = build_report(&meta_with(p), &empty_classification());
         assert!(!log.contains("ВЕРОЯТНАЯ ПРИЧИНА"), "{}", log);
     }
 
+    /// Кейс eu.aptabase.com: обход ломает главный домен (классификация
+    /// доказала «с обходом обрыв, без обхода работает»), а probe_domain в
+    /// чистом окне видит Open. Арбитраж обязан повести отчёт с «ЛОМАЕТ
+    /// ВКЛЮЧЁННЫЙ ОБХОД»; «ДОСТУПЕН» (правда лишь для мира без обхода)
+    /// печатать нельзя — один отчёт не имеет права противоречить сам себе.
+    #[test]
+    fn bypass_breaks_main_host_hides_open_verdict() {
+        let mut p = www_only_probe();
+        p.host = "eu.aptabase.com".to_string();
+        p.verdict = Verdict::Open;
+        p.http_note = "HTTPS через 37.27.135.61: HTTP 200".to_string();
+        let mut c = empty_classification();
+        c.bypass_breaks = vec![(
+            "eu.aptabase.com".to_string(),
+            "error sending request".to_string(),
+        )];
+        let log = build_report(&meta_with(p), &c);
+        assert!(log.contains("САЙТ ЛОМАЕТ ВКЛЮЧЁННЫЙ ОБХОД"), "{}", log);
+        assert!(log.contains("исключений"), "{}", log);
+        assert!(!log.contains("ДОСТУПЕН"), "{}", log);
+        // Корзина «в обход» обязана остаться пустой: главный домен в неё не едет.
+        let shield = log.split("НУЖНО ДОБАВИТЬ В ОБХОД").nth(1).unwrap_or("");
+        let shield = shield.split("ДОМЕНЫ, КОТОРЫЕ ЛОМАЕТ").next().unwrap_or(shield);
+        assert!(shield.contains("(пусто)"), "{}", shield);
+    }
+
     // --- Regression: the report must not claim "no censorship" when the
     //     system answer was proven to disagree with DoH. ---
 

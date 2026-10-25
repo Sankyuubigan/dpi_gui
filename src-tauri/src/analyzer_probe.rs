@@ -194,6 +194,39 @@ fn add_browser_failed(c: &mut Classification, browser_failed: &HashSet<String>) 
     }
 }
 
+/// Арбитраж противоречия: классификация требует обхода для главного домена
+/// (`need_bypass`), но факт-диагностика [`crate::site_probe::probe_domain`],
+/// проведённая в чистом окне без обхода, доказала, что сайт ОТКРЫВАЕТСЯ.
+/// Обход не чинит сайт, который работает без него, — значит «добавьте в
+/// обход» здесь ложь, и верен противоположный вывод: если проба #1 (с
+/// обходом) домен обрывала, его ломает сам обход → `bypass_breaks`
+/// (в исключения). Классифицировать «открытый без обхода» домен в обход
+/// уходил и вредный совет «Починить сайт» (кейс eu.aptabase.com: профиль
+/// ALT11 рвал bunny CDN, а анализ звал этот домен в general-лист).
+pub fn arbitrate_open_main_host(
+    c: &mut Classification,
+    main_on_probe: Option<&Probe>,
+    main_host: &str,
+    main_verdict_open: bool,
+) {
+    if !main_verdict_open || !c.need_bypass.iter().any(|h| h == main_host) {
+        return;
+    }
+    c.need_bypass.retain(|h| h != main_host);
+    match main_on_probe {
+        // Проба #1 (с обходом) обрывала домен, который без обхода открыт, —
+        // ломает именно обход; причина честная, из факта пробы.
+        Some(Probe::Broken(err)) => c.bypass_breaks.push((main_host.to_string(), err.clone())),
+        Some(Probe::DeadIp) => c.bypass_breaks.push((
+            main_host.to_string(),
+            "TCP:443 с включённым обходом не отвечает (без обхода — отвечает)".to_string(),
+        )),
+        // Проба #1 домен тоже открывала: он просто доступен, ничего не советуем.
+        _ => {}
+    }
+    finalize(c);
+}
+
 fn finalize(c: &mut Classification) {
     c.need_bypass.sort();
     c.need_bypass.dedup();
@@ -326,5 +359,78 @@ mod tests {
         // RST — это DPI, а не мёртвый сервер.
         assert!(!is_dead_ip_error("connection reset by peer (os error 10054)"));
         assert!(!is_dead_ip_error("connection refused (os error 10061)"));
+    }
+
+    // --- арбитраж «открытый без обхода главный домен» (кейс eu.aptabase.com) ---
+
+    /// Классификация позвала главный домен в обход, но probe_domain доказал,
+    /// что сайт открывается без обхода, а проба #1 (с обходом) его обрывала:
+    /// домен уходит в bypass_breaks («обход ломает»), не в need_bypass.
+    #[test]
+    fn open_main_host_with_broken_probe_moves_to_bypass_breaks() {
+        let mut c = empty_classification();
+        c.need_bypass = vec!["eu.aptabase.com".to_string()];
+        arbitrate_open_main_host(
+            &mut c,
+            Some(&Probe::Broken("error sending request".to_string())),
+            "eu.aptabase.com",
+            true,
+        );
+        assert!(c.need_bypass.is_empty(), "{:?}", c.need_bypass);
+        assert_eq!(
+            c.bypass_breaks,
+            vec![("eu.aptabase.com".to_string(), "error sending request".to_string())]
+        );
+    }
+
+    /// Проба #1 тоже открывала домен: он просто доступен — не советуем ничего.
+    #[test]
+    fn open_main_host_with_ok_probe_drops_bypass_advice() {
+        let mut c = empty_classification();
+        c.need_bypass = vec!["eu.aptabase.com".to_string()];
+        arbitrate_open_main_host(&mut c, Some(&Probe::Ok), "eu.aptabase.com", true);
+        assert!(c.need_bypass.is_empty(), "{:?}", c.need_bypass);
+        assert!(c.bypass_breaks.is_empty(), "{:?}", c.bypass_breaks);
+    }
+
+    /// Вердикт не Open (сайт и без обхода сломан) — классификацию не трогаем.
+    #[test]
+    fn non_open_verdict_keeps_need_bypass() {
+        let mut c = empty_classification();
+        c.need_bypass = vec!["blocked.example".to_string()];
+        arbitrate_open_main_host(
+            &mut c,
+            Some(&Probe::Broken("err".to_string())),
+            "blocked.example",
+            false,
+        );
+        assert_eq!(c.need_bypass, vec!["blocked.example".to_string()]);
+        assert!(c.bypass_breaks.is_empty());
+    }
+
+    /// Главный домен не в need_bypass — арбитраж ничего не меняет.
+    #[test]
+    fn main_host_not_in_need_bypass_is_untouched() {
+        let mut c = empty_classification();
+        c.need_bypass = vec!["other.example".to_string()];
+        c.bypass_breaks = vec![("already.example".to_string(), "e".to_string())];
+        arbitrate_open_main_host(
+            &mut c,
+            Some(&Probe::Broken("err".to_string())),
+            "main.example",
+            true,
+        );
+        assert_eq!(c.need_bypass, vec!["other.example".to_string()]);
+        assert_eq!(c.bypass_breaks.len(), 1);
+    }
+
+    fn empty_classification() -> Classification {
+        Classification {
+            need_bypass: Vec::new(),
+            bypass_breaks: Vec::new(),
+            dns_fail: Vec::new(),
+            ok: Vec::new(),
+            broken: Vec::new(),
+        }
     }
 }
