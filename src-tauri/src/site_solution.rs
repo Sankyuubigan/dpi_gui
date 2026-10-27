@@ -44,8 +44,11 @@ pub struct SiteSolution {
 ///    обрыв, без обхода работает). Применение — исключить и перезапустить обход.
 /// 2. Обход: домен заблокирован сам (сломан и с обходом, и без) — в general-лист.
 ///    Только если домен ЕЩЁ НЕ покрыт списками (добавлять покрытое — нулевой
-///    эффект, кейс vercel 27.10.26) и вердикт главного домена вообще
-///    допускает лечение обходом ([`Verdict::bypass_relevant`]).
+///    эффект, кейс vercel 27.10.26), НЕ покрыт исключениями (в winws
+///    исключения проверяются раньше include-листов — nfq/hostlist.c: добавление
+///    в general-лист не изменит ничего, кейс api.messenger.yandex.net 27.10.26)
+///    и вердикт главного домена вообще допускает лечение обходом
+///    ([`Verdict::bypass_relevant`]).
 /// 3. Hosts по пробе главного домена: доказанная подмена DNS, найден проверенный
 ///    (DoH, не шлюз) адрес, через который HTTPS-проба открыла сайт.
 /// 4. Hosts по DoH-подмене: сайт не открылся нигде, но подменные DoH-сервисы
@@ -53,9 +56,10 @@ pub struct SiteSolution {
 ///    DNS отдал мёртвые адреса, живой был только у DoH — пользователь чинил
 ///    именно ручной записью в hosts).
 ///
-/// Фоновые домены (трекеры) и уже покрытые списками не попадают в действия:
-/// советовать их — ложь. Карта списков берётся из `meta.bypass_map` (SSOT:
-/// отчёт и решение потребляют одну загрузку).
+/// Фоновые домены (трекеры) и уже покрытые списками (включая исключения)
+/// не попадают в действия: советовать их — ложь. Карты списков берутся из
+/// `meta.bypass_map` / `meta.exclude_set` (SSOT: отчёт и решение потребляют
+/// одну загрузку).
 pub fn decide(meta: &ReportMeta, c: &Classification) -> SiteSolution {
     let mut actions: Vec<SolutionAction> = Vec::new();
     let mut summaries: Vec<String> = Vec::new();
@@ -63,13 +67,22 @@ pub fn decide(meta: &ReportMeta, c: &Classification) -> SiteSolution {
     let main_verdict = meta.main_probe.as_ref().map(|p| p.verdict);
     let main_host = meta.main_probe.as_ref().map(|p| p.host.clone());
 
-    // 1. Исключения: обход ломает домен.
+    // 1. Исключения: обход ломает домен. Уже покрытые исключениями не
+    //    советуем: повторное добавление — нулевой эффект (совет-дубликат).
+    let mut already_excluded: Vec<String> = Vec::new();
     let excludes: Vec<String> = c
         .bypass_breaks
         .iter()
         .map(|(h, _)| h.clone())
         .filter(|h| !is_background_host(h))
         .filter(|h| !is_main_fixed_by_hosts(meta, h))
+        .filter(|h| match bypass_lists::is_excluded(h, &meta.exclude_set) {
+            Some(_) => {
+                already_excluded.push(h.clone());
+                false
+            }
+            None => true,
+        })
         .collect();
     if !excludes.is_empty() {
         summaries.push(format!(
@@ -105,6 +118,23 @@ pub fn decide(meta: &ReportMeta, c: &Classification) -> SiteSolution {
     // Уже покрытые списками домены не советуем: добавление ничего не изменит.
     let (bypass, covered) =
         bypass_lists::split_bypass_candidates(&bypass, &meta.bypass_map);
+    // Домен, покрытый списком ИСКЛЮЧЕНИЙ, в обход звать нельзя: в winws
+    // исключения проверяются раньше include-листов (nfq/hostlist.c,
+    // HostlistCheck_), так что «добавить в general-лист» не изменит ничего —
+    // кнопка «Починить» отчиталась бы об успехе, а сайт остался бы сломан
+    // (кейс api.messenger.yandex.net 27.10.26: домен накрыт записью
+    // yandex.net в дефолтных исключениях). Ложный совет запрещён.
+    let mut blocked_by_exclude: Vec<(String, String)> = Vec::new();
+    let bypass: Vec<String> = bypass
+        .into_iter()
+        .filter(|h| match bypass_lists::is_excluded(h, &meta.exclude_set) {
+            Some(entry) => {
+                blocked_by_exclude.push((h.clone(), entry));
+                false
+            }
+            None => true,
+        })
+        .collect();
     if !bypass.is_empty() {
         summaries.push(format!(
             "добавить в список обхода (general-лист): {}",
@@ -162,14 +192,39 @@ pub fn decide(meta: &ReportMeta, c: &Classification) -> SiteSolution {
         actions.push(SolutionAction::WriteHosts { ip, domain: host });
     }
 
+    // Честные оговорки о доменах, которым решение не досталось из-за
+    // исключений: молчание здесь снова превратилось бы в ложь
+    // («починено», а домен остался сломан).
+    let mut caveats: Vec<String> = Vec::new();
+    if !already_excluded.is_empty() {
+        caveats.push(format!(
+            "уже в исключениях — повторное добавление ничего не изменит: {}",
+            already_excluded.join(", ")
+        ));
+    }
+    if !blocked_by_exclude.is_empty() {
+        caveats.push(format!(
+            "покрыты исключениями обхода — winws к ним трюки не применяет \
+             (исключения сильнее general-листа), в обход звать бессмысленно: {}",
+            blocked_by_exclude
+                .iter()
+                .map(|(h, e)| format!("{} («{}»)", h, e))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
     if actions.is_empty() {
         SiteSolution {
             found: false,
             actions: Vec::new(),
             summary: String::new(),
-            none_reason: Some(no_solution_reason(meta, c, covered)),
+            none_reason: Some(no_solution_reason(meta, c, &covered, &caveats)),
         }
     } else {
+        if !caveats.is_empty() {
+            summaries.push(format!("⚠️ {}", caveats.join("; ")));
+        }
         SiteSolution {
             found: true,
             actions,
@@ -209,7 +264,12 @@ fn verified_hosts_ip(probe: &site_probe::DomainProbe) -> Option<String> {
 }
 
 /// Честная причина «решения нет» — по фактическому вердикту, без выдумок.
-fn no_solution_reason(meta: &ReportMeta, c: &Classification, covered: Vec<String>) -> String {
+fn no_solution_reason(
+    meta: &ReportMeta,
+    c: &Classification,
+    covered: &[String],
+    caveats: &[String],
+) -> String {
     let Some(probe) = &meta.main_probe else {
         return "анализ не смог собрать факты по главному домену".to_string();
     };
@@ -269,6 +329,10 @@ fn no_solution_reason(meta: &ReportMeta, c: &Classification, covered: Vec<String
     if let Some(note) = covered_note {
         reason.push_str("; ");
         reason.push_str(&note);
+    }
+    for caveat in caveats {
+        reason.push_str("; ");
+        reason.push_str(caveat);
     }
     reason
 }
@@ -366,6 +430,7 @@ mod tests {
             dns_fail_sub: Vec::new(),
             block_scan: None,
             bypass_map: std::collections::HashMap::new(),
+            exclude_set: std::collections::HashSet::new(),
         }
     }
 
@@ -656,6 +721,92 @@ mod tests {
         let b = report_block(&none);
         assert!(b.contains("РЕШЕНИЕ НЕ НАЙДЕНО"), "{}", b);
         assert!(b.contains("нужен VPN"), "{}", b);
+    }
+
+    // ---- Кейс api.messenger.yandex.net 27.10.26: домен накрыт исключениями ----
+
+    fn excluded_meta(p: DomainProbe, entries: &[&str]) -> ReportMeta {
+        let mut m = meta(p);
+        m.exclude_set = entries.iter().map(|e| e.to_string()).collect();
+        m
+    }
+
+    /// Домен «заблокирован сам» (нужен обход), но накрыт записью исключений
+    /// (yandex.net накрывает api.messenger.yandex.net): в winws исключения
+    /// проверяются раньше include-листов, так что совет «добавить в
+    /// general-лист» — ложь: кнопка «Починить» отчиталась бы об успехе,
+    /// а сайт остался бы сломан. Регресс на ложь итога.
+    #[test]
+    fn exclude_covered_domain_never_gets_bypass_action() {
+        let mut c = empty_classification();
+        c.need_bypass = vec!["api.messenger.yandex.net".to_string()];
+        let m = excluded_meta(
+            probe(Verdict::IpReset, Some(HttpResult::Rst), None),
+            &["yandex.net"],
+        );
+        let s = decide(&m, &c);
+        assert!(
+            !s.actions
+                .iter()
+                .any(|a| matches!(a, SolutionAction::AddToBypassList { .. })),
+            "покрытый исключениями домен нельзя звать в обход: {:?}",
+            s.actions
+        );
+        assert!(!s.found, "{:?}", s);
+        let reason = s.none_reason.unwrap();
+        assert!(reason.contains("исключени"), "{:?}", reason);
+        assert!(reason.contains("yandex.net"), "{:?}", reason);
+    }
+
+    /// Домен, уже сидящий в исключениях, не получает повторный совет
+    /// «добавить в исключения» — это совет-дубликат (нулевая польза).
+    #[test]
+    fn already_excluded_domain_never_gets_exclude_action() {
+        let mut c = empty_classification();
+        c.bypass_breaks = vec![("example.com".to_string(), "err".to_string())];
+        let m = excluded_meta(
+            probe(Verdict::Open, Some(HttpResult::Ok(200)), Some(IpSource::SystemDns)),
+            &["example.com"],
+        );
+        let s = decide(&m, &c);
+        assert!(
+            !s.actions
+                .iter()
+                .any(|a| matches!(a, SolutionAction::AddToExcludeList { .. })),
+            "повторное «в исключения» — нулевой эффект: {:?}",
+            s.actions
+        );
+        assert!(!s.found, "{:?}", s);
+        assert!(
+            s.none_reason.as_ref().unwrap().contains("уже в исключениях"),
+            "{:?}",
+            s.none_reason
+        );
+    }
+
+    /// Исключённый домен среди нескольких кандидатов: рабочая часть решения
+    /// сохраняется, исключённый — только честной оговоркой в summary.
+    #[test]
+    fn mixed_bypass_candidates_keep_action_and_caveat() {
+        let mut c = empty_classification();
+        c.need_bypass = vec!["blocked.example".to_string(), "api.messenger.yandex.net".to_string()];
+        let m = excluded_meta(
+            probe(Verdict::IpReset, Some(HttpResult::Rst), None),
+            &["yandex.net"],
+        );
+        let s = decide(&m, &c);
+        assert!(s.found, "{:?}", s);
+        assert!(
+            s.actions.iter().any(|a| matches!(a,
+                SolutionAction::AddToBypassList { domains } if domains == &vec!["blocked.example".to_string()])),
+            "рабочий кандидат должен остаться в решении: {:?}",
+            s.actions
+        );
+        assert!(
+            s.summary.contains("исключени") && s.summary.contains("yandex.net"),
+            "оговорка обязана попасть в итог: {}",
+            s.summary
+        );
     }
 
     /// Serde-контракт для фронтенда: тег типа и имена полей в camelCase.

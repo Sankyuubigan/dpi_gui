@@ -32,6 +32,12 @@ pub struct ReportMeta {
     /// иначе они расходились (кейс vercel 27.10.26: отчёт печатал «уже покрыт»,
     /// а итог звал «добавить в обход»).
     pub bypass_map: bypass_lists::BypassMap,
+    /// Эффективные списки ИСКЛЮЧЕНИЙ (юзерский list-exclude.txt + дефолтный
+    /// default-exclude.txt). SSOT: одна загрузка на анализ. Решение (decide)
+    /// не советует покрытые исключениями ни в обход (в winws исключения
+    /// проверяются раньше include-листов — nfq/hostlist.c), ни повторно
+    /// в исключения.
+    pub exclude_set: std::collections::HashSet<String>,
 }
 
 /// Путь к пользовательскому general-листу (для подсказок «добавьте в обход»).
@@ -919,6 +925,7 @@ mod tests {
             dns_fail_sub: Vec::new(),
             block_scan: None,
             bypass_map: std::collections::HashMap::new(),
+            exclude_set: std::collections::HashSet::new(),
         }
     }
 

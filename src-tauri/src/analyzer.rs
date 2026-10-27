@@ -355,43 +355,26 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         bypass_toggled = true;
         let t_off = std::time::Instant::now();
 
-        // Проба #2 без обхода: только домены, сломанные при обходе.
-        let results_off = analyzer_probe::probe_all(&broken_on);
+        // Проба #2 без обхода: только домены, сломанные при обходе. Ретрай
+        // («обрыв засчитывается, только если увиден ДВАЖДЫ» — кейс
+        // eu.aptabase.com) — общий рецепт с массовым анализом (SSOT:
+        // analyzer_probe::probe_off).
         let mut broken_off: HashSet<String> = HashSet::new();
         let mut dns_off: HashSet<String> = HashSet::new();
         let mut dead_off: HashSet<String> = HashSet::new();
-        // Обрыв «без обхода» подтверждаем ретраем: сразу после остановки winws
-        // часть соединений ещё ловит до-зачистку драйвера/стека и обрывается
-        // ложно. Один ложный обрыв уводил домен в «сломан и без обхода» →
-        // «добавьте в обход» вместо «в исключения» (кейс eu.aptabase.com).
-        // Засчитываются только обрывы, увиденные ДВАЖДЫ; Ok или DNS-ошибка на
-        // ретрае — первый обрыв был ложным.
-        let mut to_retry: Vec<String> = Vec::new();
-        for (h, p) in results_off {
-            match p {
-                Probe::Broken(_) | Probe::DeadIp => to_retry.push(h),
-                Probe::Dns => {
+        for (h, off) in analyzer_probe::probe_off(&broken_on) {
+            match off {
+                analyzer_probe::OffProbe::Ok => {}
+                analyzer_probe::OffProbe::Dns => {
                     dns_off.insert(h);
                 }
-                Probe::Ok => {}
-            }
-        }
-        if !to_retry.is_empty() {
-            thread::sleep(Duration::from_secs(1));
-            for (h, p) in analyzer_probe::probe_all(&to_retry) {
-                match p {
-                    Probe::Broken(_) => {
-                        broken_off.insert(h);
-                    }
-                    Probe::Dns => {
-                        dns_off.insert(h);
-                    }
-                    // Без обхода сервер вообще не отвечает: домен недоступен сам
-                    // по себе, ни обход, ни исключения тут не при чём.
-                    Probe::DeadIp => {
-                        dead_off.insert(h);
-                    }
-                    Probe::Ok => {}
+                analyzer_probe::OffProbe::Broken => {
+                    broken_off.insert(h);
+                }
+                // Без обхода сервер вообще не отвечает: домен недоступен сам
+                // по себе, ни обход, ни исключения тут не при чём.
+                analyzer_probe::OffProbe::Dead => {
+                    dead_off.insert(h);
                 }
             }
         }
@@ -522,6 +505,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         dns_fail_sub,
         block_scan,
         bypass_map,
+        exclude_set: bypass_lists::load_exclude_domains(),
     };
 
     let mut report = analyzer_report::build_report(&meta, &classification);

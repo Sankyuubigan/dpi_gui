@@ -7,9 +7,12 @@
 //!
 //! Порядок фаз:
 //! 1. Проба #1 всех доменов (обход в текущем состоянии), параллельно.
-//! 2. Если обход был включён — ОДНО окно без обхода: проба #2 сломанных +
-//!    ретраи, DoH-факты всех доменов (параллельно), диагностика, CIDR-скан
-//!    сломанных. Если обход был выключен — окно не открывается вовсе.
+//! 2. Если обход был включён — ОДНО окно без обхода, и ТОЛЬКО для сломанных:
+//!    проба #2 + ретраи, проверка подмены DNS «не резолвящихся», полная
+//!    диагностика сломанных (DoH-проба, CIDR-скан) — параллельно, поток на
+//!    домен. Остальные домены получают лёгкую пробу ПОСЛЕ восстановления
+//!    обхода: их вердикт («сайт открывается») от чистого окна не зависит.
+//!    Если обход был выключен — окно не открывается вовсе.
 //! 3. Восстановление обхода — гарантировано [`OffWindowGuard`] (даже паника
 //!    вернёт обход).
 //! 4. Отчёт + решение по каждому домену (те же SSOT: build_report, decide),
@@ -39,28 +42,15 @@ use crate::site_probe;
 use crate::site_solution;
 use crate::site_verdict::Verdict;
 
-/// Потолок доменов на один прогон: каждый домен добавляет окну секунды
-/// (DoH + диагностика), потолок держит окно в разумных пределах.
+/// Потолок доменов на один прогон: каждый сломанный домен добавляет окну
+/// секунды (DoH + диагностика), потолок держит окно в разумных пределах.
 pub const MASS_MAX: usize = 20;
-
-/// Чем закончилась проба #2 (без обхода) для домена.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OffResult {
-    /// Проба #2 не требовалась (домен работал с обходом).
-    Untested,
-    /// Без обхода работает — обход его ломает.
-    Ok,
-    /// Без обхода DNS-ошибка.
-    Dns,
-    /// Сломан и без обхода — заблокирован сам.
-    Broken,
-    /// Без обхода сервер не отвечает вообще.
-    Dead,
-}
 
 /// Факты одного домена, собранные в чистом окне.
 struct HostFacts {
-    off: OffResult,
+    /// Итог пробы #2 (без обхода). None — проба не требовалась: домен
+    /// работал уже с обходом, чистый замер ему не нужен.
+    off: Option<analyzer_probe::OffProbe>,
     main_probe: Option<site_probe::DomainProbe>,
     main_dns_sub: Vec<site_probe::DnsSubstitution>,
     dns_fail_sub: Vec<(String, Vec<site_probe::DnsSubstitution>)>,
@@ -143,90 +133,40 @@ pub fn run_mass(app: &AppHandle, requested: Vec<String>) -> Result<String, Strin
         })
         .collect();
 
-    // === Фаза 2: чистое окно — ОДНО на всю пачку ===
-    let mut facts: HashMap<String, HostFacts> = HashMap::new();
-    let mut restore_note: Option<String> = None;
+    // === Фаза 2: чистое окно — ОДНО на всю пачку, и ТОЛЬКО для сломанных ===
     let bypass_toggled = bypass_on;
 
-    // Итоги пробы #2: заполняются только при включённом обходе.
-    let mut off_map: HashMap<String, OffResult> =
-        hosts.iter().map(|h| (h.clone(), OffResult::Untested)).collect();
+    // Лёгкие домены (открывшиеся с обходом / не резолвящиеся): их вердикт
+    // («сайт открывается», «DNS не отвечает») от чистого окна не зависит —
+    // им хватает лёгкой пробы в рабочем режиме после восстановления обхода.
+    // Чистый замер нужен только сломанным, поэтому окно в разы короче.
+    let light_hosts: Vec<String> = hosts
+        .iter()
+        .filter(|h| !broken_on.contains(h))
+        .cloned()
+        .collect();
 
-    if bypass_on {
+    let (facts_broken, mut dns_subs, restore_note) = if bypass_on {
         let off_window = OffWindowGuard::open(app);
         let t_off = Instant::now();
 
-        // Проба #2 сломанных + ретрай (защита от ложных обрывов сразу после
-        // выгрузки драйвера — кейс eu.aptabase.com: засчитывается обрыв,
-        // увиденный ДВАЖДЫ; Ok/Dns на ретрае перебивают первый обрыв).
-        if !broken_on.is_empty() {
-            let first_pass: HashMap<String, Probe> =
-                analyzer_probe::probe_all(&broken_on).into_iter().collect();
-            let to_retry: Vec<String> = first_pass
-                .iter()
-                .filter_map(|(h, p)| match p {
-                    Probe::Broken(_) | Probe::DeadIp => Some(h.clone()),
-                    _ => None,
-                })
-                .collect();
-            thread::sleep(std::time::Duration::from_secs(1));
-            let retry_pass: HashMap<String, Probe> = if to_retry.is_empty() {
-                HashMap::new()
-            } else {
-                analyzer_probe::probe_all(&to_retry).into_iter().collect()
-            };
-            for (h, first) in &first_pass {
-                let final_res = match first {
-                    Probe::Ok => OffResult::Ok,
-                    Probe::Dns => OffResult::Dns,
-                    Probe::Broken(_) | Probe::DeadIp => match retry_pass.get(h) {
-                        Some(Probe::Ok) => OffResult::Ok,
-                        Some(Probe::Dns) => OffResult::Dns,
-                        Some(Probe::DeadIp) => OffResult::Dead,
-                        Some(Probe::Broken(_)) => OffResult::Broken,
-                        // Ретрай не вернулся (поток упал) — честнее считать
-                        // первый обрыв, чем придумывать результат.
-                        None => match first {
-                            Probe::DeadIp => OffResult::Dead,
-                            _ => OffResult::Broken,
-                        },
-                    },
-                };
-                off_map.insert(h.clone(), final_res);
-            }
-        }
+        // Итоги пробы #2 (без обхода): запись есть только у доменов,
+        // сломанных с обходом; отсутствие записи = проба не требовалась.
+        let mut off_map: HashMap<String, analyzer_probe::OffProbe> = HashMap::new();
 
-        // DoH-ответы всех доменов пачки — параллельно (по одному потоку на
-        // домен; последовательный прогон тянул бы дедлайн DoH на каждый).
-        let doh_map = resolve_doh_parallel(&hosts);
+        // Проба #2 сломанных + ретрай — общий рецепт с одиночным анализом
+        // (analyzer_probe::probe_off, SSOT): обрыв засчитывается, только
+        // если увиден ДВАЖДЫ (кейс eu.aptabase.com).
+        off_map.extend(analyzer_probe::probe_off(&broken_on));
 
-        // Диагностика каждого домена — в чистом окне (те же условия, что в
-        // одиночном анализе: подмена DNS и CIDR-скан только для сломанных).
-        for h in &hosts {
-            let main_probe = doh_map
-                .get(h)
-                .map(|a| site_probe::probe_domain_with_doh(h, a));
-            let (main_dns_sub, block_scan) = match &main_probe {
-                Some(p) if p.verdict.site_broken() && p.verdict != Verdict::WwwOnly => (
-                    doh_map
-                        .get(h)
-                        .map(|a| site_probe::dns_substitutions_from(h, a, true))
-                        .unwrap_or_default(),
-                    Some(ip_range_scan::block_diagnose(app, h)),
-                ),
-                _ => (Vec::new(), None),
-            };
-            facts.insert(
-                h.clone(),
-                HostFacts {
-                    off: *off_map.get(h).unwrap_or(&OffResult::Untested),
-                    main_probe,
-                    main_dns_sub,
-                    dns_fail_sub: Vec::new(), // заполним после классификации
-                    block_scan,
-                },
-            );
-        }
+        // Проверка подмены DNS — внутри окна (как в одиночном анализе:
+        // их TCP-пробы не должны идти через активный обход).
+        let dns_fail_hosts = dns_fail_hosts_of(&hosts, &on_map, &off_map);
+        let dns_subs = dns_fail_subs(&dns_fail_hosts);
+
+        // Полная диагностика сломанных — в чистом окне, параллельно
+        // (поток на домен: CIDR-скан одного домена не задерживает остальных).
+        let facts_broken = collect_facts_off(app, &broken_on, &off_map);
 
         app_log(
             app,
@@ -235,64 +175,32 @@ pub fn run_mass(app: &AppHandle, requested: Vec<String>) -> Result<String, Strin
                 t_off.elapsed().as_secs_f64()
             ),
         );
-        restore_note = off_window.close();
+        let restore_note = off_window.close();
+        (facts_broken, dns_subs, restore_note)
     } else {
-        // Обход и так был выключен: чистое окно не нужно, но фактовая
-        // диагностика (DoH/проба домена/CIDR) всё равно нужна.
-        let doh_map = resolve_doh_parallel(&hosts);
-        for h in &hosts {
-            let main_probe = doh_map
-                .get(h)
-                .map(|a| site_probe::probe_domain_with_doh(h, a));
-            let (main_dns_sub, block_scan) = match &main_probe {
-                Some(p) if p.verdict.site_broken() && p.verdict != Verdict::WwwOnly => (
-                    doh_map
-                        .get(h)
-                        .map(|a| site_probe::dns_substitutions_from(h, a, true))
-                        .unwrap_or_default(),
-                    Some(ip_range_scan::block_diagnose(app, h)),
-                ),
-                _ => (Vec::new(), None),
-            };
-            facts.insert(
-                h.clone(),
-                HostFacts {
-                    off: OffResult::Untested,
-                    main_probe,
-                    main_dns_sub,
-                    dns_fail_sub: Vec::new(),
-                    block_scan,
-                },
-            );
-        }
-    }
+        // Обход и так был выключен: чистые условия есть без окна.
+        let facts_broken = collect_facts_off(app, &broken_on, &HashMap::new());
+
+        let dns_fail_hosts = dns_fail_hosts_of(&hosts, &on_map, &HashMap::new());
+        let dns_subs = dns_fail_subs(&dns_fail_hosts);
+        (facts_broken, dns_subs, None)
+    };
+
+    // Лёгкие факты остальных доменов — в рабочем режиме (обход как был).
+    let mut facts = facts_broken;
+    facts.extend(collect_facts_on(&light_hosts));
 
     // === Фаза 3: классификация + отчёт + решение по каждому домену ===
-    // Классификация и подмена DNS для «не резолвящихся» — вне окна: это
-    // чистые вычисления и параллельные DoH-пробы (как dns_fail_sub_parallel
-    // в одиночном анализе, который тоже идёт после восстановления).
+    // Классификация — вне окна: это чистые вычисления над уже собранными
+    // фактами (те же classify_single/classify_dual, что в одиночном анализе).
     let mut found = 0usize;
     let mut none = 0usize;
     let mut failed = 0usize;
 
-    // dns_fail всех доменов — одна параллельная проверка подмены DNS.
-    let dns_fail_hosts: Vec<String> = hosts
-        .iter()
-        .filter(|h| match on_map.get(*h) {
-            Some(Probe::Dns) => true,
-            _ => facts.get(*h).map(|f| f.off == OffResult::Dns).unwrap_or(false),
-        })
-        .cloned()
-        .collect();
-    let mut dns_subs: HashMap<String, Vec<site_probe::DnsSubstitution>> = if dns_fail_hosts
-        .is_empty()
-    {
-        HashMap::new()
-    } else {
-        crate::analyzer::dns_fail_sub_parallel(&dns_fail_hosts, dns_fail_hosts.len())
-            .into_iter()
-            .collect()
-    };
+    // SSOT: карты списков загружаются РАЗ на прогон — решение по каждому
+    // домену потребляет одни данные (как в одиночном анализе).
+    let bypass_map = bypass_lists::load_bypass_domains();
+    let exclude_set = bypass_lists::load_exclude_domains();
 
     for h in &hosts {
         let Some(mut f) = facts.remove(h) else {
@@ -309,14 +217,14 @@ pub fn run_mass(app: &AppHandle, requested: Vec<String>) -> Result<String, Strin
         // Классификация: одна и та же пара проб, что в одиночном анализе.
         let on_probe = on_map.get(h).cloned();
         let mut classification = match f.off {
-            OffResult::Untested => {
+            None => {
                 analyzer_probe::classify_single(on_probe.into_iter().map(|p| (h.clone(), p)).collect(), &HashSet::new())
             }
-            _ => analyzer_probe::classify_dual(
+            Some(off) => analyzer_probe::classify_dual(
                 on_probe.into_iter().map(|p| (h.clone(), p)).collect(),
-                &set_if(f.off == OffResult::Broken, h),
-                &set_if(f.off == OffResult::Dns, h),
-                &set_if(f.off == OffResult::Dead, h),
+                &set_if(off == analyzer_probe::OffProbe::Broken, h),
+                &set_if(off == analyzer_probe::OffProbe::Dns, h),
+                &set_if(off == analyzer_probe::OffProbe::Dead, h),
                 &HashSet::new(),
             ),
         };
@@ -345,7 +253,8 @@ pub fn run_mass(app: &AppHandle, requested: Vec<String>) -> Result<String, Strin
             main_dns_sub: f.main_dns_sub,
             dns_fail_sub: f.dns_fail_sub,
             block_scan: f.block_scan,
-            bypass_map: bypass_lists::load_bypass_domains(),
+            bypass_map: bypass_map.clone(),
+            exclude_set: exclude_set.clone(),
         };
         let mut report = analyzer_report::build_report(&meta, &classification);
         let solution = site_solution::decide(&meta, &classification);
@@ -399,24 +308,114 @@ fn set_if(cond: bool, host: &str) -> HashSet<String> {
     }
 }
 
-/// DoH-ответы всех доменов пачки — параллельно (тот же паттерн, что
-/// dns_fail_sub_parallel: поток на домен, результат собирается в канал).
-fn resolve_doh_parallel(hosts: &[String]) -> HashMap<String, crate::diagnostics_probe::DohAnswers> {
-    let (tx, rx) = mpsc::channel::<(usize, (String, crate::diagnostics_probe::DohAnswers))>();
-    for (idx, h) in hosts.iter().enumerate() {
+/// Домены из «не резолвится»: DNS-ошибка в пробе #1 (с обходом) или в
+/// пробе #2 (без обхода).
+fn dns_fail_hosts_of(
+    hosts: &[String],
+    on_map: &HashMap<String, Probe>,
+    off_map: &HashMap<String, analyzer_probe::OffProbe>,
+) -> Vec<String> {
+    hosts
+        .iter()
+        .filter(|h| match on_map.get(*h) {
+            Some(Probe::Dns) => true,
+            _ => off_map.get(*h) == Some(&analyzer_probe::OffProbe::Dns),
+        })
+        .cloned()
+        .collect()
+}
+
+/// Одна параллельная проверка подмены DNS для всех dns_fail доменов пачки.
+fn dns_fail_subs(
+    dns_fail_hosts: &[String],
+) -> HashMap<String, Vec<site_probe::DnsSubstitution>> {
+    if dns_fail_hosts.is_empty() {
+        HashMap::new()
+    } else {
+        crate::analyzer::dns_fail_sub_parallel(dns_fail_hosts, dns_fail_hosts.len())
+            .into_iter()
+            .collect()
+    }
+}
+
+/// Полная диагностика СЛОМАННЫХ доменов из «чистых» условий (вызывать только
+/// там, где обход гарантированно не работает: в реальном окне после
+/// `OffWindowGuard::open` либо когда обход и так был выключен). Параллельно,
+/// поток на домен: CIDR-скан одного домена не задерживает остальных.
+fn collect_facts_off(
+    app: &AppHandle,
+    broken_on: &[String],
+    off_map: &HashMap<String, analyzer_probe::OffProbe>,
+) -> HashMap<String, HostFacts> {
+    let (tx, rx) = mpsc::channel::<(String, HostFacts)>();
+    for h in broken_on {
+        let off = off_map.get(h).copied();
+        let tx = tx.clone();
+        let h = h.clone();
+        let app = app.clone();
+        thread::spawn(move || {
+            let answers = site_probe::resolve_doh_answers(&h);
+            let main_probe = site_probe::probe_domain_with_doh(&h, &answers);
+            let (main_dns_sub, block_scan) =
+                if main_probe.verdict.site_broken() && main_probe.verdict != Verdict::WwwOnly {
+                    (
+                        site_probe::dns_substitutions_from(&h, &answers, true),
+                        Some(ip_range_scan::block_diagnose(&app, &h)),
+                    )
+                } else {
+                    (Vec::new(), None)
+                };
+            let _ = tx.send((
+                h,
+                HostFacts {
+                    off,
+                    main_probe: Some(main_probe),
+                    main_dns_sub,
+                    dns_fail_sub: Vec::new(), // заполним после классификации
+                    block_scan,
+                },
+            ));
+        });
+    }
+    drop(tx);
+    let mut facts: HashMap<String, HostFacts> = HashMap::new();
+    for _ in 0..broken_on.len() {
+        if let Ok((h, f)) = rx.recv() {
+            facts.insert(h, f);
+        }
+    }
+    facts
+}
+
+/// Лёгкие факты доменов, которым чистый замер не нужен (открывшиеся с
+/// обходом / не резолвящиеся): одна DoH-проба в рабочем режиме — том же,
+/// в котором домен реально используется. Параллельно, после окна.
+fn collect_facts_on(light_hosts: &[String]) -> HashMap<String, HostFacts> {
+    let (tx, rx) = mpsc::channel::<(String, site_probe::DomainProbe)>();
+    for h in light_hosts {
         let tx = tx.clone();
         let h = h.clone();
         thread::spawn(move || {
             let answers = site_probe::resolve_doh_answers(&h);
-            let _ = tx.send((idx, (h, answers)));
+            let probe = site_probe::probe_domain_with_doh(&h, &answers);
+            let _ = tx.send((h, probe));
         });
     }
     drop(tx);
-    let mut out: HashMap<String, crate::diagnostics_probe::DohAnswers> = HashMap::new();
-    for _ in 0..hosts.len() {
-        if let Ok((_, (h, answers))) = rx.recv() {
-            out.insert(h, answers);
+    let mut facts: HashMap<String, HostFacts> = HashMap::new();
+    for _ in 0..light_hosts.len() {
+        if let Ok((h, probe)) = rx.recv() {
+            facts.insert(
+                h,
+                HostFacts {
+                    off: None,
+                    main_probe: Some(probe),
+                    main_dns_sub: Vec::new(),
+                    dns_fail_sub: Vec::new(),
+                    block_scan: None,
+                },
+            );
         }
     }
-    out
+    facts
 }

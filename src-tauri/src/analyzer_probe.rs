@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use std::thread;
 use reqwest::blocking::Client as HttpClient;
@@ -73,6 +73,77 @@ pub fn probe_all(hosts: &[String]) -> Vec<(String, Probe)> {
         }
     }
     results
+}
+
+/// Итог пробы «без обхода» для одного домена — класс без деталей обрыва:
+/// для классификации важен тип результата, а не текст ошибки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffProbe {
+    /// Без обхода работает — обход его ломает.
+    Ok,
+    /// Без обхода DNS-ошибка.
+    Dns,
+    /// Сломан и без обхода — заблокирован сам.
+    Broken,
+    /// Без обхода сервер не отвечает вообще (TCP не устанавливается).
+    Dead,
+}
+
+/// Слияние первой пробы «без обхода» и ретрая по правилу «обрыв
+/// засчитывается, только если увиден ДВАЖДЫ»: Ok или DNS-ошибка на ретрае
+/// перебивают первый обрыв (он был ложным — сразу после остановки winws
+/// часть соединений ещё ловит до-зачистку драйвера/стека, кейс
+/// eu.aptabase.com). Выпавший ретрай (поток пробы умер) — честнее засчитать
+/// первый обрыв, чем переклеивать его в «обход ломает» без чистого
+/// подтверждения.
+fn merge_off_pass(first: Probe, retry: Option<&Probe>) -> OffProbe {
+    match first {
+        Probe::Ok => OffProbe::Ok,
+        Probe::Dns => OffProbe::Dns,
+        Probe::Broken(_) | Probe::DeadIp => match retry {
+            Some(Probe::Ok) => OffProbe::Ok,
+            Some(Probe::Dns) => OffProbe::Dns,
+            Some(Probe::DeadIp) => OffProbe::Dead,
+            Some(Probe::Broken(_)) => OffProbe::Broken,
+            None => match first {
+                Probe::DeadIp => OffProbe::Dead,
+                _ => OffProbe::Broken,
+            },
+        },
+    }
+}
+
+/// Проба «без обхода» для доменов, сломанных при обходе: первая проба,
+/// пауза, ретрай обрывов. Единый источник правды для одиночного (analyzer.rs)
+/// и массового (mass_analysis.rs) анализа — политика «обрыв виден дважды»
+/// живёт здесь в одном экземпляре.
+pub fn probe_off(broken_on: &[String]) -> HashMap<String, OffProbe> {
+    if broken_on.is_empty() {
+        return HashMap::new();
+    }
+    let first_pass: HashMap<String, Probe> = probe_all(broken_on).into_iter().collect();
+    let to_retry: Vec<String> = first_pass
+        .iter()
+        .filter_map(|(h, p)| match p {
+            Probe::Broken(_) | Probe::DeadIp => Some(h.clone()),
+            _ => None,
+        })
+        .collect();
+    // Пауза перед ретраем: соединениям нужно время, чтобы кончилась
+    // до-зачистка драйвера после остановки winws.
+    thread::sleep(Duration::from_secs(1));
+    let retry_pass: HashMap<String, Probe> = if to_retry.is_empty() {
+        HashMap::new()
+    } else {
+        probe_all(&to_retry).into_iter().collect()
+    };
+    first_pass
+        .into_iter()
+        .map(|(h, first)| {
+            let off = merge_off_pass(first, retry_pass.get(&h));
+            (h, off)
+        })
+        .collect()
 }
 
 /// Итоговая классификация домена после сравнения двух проб (обход ВКЛ / ВЫКЛ).
@@ -250,6 +321,42 @@ mod tests {
 
     fn results(v: &[(&str, Probe)]) -> Vec<(String, Probe)> {
         v.iter().map(|(h, p)| (h.to_string(), p.clone())).collect()
+    }
+
+    /// Правило «обрыв засчитывается, только если увиден ДВАЖДЫ» (SSOT
+    /// для одиночного и массового анализа): Ok/Dns на ретрае перебивают
+    /// первый обрыв, выпавший ретрай — первый обрыв остаётся.
+    #[test]
+    fn off_retry_requires_two_sightings() {
+        assert_eq!(merge_off_pass(Probe::Ok, None), OffProbe::Ok);
+        assert_eq!(merge_off_pass(Probe::Dns, None), OffProbe::Dns);
+        // Один обрыв, ретрай открыл — первый был ложным.
+        assert_eq!(
+            merge_off_pass(Probe::Broken("x".into()), Some(&Probe::Ok)),
+            OffProbe::Ok
+        );
+        // DNS-ошибка на ретрае тоже перебивает обрыв.
+        assert_eq!(
+            merge_off_pass(Probe::Broken("x".into()), Some(&Probe::Dns)),
+            OffProbe::Dns
+        );
+        // Обрыв виден дважды — засчитан.
+        assert_eq!(
+            merge_off_pass(Probe::Broken("x".into()), Some(&Probe::Broken("y".into()))),
+            OffProbe::Broken
+        );
+        assert_eq!(
+            merge_off_pass(Probe::DeadIp, Some(&Probe::DeadIp)),
+            OffProbe::Dead
+        );
+        // Обрыв → мёртвый IP на ретрае: класс уточняется в Dead.
+        assert_eq!(
+            merge_off_pass(Probe::Broken("x".into()), Some(&Probe::DeadIp)),
+            OffProbe::Dead
+        );
+        // Ретрай не вернулся (поток умер) — честнее первый обрыв, чем «обход ломает».
+        assert_eq!(merge_off_pass(Probe::Broken("x".into()), None), OffProbe::Broken);
+        assert_eq!(merge_off_pass(Probe::DeadIp, None), OffProbe::Dead);
     }
 
     #[test]
