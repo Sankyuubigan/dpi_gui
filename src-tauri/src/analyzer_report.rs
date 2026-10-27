@@ -297,6 +297,12 @@ fn write_address_table(log: &mut String, probe: &site_probe::DomainProbe) {
         }
     }
 
+    // GeoDNS-арбитраж: расхождение наборов доказано легитимным (site_probe).
+    // Молчание здесь читалось бы как «перехвата не было», а наборы различались.
+    if let Some(note) = &probe.geo_dns_note {
+        log.push_str(&format!("    ℹ️ {}\n", note));
+    }
+
     // Рабочий адрес: тот, через который реально прошла HTTPS-проба
     // (собран в site_probe::pick_working).
     match &probe.working_ip {
@@ -386,6 +392,9 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
     // (не сравнивали — а не «проверили и чисто»).
     let dns_state = match &probe.dns_spoofed {
         Some(_) => "ОБНАРУЖЕНА ПОДМЕНА DNS (см. строку ниже)".to_string(),
+        None if probe.geo_dns_note.is_some() => {
+            "системный DNS и DoH вернули разные наборы адресов — GeoDNS/CDN, подмены нет (обоснование — в адресной таблице)".to_string()
+        }
         None if probe.doh_ips.is_empty() && !probe.doh_failures.is_empty() => {
             "сравнение с DoH невозможно: ни один DoH-сервис не ответил — о подмене судить нельзя".to_string()
         }
@@ -395,6 +404,13 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
     if let Some(spoof) = &probe.dns_spoofed {
         log.push_str(&format!("  ⚠️ UDP:53 перехвачен: {}\n", spoof));
         log.push_str("     адреса из строки «DNS (система)» и из «IP apex» недостоверны\n");
+    }
+    // GeoDNS-арбитраж: расхождение наборов доказано легитимным (site_probe).
+    // Обоснование — рядом со строкой DNS-цензура: адресная таблица печатается
+    // только для вердикта Open, а GeoDNS-домен может быть и не Open (кейс
+    // cdn-zcode.z.ai: GSLB-наборы различаются, а корень CDN отвечает 403).
+    if let Some(note) = &probe.geo_dns_note {
+        log.push_str(&format!("  ℹ️ {}\n", note));
     }
     // Публичные резолверы 1.1.1.1/8.8.8.8 тоже ходят по UDP:53 и тоже могут
     // отличаться от системного — по честности (кейс openrouter: система
@@ -968,6 +984,7 @@ mod tests {
             www_url: Some(www_url.to_string()),
             isp_redirect: None,
             dns_spoofed: None,
+            geo_dns_note: None,
             doh_failures: vec![],
             diagnosis: Some(diagnosis),
         }
@@ -1309,6 +1326,7 @@ let log = build_report(&meta_with(p), &empty_classification());
             www_url: None,
             isp_redirect: None,
             dns_spoofed: Some("системный DNS вернул 188.186.146.207, DoH-резолверы — 104.21.95.93 (пересечений нет)".to_string()),
+            geo_dns_note: None,
             doh_failures: vec!["dns.dns-ai.ru: не ответил за 9 с (таймаут)".to_string()],
             diagnosis: Some(diagnosis),
         };
@@ -1366,6 +1384,7 @@ let log = build_report(&meta_with(p), &empty_classification());
             www_url: None,
             isp_redirect: None,
             dns_spoofed: Some("расхождение доказано".to_string()),
+            geo_dns_note: None,
             doh_failures: vec![],
             diagnosis: Some(diagnosis),
         };
@@ -1467,6 +1486,7 @@ let log = build_report(&meta_with(p), &empty_classification());
             www_url: None,
             isp_redirect: None,
             dns_spoofed: Some("перехват доказан".to_string()),
+            geo_dns_note: None,
             doh_failures: vec![],
             diagnosis: Some(diagnosis),
         });
@@ -1532,6 +1552,7 @@ let log = build_report(&meta_with(p), &empty_classification());
             www_url: None,
             isp_redirect: None,
             dns_spoofed: None,
+            geo_dns_note: None,
             doh_failures: vec![],
             diagnosis: Some(diagnosis),
         });
@@ -1643,6 +1664,7 @@ let log = build_report(&meta_with(p), &empty_classification());
             www_url: None,
             isp_redirect: None,
             dns_spoofed: None,
+            geo_dns_note: None,
             doh_failures: vec![],
             diagnosis: Some(diagnosis),
         };
@@ -1662,5 +1684,63 @@ let log = build_report(&meta_with(p), &empty_classification());
             "{}",
             log
         );
+    }
+
+    /// Кейс cdn-zcode.z.ai (28.10.26): наборы системного DNS и DoH не
+    /// пересекаются, но системный адрес отдал валидный сертификат сайта —
+    /// отчёт обязан назвать это GeoDNS, а не подменой (никаких
+    /// «перехвачен»/«смените DNS» на легитимном расхождении).
+    #[test]
+    fn geo_dns_arbitration_is_not_reported_as_spoofing() {
+        let host = "cdn-zcode.example.com";
+        let verdict = Verdict::GeoBlocked;
+        let diagnosis = crate::site_verdict::explain(
+            verdict,
+            &CauseContext {
+                host,
+                www_url: None,
+                apex_ip: Some("47.246.2.186"),
+                dns_spoofed: false,
+                doh_working_ip: None,
+                same_host_alt_ip_works: false,
+                isp_redirect: None,
+                doh_http80_hint: false,
+                doh_candidates: Vec::new(),
+                probe_fail_note: None,
+            },
+        );
+        let mut dns = DnsInfo::new();
+        dns.system = vec!["47.246.2.186".parse().unwrap()];
+        let probe = DomainProbe {
+            host: host.to_string(),
+            dns,
+            primary_ips: vec!["47.246.2.186".to_string()],
+            doh_ips: vec!["8.6.112.0".to_string()],
+            doh_gateway_ips: Vec::new(),
+            doh_ip_services: vec![(
+                "8.6.112.0".to_string(),
+                vec!["cloudflare-dns.com".to_string()],
+            )],
+            working_ip: Some("47.246.2.186".to_string()),
+            working_ip_source: Some(IpSource::SystemDns),
+            working_http: Some(HttpResult::Forbidden(403)),
+            http_note: "HTTPS через 47.246.2.186: отказ сервера HTTP 403".to_string(),
+            verdict,
+            www_host: Some(format!("www.{}", host)),
+            www_ips: vec![],
+            www_url: None,
+            isp_redirect: None,
+            dns_spoofed: None,
+            geo_dns_note: Some(crate::site_probe::GEO_DNS_NOTE.to_string()),
+            doh_failures: vec![],
+            diagnosis: Some(diagnosis),
+        };
+        let log = build_report(&meta_with(probe), &empty_classification());
+        // В адресной таблице — обоснование GeoDNS, а не пометка перехвата.
+        assert!(log.contains("GeoDNS/CDN-балансировщик"), "{}", log);
+        assert!(!log.contains("UDP:53 перехвачен"), "{}", log);
+        assert!(!log.contains("ОБНАРУЖЕНА ПОДМЕНА"), "{}", log);
+        // Строка DNS-цензуры честно различает «расхождений нет» и GeoDNS.
+        assert!(log.contains("GeoDNS/CDN, подмены нет"), "{}", log);
     }
 }

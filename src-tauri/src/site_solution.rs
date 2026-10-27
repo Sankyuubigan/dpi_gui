@@ -412,6 +412,7 @@ mod tests {
             www_url: None,
             isp_redirect: None,
             dns_spoofed: matches!(verdict, Verdict::DnsBlocked).then(|| "расхождение".to_string()),
+            geo_dns_note: None,
             doh_failures: vec![],
             diagnosis: Some(diagnosis(verdict, "example.com", Some("5.6.7.8"))),
         }

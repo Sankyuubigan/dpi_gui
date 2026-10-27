@@ -72,6 +72,12 @@ pub struct DomainProbe {
     /// `None` означает «перехват не обнаружен» либо «DoH недоступен и
     /// сравнивать не с чем» — в обоих случаях отчёт обязан это оговорить.
     pub dns_spoofed: Option<String>,
+    /// GeoDNS-арбитраж (кейс cdn-zcode.z.ai 28.10.26): наборы системного DNS
+    /// и DoH не пересекаются, но системный адрес доказанно отдаёт валидный
+    /// сертификат сайта — расхождение легитимно (CDN-балансировщик отдаёт
+    /// каждому резолверу свой набор эджей), НЕ подмена. Текст обоснования
+    /// для отчёта; None = арбитраж не срабатывал.
+    pub geo_dns_note: Option<String>,
     /// Почему не сработал хотя бы один DoH-сервис (пусто — все ответили).
     pub doh_failures: Vec<String>,
     /// Разбор причины и подсказки.
@@ -172,6 +178,98 @@ fn detect_udp_spoofing(dns: &DnsInfo, doh_ips: &[IpAddr]) -> Option<String> {
         ));
     }
     None
+}
+
+/// Заметка об арбитраже GeoDNS — единый текст для отчёта (SSOT).
+pub(crate) const GEO_DNS_NOTE: &str = "системный DNS и DoH вернули разные наборы адресов, но адрес из системного DNS отвечает валидным сертификатом сайта: это GeoDNS/CDN-балансировщик (каждому резолверу — свой набор эджей), а не подмена DNS";
+
+/// Сколько системных адресов параллельно проверяем сертификатом в арбитраже.
+const GEO_DNS_PROBE_MAX: usize = 4;
+
+/// HTTP-результат, возможный ТОЛЬКО поверх завершённого TLS-рукопожатия с
+/// валидным сертификатом домена: `http_via_ip` строит reqwest-клиент без
+/// `danger_accept_invalid_certs`, ошибки сертификата уходят в `BadCert`.
+/// Цензор не может предъявить валидный сертификат чужого домена — такой ответ
+/// доказывает, что адрес принадлежит настоящему эджу сайта.
+fn served_over_valid_cert(r: &HttpResult) -> bool {
+    matches!(
+        r,
+        HttpResult::Ok(_)
+            | HttpResult::Forbidden(_)
+            | HttpResult::BlockPage
+            | HttpResult::ServiceRestrict
+    )
+}
+
+/// Параллельная проверка: отвечает ли хотя бы один адрес из системного DNS
+/// валидным сертификатом домена. Нужна, когда первая проба системного канала
+/// неубедительна (RST/таймаут/BadCert на первом эдже — остальные могут жить).
+fn system_ips_serve_valid_cert(host: &str, ips: &[String]) -> bool {
+    use std::sync::mpsc;
+    let candidates: Vec<IpAddr> = ips
+        .iter()
+        .filter_map(|s| s.parse::<IpAddr>().ok())
+        .filter(|a| !is_stub_ip(a))
+        .take(GEO_DNS_PROBE_MAX)
+        .collect();
+    let (tx, rx) = mpsc::channel::<bool>();
+    let mut spawned = 0usize;
+    for ip in candidates {
+        let tx = tx.clone();
+        let host = host.to_string();
+        std::thread::spawn(move || {
+            let _ = tx.send(served_over_valid_cert(&http_via_ip(&host, ip, 443)));
+        });
+        spawned += 1;
+    }
+    drop(tx);
+    for _ in 0..spawned {
+        match rx.recv() {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => break,
+        }
+    }
+    false
+}
+
+/// Арбитраж «пересечений нет» (вызов в `probe_domain_with_doh`): возвращает
+/// (dns_spoofed после арбитража, заметка для отчёта). Чистая обёртка над
+/// [`arbitrate_geo_dns_with`] — та существует ради юнит-тестов без сети.
+fn arbitrate_geo_dns(
+    host: &str,
+    spoofed: Option<String>,
+    sys: &ProbeOutcome,
+    primary_ips: &[String],
+) -> (Option<String>, Option<String>) {
+    arbitrate_geo_dns_with(host, spoofed, sys, primary_ips, &system_ips_serve_valid_cert)
+}
+
+/// Вариант с инъекцией альтернативной пробы — под юнит-тесты без сети.
+///
+/// Расхождение наборов системного DNS и DoH само по себе — ещё не подмена.
+/// GeoDNS/GSLB-балансировщики CDN (кейс cdn-zcode.z.ai 28.10.26: CNAME
+/// `*.w.cdngslb.com`) отдают каждому резолверу СВОЙ набор эджей, и пустое
+/// пересечение законно. Доказательство «это не цензор» — валидный сертификат
+/// сайта по системному адресу; без него расхождение остаётся подозрением.
+fn arbitrate_geo_dns_with(
+    host: &str,
+    spoofed: Option<String>,
+    sys: &ProbeOutcome,
+    primary_ips: &[String],
+    alt_probe: &dyn Fn(&str, &[String]) -> bool,
+) -> (Option<String>, Option<String>) {
+    let Some(reason) = spoofed else {
+        return (None, None);
+    };
+    // HTTP-ответ по системному адресу уже получен — сертификат там валиден.
+    if sys.http.as_ref().is_some_and(|r| served_over_valid_cert(r)) {
+        return (None, Some(GEO_DNS_NOTE.to_string()));
+    }
+    if alt_probe(host, primary_ips) {
+        return (None, Some(GEO_DNS_NOTE.to_string()));
+    }
+    (Some(reason), None)
 }
 
 /// Хост редиректа, на который провайдер подменил ответ вместо ответа сервера.
@@ -469,7 +567,7 @@ pub fn probe_domain_with_doh(host: &str, doh_answers: &DohAnswers) -> DomainProb
     let doh_addr_ips = doh_answers.all_ips();
     let doh_failures = doh_answers.failures();
 
-    let dns_spoofed = detect_udp_spoofing(&dns, &doh_addr_ips);
+    let spoofed_raw = detect_udp_spoofing(&dns, &doh_addr_ips);
 
     let is_www = host.starts_with("www.");
     let www_host = if is_www {
@@ -500,6 +598,13 @@ pub fn probe_domain_with_doh(host: &str, doh_answers: &DohAnswers) -> DomainProb
     } else {
         probe_host_at(host, &doh_ips)
     };
+
+    // GeoDNS-арбитраж «пересечений нет» (кейс cdn-zcode.z.ai 28.10.26):
+    // GeoDNS/GSLB-балансировщики CDN отдают каждому резолверу свой набор
+    // эджей, и пустое пересечение законно. Подмена остаётся вердиктом только
+    // когда ни один системный адрес не отдал валидный сертификат сайта.
+    let (dns_spoofed, geo_dns_note) =
+        arbitrate_geo_dns(host, spoofed_raw, &sys_probe, &primary_ips);
 
     // Пробуем вариант с `www.`: у сайта может быть рабочее имя только с этим
     // префиксом, а apex без него не отвечает.
@@ -621,6 +726,7 @@ pub fn probe_domain_with_doh(host: &str, doh_answers: &DohAnswers) -> DomainProb
         www_url,
         isp_redirect,
         dns_spoofed,
+        geo_dns_note,
         doh_failures,
         diagnosis: Some(diagnosis),
     }
@@ -1013,6 +1119,7 @@ mod tests {
             www_url: None,
             isp_redirect: None,
             dns_spoofed: Some("системный DNS вернул 188.186.154.88, DoH-резолверы — 104.21.95.93 (пересечений нет)".to_string()),
+            geo_dns_note: None,
             doh_failures: vec!["dns.dns-ai.ru: HTTP 505".to_string()],
             diagnosis: None,
         };
@@ -1046,10 +1153,102 @@ mod tests {
             www_url: None,
             isp_redirect: None,
             dns_spoofed: Some("расхождение".to_string()),
+            geo_dns_note: None,
             doh_failures: vec![],
             diagnosis: None,
         };
         assert!(hosts_entries(&probe).is_empty());
+    }
+
+    /// GeoDNS-арбитраж (кейс cdn-zcode.z.ai 28.10.26): расхождение наборов
+    /// системного DNS и DoH при валидном сертификате на системном адресе —
+    /// НЕ подмена. Все ветки — на синтетических данных, без сети.
+    #[test]
+    fn geo_dns_arbitration_requires_valid_cert_proof() {
+        let reason = Some(
+            "системный DNS вернул 1.1.1.1, DoH-резолверы — 2.2.2.2 (пересечений нет)".to_string(),
+        );
+        let no_alt = |_host: &str, _ips: &[String]| false;
+
+        // Расхождения нет — арбитраж ничего не меняет и альтернативу не пробует.
+        let called = std::cell::Cell::new(false);
+        let (spoofed, note) = arbitrate_geo_dns_with(
+            "cdn.example.com",
+            None,
+            &ProbeOutcome::dead("нет пробы".to_string()),
+            &[],
+            &|_, _| {
+                called.set(true);
+                true
+            },
+        );
+        assert!(spoofed.is_none() && note.is_none() && !called.get());
+
+        // Системный канал уже ответил поверх валидного сертификата (голый 403
+        // CDN-эджа): GeoDNS доказан, альтернативная проба не требуется.
+        let sys = ProbeOutcome {
+            tcp_ok: true,
+            ip: Some("47.246.2.186".to_string()),
+            http: Some(HttpResult::Forbidden(403)),
+            note: String::new(),
+            any_reset: false,
+        };
+        let called = std::cell::Cell::new(false);
+        let (spoofed, note) = arbitrate_geo_dns_with(
+            "cdn.example.com",
+            reason.clone(),
+            &sys,
+            &["47.246.2.186".to_string()],
+            &|_, _| {
+                called.set(true);
+                false
+            },
+        );
+        assert!(!called.get(), "сертификат уже доказан первой пробой");
+        assert!(spoofed.is_none());
+        assert!(note.as_deref().unwrap().contains("GeoDNS"), "{}", note.unwrap());
+
+        // Первая проба неубедительна (RST на первом эдже), но другой системный
+        // адрес отдал валидный сертификат — расхождение легитимно.
+        let sys_rst = ProbeOutcome {
+            tcp_ok: true,
+            ip: Some("43.109.100.192".to_string()),
+            http: Some(HttpResult::Rst),
+            note: String::new(),
+            any_reset: true,
+        };
+        let (spoofed, note) = arbitrate_geo_dns_with(
+            "cdn.example.com",
+            reason.clone(),
+            &sys_rst,
+            &["43.109.100.192".to_string(), "47.246.2.186".to_string()],
+            &|_, _| true,
+        );
+        assert!(spoofed.is_none() && note.is_some());
+
+        // Доказательств GeoDNS нет (ни один системный адрес не отвечает
+        // валидным сертификатом) — расхождение остаётся подозрением на подмену.
+        let (spoofed, note) =
+            arbitrate_geo_dns_with("poisoned.example.com", reason, &sys_rst, &["6.6.6.6".to_string()], &no_alt);
+        assert!(spoofed.is_some() && note.is_none());
+    }
+
+    /// Ответ, возможный только поверх валидного сертификата, и ответы,
+    /// сертификат не доказывающие (классификация reqwest-ошибок — SSOT
+    /// classify_err_text: сертификатные уходят в BadCert).
+    #[test]
+    fn served_over_valid_cert_truth_table() {
+        assert!(served_over_valid_cert(&HttpResult::Ok(200)));
+        assert!(served_over_valid_cert(&HttpResult::Ok(302)));
+        assert!(served_over_valid_cert(&HttpResult::Forbidden(403)));
+        assert!(served_over_valid_cert(&HttpResult::BlockPage));
+        assert!(served_over_valid_cert(&HttpResult::ServiceRestrict));
+        assert!(!served_over_valid_cert(&HttpResult::BadCert));
+        assert!(!served_over_valid_cert(&HttpResult::Rst));
+        assert!(!served_over_valid_cert(&HttpResult::Tls));
+        assert!(!served_over_valid_cert(&HttpResult::Timeout));
+        assert!(!served_over_valid_cert(&HttpResult::Dns));
+        assert!(!served_over_valid_cert(&HttpResult::Other("x".into())));
     }
 
     #[test]
@@ -1057,6 +1256,35 @@ mod tests {
     fn live_probe_google() {
         let p = probe_domain("google.com");
         assert_eq!(p.verdict, Verdict::Open, "probe: {:?}", p);
+    }
+
+    /// Кейс cdn-zcode.z.ai (28.10.26): GeoDNS/GSLB-домен Alibaba CDN. Системный
+    /// DNS и DoH отдают РАЗНЫЕ наборы эджей, но все легитимные (валидный
+    /// сертификат *.z.ai). Вердикт не имеет права быть DnsBlocked: расхождение
+    /// наборов на GSLB — норма, а не подмена. Запуск:
+    /// `cargo test live_probe_geodns -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "requires network"]
+    fn live_probe_geodns_cdn_zcode() {
+        let p = probe_domain("cdn-zcode.z.ai");
+        println!("verdict: {:?}", p.verdict);
+        println!("system ips: {:?}", p.primary_ips);
+        println!("doh ips: {:?}", p.doh_ips);
+        println!("spoofed: {:?}", p.dns_spoofed);
+        println!("geo note: {}", p.geo_dns_note.is_some());
+        assert!(
+            !matches!(p.verdict, Verdict::DnsBlocked),
+            "GeoDNS-домен нельзя звать подменой DNS: {:?}",
+            p
+        );
+        // Если наборы и сейчас не пересекаются, арбитраж обязан оставить
+        // обоснование GeoDNS и НЕ помечать системный DNS подменённым.
+        let doh: std::collections::HashSet<&String> = p.doh_ips.iter().collect();
+        let sys: std::collections::HashSet<&String> = p.primary_ips.iter().collect();
+        if !doh.is_empty() && !sys.is_empty() && doh.is_disjoint(&sys) {
+            assert!(p.geo_dns_note.is_some(), "расхождение без арбитража: {:?}", p);
+            assert!(p.dns_spoofed.is_none(), "{:?}", p);
+        }
     }
 
     /// Проверка на реальной сети: домен из известного случая отравления DNS.
