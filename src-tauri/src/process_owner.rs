@@ -1,9 +1,13 @@
-//! Владелец TCP-сокета (PRP ревизия 4 §7.6, ШАГ E «кто стучался»).
+//! Владелец сокета (PRP ревизия 4 §7.6, ШАГ E «кто стучался»).
 //!
 //! Отвечает на вопрос юзера «что за процесс пытался делать запрос и обломался»:
 //! детектор (`domain_monitor`) кэширует владельца на ИСХОДЯЩЕМ пакете живого
-//! TCP-соединения (в этот момент row ещё есть в таблице Windows), а не на RST —
+//! соединения (в этот момент row ещё есть в таблице Windows), а не на RST —
 //! к моменту RST стек уже удалил соединение из таблицы.
+//!
+//! Две таблицы: TCP-сокеты ищутся по 4-tuple (локальный порт + удалённая пара),
+//! UDP-сокеты (QUIC-ветка детектора) — только по локальному порту: у UDP нет
+//! удалённой пары, и до 27.10.26 QUIC-события честно писали «процесс не определён».
 //!
 //! Состояние на 21.10.26: ONLY IPv4 — детектор v1 пропускает IPv6/loopback,
 //! поэтому v6-таблица не сканируется. Имя процесса — через уже имеющуюся
@@ -13,7 +17,8 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+    GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCPTABLE_OWNER_PID, MIB_UDPTABLE_OWNER_PID,
+    TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
 };
 use windows_sys::Win32::Networking::WinSock::AF_INET;
 
@@ -85,31 +90,92 @@ pub fn find_pid(local_port: u16, remote_ip: IpAddr, remote_port: u16) -> Option<
     None
 }
 
-/// Имя процесса (executable), владеющего соединением; пустое имя/не найдено → None.
-/// Имя и полный путь exe владельца TCP-сокета (`None` = процесс не найден,
-/// имя пустое). Путь — `Process::exe()` из sysinfo (образ, запустивший
-/// процесс). Пустой путь возвращается как `Some((name, ""))` — отдельная
-/// честная форма «имя есть, путь не отдала СВ».
-pub fn owner_name_and_exe(
-    local_port: u16,
-    remote_ip: IpAddr,
-    remote_port: u16,
-) -> Option<(String, String)> {
-    let pid = find_pid(local_port, remote_ip, remote_port)?;
+/// PID владельца UDP-сокета по локальному порту или None (нет данных / не найдено).
+/// У UDP-сокета нет удалённой пары — совпадение только по порту. При нескольких
+/// владельцах одного порта (SO_REUSEADDR) берётся первый: для эфемерного
+/// QUIC-порта браузера владелец один.
+pub fn find_udp_pid(local_port: u16) -> Option<u32> {
+    unsafe {
+        // 1-й проход: запрашиваем размер таблицы.
+        let mut size: u32 = 0;
+        let status = GetExtendedUdpTable(
+            std::ptr::null_mut(),
+            &mut size,
+            0,
+            (AF_INET) as u32,
+            UDP_TABLE_OWNER_PID,
+            0,
+        );
+        if status != ERROR_INSUFFICIENT_BUFFER || size == 0 {
+            return None;
+        }
+
+        // 2-й проход: читаем таблицу целиком.
+        let mut buf = vec![0u8; size as usize];
+        let table = buf.as_mut_ptr() as *mut MIB_UDPTABLE_OWNER_PID;
+        let status = GetExtendedUdpTable(
+            table as *mut _,
+            &mut size,
+            0,
+            (AF_INET) as u32,
+            UDP_TABLE_OWNER_PID,
+            0,
+        );
+        if status != 0 {
+            return None;
+        }
+
+        // Порты — та же ловушка, что у TCP: network byte order в младших
+        // 2 байтах DWORD.
+        let count = (*table).dwNumEntries as usize;
+        let rows = std::slice::from_raw_parts((*table).table.as_ptr(), count);
+        for row in rows {
+            if row.dwOwningPid == 0 {
+                continue; // безвладелецные служебные строки — не процессы пользователей
+            }
+            if u16::from_be((row.dwLocalPort & 0x0000FFFF) as u16) == local_port {
+                return Some(row.dwOwningPid);
+            }
+        }
+    }
+    None
+}
+
+/// Имя (executable) и полный путь exe по PID; None = процесс не найден / имя пустое.
+fn pid_name_and_exe(pid: u32) -> Option<(String, String)> {
     let pid = Pid::from_u32(pid);
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
     let proc = sys.process(pid)?;
     let name = proc.name().to_string_lossy().trim().to_string();
     if name.is_empty() {
-        None
-    } else {
-        let exe = proc
-            .exe()
-            .map(|p| p.to_string_lossy().trim().to_string())
-            .unwrap_or_default();
-        Some((name, exe))
+        return None;
     }
+    let exe = proc
+        .exe()
+        .map(|p| p.to_string_lossy().trim().to_string())
+        .unwrap_or_default();
+    Some((name, exe))
+}
+
+/// Имя процесса (executable), владеющего TCP-соединением; пустое имя/не найдено → None.
+/// Путь — `Process::exe()` из sysinfo (образ, запустивший процесс). Пустой путь
+/// возвращается как `Some((name, ""))` — отдельная честная форма «имя есть,
+/// путь не отдала СВ».
+pub fn owner_name_and_exe(
+    local_port: u16,
+    remote_ip: IpAddr,
+    remote_port: u16,
+) -> Option<(String, String)> {
+    let pid = find_pid(local_port, remote_ip, remote_port)?;
+    pid_name_and_exe(pid)
+}
+
+/// Имя процесса, владеющего UDP-сокетом (для QUIC-событий домен-детектора).
+/// Форма результата та же, что у [`owner_name_and_exe`].
+pub fn udp_owner_name_and_exe(local_port: u16) -> Option<(String, String)> {
+    let pid = find_udp_pid(local_port)?;
+    pid_name_and_exe(pid)
 }
 
 // ---------------------------------------------------------------------------
@@ -157,5 +223,21 @@ mod tests {
 
         drop(stream);
         accept_thread.join().expect("keepalive поток");
+    }
+
+    #[test]
+    fn udp_owner_of_self_socket_is_self() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind temp-порт");
+        let port = sock.local_addr().expect("local_addr").port();
+
+        // Небольшой сон: row UDP-таблицы обязана уже быть.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let (name, _exe) = udp_owner_name_and_exe(port)
+            .expect("владелец собственного UDP-сокета обязан найтись");
+        assert!(!name.trim().is_empty(), "имя процесса не пустое: {name}");
+
+        // Сокет держим живым до конца проверки.
+        drop(sock);
     }
 }

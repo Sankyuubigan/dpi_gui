@@ -9,6 +9,11 @@
 //!   (ретрансмиссии), порог ровно как у winws (default retrans-threshold = 3);
 //!   третий сигнал — QUIC (UDP:443): повторные Initial при полном молчании
 //!   сервера (расшифровка Initial — модуль quic_sniff, RFC 9001 Initial Secrets);
+//! - пакеты, совпадающие с фейками активной стратегии winws (модуль
+//!   fake_payloads), отсекаются ДО коллекторов и счётчиков: подставные копии
+//!   (8–11 на каждый подменяемый пакет) без фильтра считались ретрансмиссиями/
+//!   QUIC Initial, а SNI лочился на SNI ИЗ ФАЙЛА-ФЕЙКА (onetrust/google) —
+//!   фантомы в «Ошибках сети» (инцидент 27.10.26);
 //! - НИКАКИХ записей на диск: события только в память процесса и в UI;
 //! - списки пользователя НИКАК не затрагиваются (детектор списки даже не читает);
 //! - ошибки не молчат: честная строка в лог с кодом ошибки.
@@ -23,6 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
 use crate::events::app_log;
+use crate::fake_payloads::FakeBlobs;
 use crate::list_index::ListIndex;
 use crate::quic_sniff::{
     classify_quic, parse_initial_payload, parse_udp_packet, ParsedInitial, QuicCryptoBuffer,
@@ -652,6 +658,8 @@ struct WorkerCtx {
     rate: RateLimiter,
     /// Принадлежность домена спискам (ШАГ D, PRP §7.5).
     lists: ListIndex,
+    /// Байты фейков активной стратегии winws (инцидент 27.10.26).
+    fakes: Arc<FakeBlobs>,
     no_domain_count: u64,
     /// Честное предупреждение не молчит, но и не шумит: один лог за сессию.
     ipv6_warned: bool,
@@ -699,6 +707,12 @@ fn handle_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], addr: &WinD
     // Исходящий (клиент → сервер): собираем ClientHello и считаем ретрансы.
     if outbound {
         if t.payload.is_empty() {
+            return;
+        }
+        if ctx.fakes.is_fake_payload(t.payload) {
+            // Подставной пакет winws — детектору не сигнал: фейки идут по 8–11
+            // копий с SNI из файла-фейка и без фильтра считались ретрансмиссиями
+            // и лочили SNI-коллектор (фантомы onetrust/google, инцидент 27.10.26).
             return;
         }
         let state = ctx.tracker.get_or_create(key.clone());
@@ -773,6 +787,13 @@ fn handle_udp_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], outboun
         return;
     }
 
+    // QUIC-фейк winws (11 копий Initial с DCID и SNI из файла-фейка) — не сигнал:
+    // без фильтра каждый подменяемый флоу давал фантомное
+    // «QUIC: сервер не отвечает на Initial» (инцидент 27.10.26).
+    if ctx.fakes.is_fake_payload(u.payload) {
+        return;
+    }
+
     let Some(kind) = classify_quic(u.payload) else { return };
     if kind != QuicPacketKind::Initial {
         return; // SNI живёт только в Initial (RFC 9001 §4.4)
@@ -792,8 +813,10 @@ fn handle_udp_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], outboun
 
     let key = QuicFlowKey { remote_ip, remote_port, local_port, dcid: parsed.dcid.clone() };
     // Один lookup на флоу (кэш в состоянии) — так же, как в TCP-ветке ШАГа E.
+    // UDP-сокет не имеет удалённой пары: владелец ищется по локальному порту
+    // в UDP-таблице (до 27.10.26 QUIC-события писали «процесс не определён»).
     let (owner_name, owner_path) =
-        crate::process_owner::owner_name_and_exe(local_port, remote_ip, remote_port)
+        crate::process_owner::udp_owner_name_and_exe(local_port)
             .map(|(n, e)| (Some(n), if e.is_empty() { None } else { Some(e) }))
             .unwrap_or((None, None));
     let state = ctx.quic.flows.entry(key).or_insert_with(|| QuicFlowState {
@@ -871,7 +894,7 @@ unsafe impl Send for MonitorState {}
 
 static MONITOR: Mutex<Option<MonitorState>> = Mutex::new(None);
 
-pub fn start_domain_monitor(app: AppHandle) -> Result<(), String> {
+pub fn start_domain_monitor(app: AppHandle, winws_args: &[String]) -> Result<(), String> {
     let mut guard = MONITOR.lock().expect("MONITOR mutex poisoned");
     if let Some(state) = guard.as_ref() {
         if !state.thread.is_finished() {
@@ -884,11 +907,37 @@ pub fn start_domain_monitor(app: AppHandle) -> Result<(), String> {
         return Ok(()); // режим off — тихо и молча ничего не делаем (PRP)
     }
 
+    // Фильтр фейков (инцидент 27.10.26): байты фейков активной стратегии —
+    // из аргументов запуска winws (SSOT: те же final_args, что у процесса;
+    // монитор живёт ровно между stop_winws и spawn_winws, рассинхрона нет).
+    let (fakes, fake_warnings) = FakeBlobs::from_winws_args(winws_args);
+    if fakes.is_empty() {
+        app_log(
+            &app,
+            "[Автомонитор] фейк-файлы в аргументах winws не найдены — фильтр фейков не активен".to_string(),
+        );
+    } else {
+        app_log(
+            &app,
+            format!(
+                "[Автомонитор] фильтр фейков winws: {} блоб(ов), {} байт — {}",
+                fakes.len(),
+                fakes.total_len(),
+                fakes.source_names().join(", ")
+            ),
+        );
+    }
+    // Ошибки не молчат (core §2.2): каждый непрочитанный фейк — видимое предупреждение.
+    for warn in &fake_warnings {
+        app_log(&app, format!("[Автомонитор] фейк: {}", warn));
+    }
+    let fakes = Arc::new(fakes);
+
     let handle = open_sniff_handle(sniff_filter())
         .map_err(|e| format!("[Автомонитор] не запущен: {}", e))?;
     let raw = handle.raw();
 
-    // ШАГ D (PRP §7.5): индекс списков грузится ОДНОРАЗОВО при старте детектора;
+    // ШАГ D (PRP §7.5): индекс списков грузится ОДНАЗОВО при старте детектора;
     // правки списков юзер подхватывает рестартом обхода (тот же ритм, что у winws).
     let lists_dir = crate::config::get_app_dir().join("lists");
     let (lists, warnings) = ListIndex::load(&lists_dir);
@@ -902,7 +951,7 @@ pub fn start_domain_monitor(app: AppHandle) -> Result<(), String> {
     let thread = std::thread::Builder::new()
         .name("domain-monitor".into())
         .spawn(move || {
-            worker(app_thread, handle, stop_thread, lists);
+            worker(app_thread, handle, stop_thread, lists, fakes);
         })
         .map_err(|e| format!("[Автомонитор] старт потока не удался: {}", e))?;
 
@@ -928,13 +977,20 @@ pub fn stop_domain_monitor() {
 // ---------------------------------------------------------------------------
 // Рабочий цикл (Recv → parse → события).
 // ---------------------------------------------------------------------------
-fn worker(app: AppHandle, handle: SniffHandle, stop: Arc<AtomicBool>, lists: ListIndex) {
+fn worker(
+    app: AppHandle,
+    handle: SniffHandle,
+    stop: Arc<AtomicBool>,
+    lists: ListIndex,
+    fakes: Arc<FakeBlobs>,
+) {
     let mut ctx = WorkerCtx {
         tracker: FlowTracker::new(),
         quic: QuicTracker::new(),
         dedup: Dedupe::new(),
         rate: RateLimiter::new(),
         lists,
+        fakes,
         no_domain_count: 0,
         ipv6_warned: false,
         packets_since_maintain: 0,

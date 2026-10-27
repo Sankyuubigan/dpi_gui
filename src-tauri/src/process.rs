@@ -113,7 +113,7 @@ fn spawn_winws(app: &AppHandle, final_args: Vec<String>, quiet: bool) -> Result<
     // используется тестами профилей и диагностикой, чтобы не плодить ложные детекции.
     // Ошибка Err уже несёт свой префикс «[Автомонитор]» — не дублируем его в логе.
     if !quiet {
-        if let Err(e) = crate::domain_monitor::start_domain_monitor(app.clone()) {
+        if let Err(e) = crate::domain_monitor::start_domain_monitor(app.clone(), &final_args) {
             let _ = app.emit("log", e);
         }
     }

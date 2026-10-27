@@ -25,6 +25,7 @@ mod hosts;
 mod events;
 mod win_divert;
 mod domain_monitor;
+mod fake_payloads;
 mod tls_sni;
 mod quic_sniff;
 mod list_index;
