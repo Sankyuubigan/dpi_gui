@@ -125,7 +125,7 @@ fn extract_value(s: &str, key: &str) -> Option<String> {
 
 /// Итог анализа: текстовый отчёт + структурированное решение
 /// (для кнопки «Починить сайт» на фронтенде).
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DomainAnalysisOutcome {
     pub report: String,
@@ -349,9 +349,9 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
     // и при включённом профиле, который ломает сайт, отчёт получал ложные
     // «IP не отвечает / фильтрация маршрута» вместо правды (кейс sostav.ru).
     let (classification, main_probe, main_dns_sub, dns_fail_sub, block_scan) = if bypass_on {
-        let saved = bypass_toggle::capture_active();
-
-        bypass_toggle::stop_bypass();
+        // Окно без обхода с гарантией восстановления: паника внутри ветки
+        // больше не оставляет обход выключенным (OffWindowGuard::Drop).
+        let off_window = bypass_toggle::OffWindowGuard::open(app);
         bypass_toggled = true;
         let t_off = std::time::Instant::now();
 
@@ -470,7 +470,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
             t_off.elapsed(),
         ));
 
-        restore_note = bypass_toggle::restore_bypass(app, &saved);
+        restore_note = off_window.close();
 
         (classification, Some(main_probe), main_dns_sub, dns_fail_sub, block_scan)
     } else {
@@ -538,7 +538,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
 /// Подмена DNS для доменов из списка «не резолвится» (до `limit`): проверка
 /// параллельна — последовательный `.map` тянул дедлайн DoH (~9 с) на каждый
 /// домен (до 45 с на пятерку). Порядок результатов — исходный.
-fn dns_fail_sub_parallel(
+pub(crate) fn dns_fail_sub_parallel(
     hosts: &[String],
     limit: usize,
 ) -> Vec<(String, Vec<site_probe::DnsSubstitution>)> {

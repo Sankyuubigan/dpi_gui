@@ -40,6 +40,19 @@ export interface SiteSolution {
   noneReason: string | null;
 }
 
+/// Статус анализа домена из «Ошибок сети» (события analysis_progress бэкенда).
+/// Ключ карты — домен. Данные для бейджа в списке ошибок и кнопки «Починить».
+export interface AnalysisStatus {
+  /// "queued" | "running" | "done" | "failed"
+  state: "queued" | "running" | "done" | "failed";
+  found: boolean;
+  summary: string;
+  noneReason: string | null;
+  error: string | null;
+  /// Полное решение при state === "done" && found — данные для «Починить».
+  solution: SiteSolution | null;
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState("control");
   const [isRunning, setIsRunning] = useState(false);
@@ -57,6 +70,10 @@ export default function App() {
   // на всё время работы приложения (PRP §7.1, баг «лог чистится при смене вкладки»).
   const [logs, setLogs] = useState<string[]>([]);
   const [suspicions, setSuspicions] = useState<Suspicion[]>([]);
+  // Статусы анализа по доменам (бейджи в «Ошибках сети», данные для
+  // «Починить»). Заполняется кнопкой «Массовый анализ» и ручным анализом.
+  // Живёт в App — переживает смену вкладок.
+  const [analysisMap, setAnalysisMap] = useState<Record<string, AnalysisStatus>>({});
 
   const logMsg = (msg: string) => {
     const time = new Date().toLocaleTimeString();
@@ -76,6 +93,10 @@ export default function App() {
       const lists: string[] = ev.lists || [];
       const proc: string = ev.proc_name || "";
       const procPath: string = ev.proc_path || "";
+      // Анализ доменов НИКОГДА не запускается автоматически: он глушит обход,
+      // и фоновые запуски делали обход выключенным чаще, чем включённым
+      // (инцидент 27.10.26). Домены анализирует только кнопка
+      // «Массовый анализ» или ручной анализ на вкладке «Починка сайтов».
       setSuspicions(prev => {
         const idx = prev.findIndex(s => s.domain === ev.domain);
         if (idx >= 0) {
@@ -110,9 +131,33 @@ export default function App() {
       // дублирование НЕ нужно: раньше фронт дублировал строку без списков (баг).
     });
 
+    const unAnalysis = listen<any>("analysis_progress", (event) => {
+      const ev = event.payload;
+      setAnalysisMap(prev => {
+        const next: Record<string, AnalysisStatus> = {
+          ...prev,
+          [ev.domain]: {
+            state: ev.state,
+            found: !!ev.found,
+            summary: ev.summary || "",
+            noneReason: ev.noneReason ?? null,
+            error: ev.error ?? null,
+            solution: ev.solution ?? null,
+          },
+        };
+        // Мягкий потолок карты: старые записи вытесняются (ключей ~ домены сессии).
+        const keys = Object.keys(next);
+        if (keys.length > 500) {
+          for (const k of keys.slice(0, keys.length - 500)) delete next[k];
+        }
+        return next;
+      });
+    });
+
     return () => {
       unLog.then(f => f());
       unDiscovery.then(f => f());
+      unAnalysis.then(f => f());
     };
   }, []);
 
@@ -197,6 +242,7 @@ export default function App() {
             logs={logs}
             suspicions={suspicions}
             setSuspicions={setSuspicions}
+            analysisMap={analysisMap}
             logMsg={logMsg}
             onFixDomain={sendToSiteFix}
           />

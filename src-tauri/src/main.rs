@@ -29,6 +29,8 @@ mod tls_sni;
 mod quic_sniff;
 mod list_index;
 mod process_owner;
+mod analysis_queue;
+mod mass_analysis;
 
 use tauri::AppHandle;
 
@@ -89,67 +91,37 @@ fn check_status() -> bool {
     process::is_winws_running()
 }
 
-// Оборачиваем долгие команды в асинхронные таски, чтобы не вешать UI-поток
+// Оборачиваем долгие команды в асинхронные таски, чтобы не вешать UI-поток.
+// Анализ идёт через общую очередь (analysis_queue): он глушит/восстанавливает
+// обход, и два параллельных анализа перемешали бы свои окна «обход выключен».
 #[tauri::command]
 async fn run_domain_analysis(app: AppHandle, url: String) -> Result<analyzer::DomainAnalysisOutcome, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        analyzer::analyze_url(&app, &url)
-    }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
+    analysis_queue::enqueue_manual(app, url).await
 }
 
-/// Применяет найденное решение (кнопка «Починить сайт»): правит списки
-/// обхода/исключений и/или hosts. При работающем обходе правка списков
-/// требует перезапуска winws — списки читаются процессом только на старте.
+/// Массовый анализ списка «Ошибки сети»: вся пачка в ОДНОМ окне без обхода
+/// (mass_analysis), по-доменные события — analysis_progress, сводка — сюда.
+#[tauri::command]
+async fn run_mass_analysis(app: AppHandle, domains: Vec<String>) -> Result<String, String> {
+    analysis_queue::enqueue_mass(app, domains).await
+}
+
+/// Применяет найденное решение (кнопки «Починить сайт» / «Починить» в списке
+/// ошибок): правит списки обхода/исключений и/или hosts. При работающем обходе
+/// правка списков требует перезапуска winws — списки читаются процессом только
+/// на старте. Исполняется через общую очередь, чтобы не пересечься с окном
+/// «обход выключен» идущего анализа.
 #[tauri::command]
 async fn apply_solution(app: AppHandle, solution: site_solution::SiteSolution) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut report_lines: Vec<String> = Vec::new();
-        let mut lists_changed: bool = false;
-
-        for action in &solution.actions {
-            match action {
-                site_solution::SolutionAction::AddToBypassList { domains } => {
-                    let r = bypass_lists::add_domains(bypass_lists::TargetList::Bypass, domains)?;
-                    report_lines.push(format!("🛡️ {}", r));
-                    lists_changed = true;
-                }
-                site_solution::SolutionAction::AddToExcludeList { domains } => {
-                    let r = bypass_lists::add_domains(bypass_lists::TargetList::Exclude, domains)?;
-                    report_lines.push(format!("⛔ {}", r));
-                    lists_changed = true;
-                }
-                site_solution::SolutionAction::WriteHosts { ip, domain } => {
-                    let r = hosts::apply_hosts_entry(ip, domain)?;
-                    report_lines.push(format!("📄 {}", r));
-                }
-            }
-        }
-
-        if lists_changed {
-            // winws читает hostlist-файлы только при старте: чтобы решение
-            // заработало сразу, перезапускаем обход тем же профилем
-            // (логика SSOT — bypass_toggle, как в анализе).
-            if process::is_winws_running() {
-                let saved = bypass_toggle::capture_active();
-                bypass_toggle::stop_bypass();
-                let note = bypass_toggle::restore_bypass(&app, &saved)
-                    .unwrap_or_else(|| "Обход не перезапускался: профиль не был активен.".to_string());
-                report_lines.push(format!("♻️ Правки списков применены; {}", note));
-            } else {
-                report_lines.push("ℹ️ Обход сейчас выключен: правки вступят в силу при следующем старте профиля.".to_string());
-            }
-        }
-
-        if report_lines.is_empty() {
-            return Err("в решении нет ни одного действия — применять нечего".to_string());
-        }
-        Ok(report_lines.join("\n"))
-    }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
+    analysis_queue::enqueue_apply(app, solution).await
 }
 
 #[tauri::command]
 async fn test_profile(app: AppHandle, profile_name: String, url: String, game_filter: bool) -> Result<testing::ProfileTestOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // Тест профиля сам стартует/глушит winws: очередь анализа на это
+        // время ставится на паузу (иначе авто-анализ перемешал бы окна).
+        let _guard = analysis_queue::begin_external()?;
         testing::test_single_profile(app, &profile_name, &url, game_filter)
     }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
 }
@@ -164,6 +136,8 @@ async fn test_dns(url: String, dns_ip: String) -> Result<String, String> {
 #[tauri::command]
 async fn run_diagnostics(app: AppHandle, url: String, game_filter: bool) -> Result<diagnostics::DiagnosticsReport, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // Диагностика сама рулит обходом — пауза очереди анализа на её время.
+        let _guard = analysis_queue::begin_external()?;
         diagnostics::run_diagnostics(app, url, game_filter)
     }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
 }
@@ -262,6 +236,7 @@ fn main() {
             stop_bypass,
             check_status,
             run_domain_analysis,
+            run_mass_analysis,
             apply_solution,
             test_profile,
             test_dns,

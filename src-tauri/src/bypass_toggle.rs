@@ -9,6 +9,7 @@ use std::time::Duration;
 use tauri::AppHandle;
 
 use crate::config;
+use crate::events::app_log;
 use crate::process;
 
 /// Сохранённое состояние обхода на момент начала двухфазовой пробы.
@@ -69,5 +70,53 @@ pub fn restore_bypass(app: &AppHandle, saved: &SavedBypass) -> Option<String> {
         None => Some(
             "⚠️ Активный профиль не определён — включите обход вручную.".to_string(),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Окно «обход выключен» с ГАРАНТИЕЙ восстановления.
+//
+// Инцидент 27.10.26: паника анализа между stop_bypass и restore_bypass
+// оставляла обход выключенным навсегда — юзер видел «не включается заново».
+// Корень — восстановление не было связаны с окном lifetime'ом. OffWindowGuard
+// делает отказ невозможным (core §1.10): Drop всегда возвращает обход, даже
+// при панике/раннем выходе из окна.
+// ---------------------------------------------------------------------------
+pub struct OffWindowGuard {
+    app: AppHandle,
+    saved: SavedBypass,
+    armed: bool,
+}
+
+impl OffWindowGuard {
+    /// Захватывает активный профиль и глушит обход (с ожиданием выгрузки
+    /// драйвера — см. stop_bypass). Пока guard жив, окно открыто.
+    pub fn open(app: &AppHandle) -> Self {
+        let saved = capture_active();
+        stop_bypass();
+        Self { app: app.clone(), saved, armed: true }
+    }
+
+    /// Чистое закрытие окна: восстановление обхода сохранённым профилем.
+    /// Возвращает заметку для отчёта (как restore_bypass).
+    pub fn close(mut self) -> Option<String> {
+        let note = restore_bypass(&self.app, &self.saved);
+        self.armed = false;
+        note
+    }
+}
+
+impl Drop for OffWindowGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let note = restore_bypass(&self.app, &self.saved);
+            app_log(
+                &self.app,
+                format!(
+                    "[Обход] аварийное восстановление после незакрытого окна без обхода: {}",
+                    note.unwrap_or_else(|| "заметки нет".to_string())
+                ),
+            );
+        }
     }
 }
