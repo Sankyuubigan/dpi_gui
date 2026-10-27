@@ -27,6 +27,11 @@ pub struct ReportMeta {
     /// транспорт-блок цензором + скан CIDR Cloudflare (Заполнен, когда сайт
     /// не открывается: см. `ip_range_scan::block_diagnose`).
     pub block_scan: Option<crate::ip_range_scan::BlockScanReport>,
+    /// Загруженные домены списков обхода. SSOT: один `load_bypass_domains`
+    /// на анализ (в `analyzer.rs`), и отчёт, и решение потребляют эту карту —
+    /// иначе они расходились (кейс vercel 27.10.26: отчёт печатал «уже покрыт»,
+    /// а итог звал «добавить в обход»).
+    pub bypass_map: bypass_lists::BypassMap,
 }
 
 /// Путь к пользовательскому general-листу (для подсказок «добавьте в обход»).
@@ -672,48 +677,59 @@ fn write_need_bypass(log: &mut String, meta: &ReportMeta, c: &Classification) {
     // найдено адресное лечение (hosts по проверенному адресу), советовать тот
     // же хост в обход — противоречие внутри одного отчёта (кейс vercel:
     // верх говорил «обход не нужен», низ — «добавьте в обход»).
-    let main_fixed_by_hosts: Option<String> =
-        meta.main_probe.as_ref().and_then(|p| {
-            if p.verdict.needs_address_fix() && !site_probe::hosts_entries(p).is_empty() {
-                Some(p.host.clone())
-            } else {
-                None
-            }
-        });
+    let main_fixed_by_hosts: Option<String> = meta.main_probe.as_ref().and_then(|p| {
+        if p.verdict.needs_address_fix() && !site_probe::hosts_entries(p).is_empty() {
+            Some(p.host.clone())
+        } else {
+            None
+        }
+    });
     // Фоновые домены — в отдельную корзину, а не в обход.
-    let background: Vec<&String> = c.need_bypass.iter().filter(|h| is_background_host(h)).collect();
-    let mut actionable: Vec<&String> = c
+    let background: Vec<&String> = c
+        .need_bypass
+        .iter()
+        .filter(|h| is_background_host(h))
+        .collect();
+    let mut actionable: Vec<String> = c
         .need_bypass
         .iter()
         .filter(|h| !is_background_host(h))
+        .cloned()
         .collect();
     if let Some(ref fixed) = main_fixed_by_hosts {
-        actionable.retain(|h| *h != fixed);
+        actionable.retain(|h| h != fixed);
     }
-    if actionable.is_empty() {
+    // Вердикт главного домена: обход имеет смысл только для DPI-класса
+    // (кейс vercel 27.10.26: IpUnreachable звали «в обход» — ложь).
+    let main_verdict = meta.main_probe.as_ref().map(|p| p.verdict);
+    let main_host = meta.main_probe.as_ref().map(|p| p.host.clone());
+    actionable.retain(|h| {
+        if Some(h) == main_host.as_ref() {
+            main_verdict.map(|v| v.bypass_relevant()).unwrap_or(false)
+        } else {
+            true
+        }
+    });
+    // SSOT с решением (`site_solution::decide`): те же covered/uncovered.
+    // Уже покрытые списками домены здесь НЕ печатаются — их место только в
+    // секции «УЖЕ ВНЕСЁННЫЕ В ОБХОД» (см. write_already_in_bypass).
+    let (uncovered, _covered) = bypass_lists::split_bypass_candidates(&actionable, &meta.bypass_map);
+    if uncovered.is_empty() {
         log.push_str("  - (пусто) новых доменов для обхода не найдено\n");
     } else {
-        let bypass_map = bypass_lists::load_bypass_domains();
         let path = general_list_path();
         let mut parent_suggestions: Vec<String> = Vec::new();
-        for h in &actionable {
-            // Если домен уже покрыт обходом (например, родителем) — не советуем дублировать.
-            let already = !bypass_lists::find_bypass_matches(std::slice::from_ref(h), &bypass_map).is_empty();
+        for h in &uncovered {
             let parent = bypass_lists::parent_domain(h);
             let kind = if parent == h.to_lowercase() {
                 "[корневой домен]".to_string()
             } else {
                 format!("[субдомен, родитель: {}]", parent)
             };
-            let action = if already {
-                "уже покрыт обходом — не дублируйте".to_string()
-            } else {
-                if parent != h.to_lowercase() && !parent_suggestions.contains(&parent) {
-                    parent_suggestions.push(parent.clone());
-                }
-                format!("добавьте в {}", path)
-            };
-            log.push_str(&format!("  - {}   {}   {}\n", h, kind, action));
+            if parent != h.to_lowercase() && !parent_suggestions.contains(&parent) {
+                parent_suggestions.push(parent.clone());
+            }
+            log.push_str(&format!("  - {}   {}   добавьте в {}\n", h, kind, path));
         }
         if !parent_suggestions.is_empty() {
             parent_suggestions.sort();
@@ -841,8 +857,8 @@ fn bypass_entry_verdict(domain: &str, c: &Classification) -> String {
 }
 
 fn write_already_in_bypass(log: &mut String, meta: &ReportMeta, c: &Classification) {
-    let bypass_map = bypass_lists::load_bypass_domains();
-    let bypass_matches = bypass_lists::find_bypass_matches(&meta.discovered, &bypass_map);
+    let bypass_matches =
+        bypass_lists::find_bypass_matches(&meta.discovered, &meta.bypass_map);
 
     log.push_str("🗑️ ДОМЕНЫ САЙТА, УЖЕ ВНЕСЁННЫЕ В ОБХОД (проверьте, не ломают ли они сайт):\n");
     if bypass_matches.is_empty() {
@@ -902,6 +918,7 @@ mod tests {
             main_dns_sub: Vec::new(),
             dns_fail_sub: Vec::new(),
             block_scan: None,
+            bypass_map: std::collections::HashMap::new(),
         }
     }
 
@@ -1461,6 +1478,78 @@ let log = build_report(&meta_with(p), &empty_classification());
         assert!(
             !shield.contains(&format!("  - {} ", host)),
             "хост с hosts-лечением нельзя советовать в обход: {}",
+            log
+        );
+    }
+
+    /// Кейс vercel 27.10.26: домен уже покрыт обходом (родитель vercel.app),
+    /// вердикт «IP не отвечает». Домен НЕ печатается в секции «НУЖНО ДОБАВИТЬ
+    /// В ОБХОД» — его место только в «УЖЕ ВНЕСЁННЫЕ В ОБХОД». Раньше отчёт
+    /// печатал «уже покрыт — не дублируйте» внутри секции «нужных» — то же
+    /// самое, что звать добавлять.
+    #[test]
+    fn covered_domain_is_not_listed_in_need_bypass() {
+        let host = "sub.vercel.app";
+        let verdict = Verdict::IpUnreachable;
+        let diagnosis = crate::site_verdict::explain(
+            verdict,
+            &CauseContext {
+                host,
+                www_url: None,
+                apex_ip: Some("216.198.79.131"),
+                dns_spoofed: false,
+                doh_working_ip: None,
+                same_host_alt_ip_works: false,
+                isp_redirect: None,
+                doh_http80_hint: false,
+                doh_candidates: Vec::new(),
+                probe_fail_note: None,
+            },
+        );
+        let mut dns = DnsInfo::new();
+        dns.system = vec!["216.198.79.131".parse().unwrap()];
+        let mut meta = meta_with(DomainProbe {
+            host: host.to_string(),
+            dns,
+            primary_ips: vec!["216.198.79.131".to_string()],
+            doh_ips: vec![],
+            doh_gateway_ips: Vec::new(),
+            doh_ip_services: Vec::new(),
+            working_ip: None,
+            working_ip_source: None,
+            working_http: None,
+            http_note: String::new(),
+            verdict,
+            www_host: Some(format!("www.{}", host)),
+            www_ips: vec![],
+            www_url: None,
+            isp_redirect: None,
+            dns_spoofed: None,
+            doh_failures: vec![],
+            diagnosis: Some(diagnosis),
+        });
+        meta.discovered = vec![host.to_string()];
+        meta.bypass_map = std::collections::HashMap::from([(
+            "vercel.app".to_string(),
+            vec![std::path::PathBuf::from("list-general.txt")],
+        )]);
+        let mut c = empty_classification();
+        c.need_bypass = vec![host.to_string()];
+        let log = build_report(&meta, &c);
+        let shield = log
+            .split("ДОМЕНЫ, КОТОРЫЕ НУЖНО ДОБАВИТЬ В ОБХОД")
+            .nth(1)
+            .unwrap_or("");
+        let shield = shield.split("ДОМЕНЫ, КОТОРЫЕ ЛОМАЕТ").next().unwrap_or(shield);
+        assert!(
+            !shield.contains(&format!("  - {} ", host)),
+            "покрытый домен нельзя советовать добавлять: {}",
+            log
+        );
+        let already = log.split("УЖЕ ВНЕСЁННЫЕ В ОБХОД").nth(1).unwrap_or("");
+        assert!(
+            already.contains(host),
+            "покрытый домен обязан быть в секции «уже внесённые»: {}",
             log
         );
     }

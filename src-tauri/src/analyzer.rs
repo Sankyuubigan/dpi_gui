@@ -12,6 +12,7 @@ use tauri::AppHandle;
 use crate::process;
 use crate::analyzer_probe::{self, Probe};
 use crate::analyzer_report::{self, ReportMeta};
+use crate::bypass_lists;
 use crate::bypass_toggle;
 use crate::ip_probe;
 use crate::analyzer_ip_report;
@@ -164,6 +165,11 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<DomainAnalysisOutcome, 
 fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<DomainAnalysisOutcome, String> {
     let target_url = ip_target::target_url_of(url);
 
+    // Тайминги этапов: пользователь видит, где анализ проводит время,
+    // а мы — где его стоит ускорять (логирование до/после оптимизаций).
+    let mut timings: Vec<(&'static str, std::time::Duration)> = Vec::new();
+    let t_total = std::time::Instant::now();
+
     // Используем НОВЫЙ headless-режим (--headless=new). В отличие от старого
     // --headless, в новом режиме Chrome не спавнит отдельные консольные дочерние
     // процессы (renderer/GPU/crashpad), поэтому чёрное консольное окно вообще
@@ -268,6 +274,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
 
     let _ = tab.navigate_to(&target_url);
 
+    let t_chrome = std::time::Instant::now();
     // Универсальное ожидание по «network idle»: ждём, пока новые запросы перестанут
     // появляться (окно тишины IDLE_WINDOW), с общим потолком MAX_WAIT. Это ловит
     // поздние домены SPA / lazy-load / редиректов для любого сайта, а не фиксированные 15 с.
@@ -302,6 +309,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         hide_stop.store(true, Ordering::Relaxed);
         let _ = hide_handle.join();
     }
+    timings.push(("chrome: загрузка страницы (network idle)", t_chrome.elapsed()));
 
     let discovered: Vec<String> = {
         let mut v: Vec<String> = discovered_domains.lock().unwrap().iter().cloned().collect();
@@ -318,7 +326,9 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
     let bypass_on = process::is_winws_running();
 
     // Проба #1: домены как есть (обход в текущем состоянии).
+    let t_probe1 = std::time::Instant::now();
     let results_on = analyzer_probe::probe_all(&discovered);
+    timings.push(("probe_all #1 (с обходом)", t_probe1.elapsed()));
 
     // Собираем домены, оборвавшиеся с включённым обходом — их надо перепроверить БЕЗ обхода,
     // чтобы отличить «заблокирован сам» (в обход) от «обход его ломает» (в исключения).
@@ -343,6 +353,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
 
         bypass_toggle::stop_bypass();
         bypass_toggled = true;
+        let t_off = std::time::Instant::now();
 
         // Проба #2 без обхода: только домены, сломанные при обходе.
         let results_off = analyzer_probe::probe_all(&broken_on);
@@ -394,7 +405,13 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         );
 
         // Фактовая диагностика главного домена — в чистом окне без обхода.
-        let main_probe = site_probe::probe_domain(&main_host);
+        // DoH-ответы грузятся ОДИН раз и расходуются и на пробу домена,
+        // и на проверку «подмены DNS» (раньше resolve_doh_all вызывался
+        // дважды — лишний проход с дедлайном 9 с).
+        let t_probe = std::time::Instant::now();
+        let main_doh_answers = site_probe::resolve_doh_answers(&main_host);
+        let main_probe = site_probe::probe_domain_with_doh(&main_host, &main_doh_answers);
+        timings.push(("probe_domain (диагностика главного домена)", t_probe.elapsed()));
 
         // Арбитраж (кейс eu.aptabase.com): если сайт доказанно открывается без
         // обхода, а классификация зовёт его в обход — верен вывод «обход его
@@ -414,10 +431,11 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         // заблокирован. Если главный домен не открывается — резолвим его через
         // DoH-сервисы и ищем рабочий IP для подмены.
         // При WwwOnly проверка бессмысленна: рабочее имя уже найдено.
+        // DoH-ответы переиспользуются из пробы домена (одна загрузка на анализ).
         let main_dns_sub = if main_probe.verdict.site_broken()
             && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
         {
-            site_probe::check_dns_substitution(&main_host, true)
+            site_probe::dns_substitutions_from(&main_host, &main_doh_answers, true)
         } else {
             Vec::new()
         };
@@ -427,6 +445,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         // к родным IP не работает — скан CIDR-диапазонов с поиском рабочего IP.
         // Условие совпадает с блоком подмены DNS: сайт открывается или найдено
         // рабочее имя (WwwOnly) — разбирать нечего.
+        let t_block = std::time::Instant::now();
         let block_scan = if main_probe.verdict.site_broken()
             && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
         {
@@ -434,17 +453,22 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         } else {
             None
         };
+        timings.push(("block_diagnose (CIDR-скан)", t_block.elapsed()));
 
         // Авто-восстановление обхода прежним профилем (общая логика SSOT) —
         // только после того, как все фактовые пробы собрались в чистом окне.
         // Сюда же — лёгкая подмена DNS для «не резолвящихся» доменов (до 5):
         // их TCP-пробы тоже не должны идти через активный обход.
-        let dns_fail_sub: Vec<(String, Vec<site_probe::DnsSubstitution>)> = classification
-            .dns_fail
-            .iter()
-            .take(5)
-            .map(|h| (h.clone(), site_probe::check_dns_substitution(h, false)))
-            .collect();
+        // Домены проверяются параллельно: последовательный .map тянул до
+        // 9 с дедлайна DoH на каждый (до 45 с на пятерку).
+        let t_dnsfail = std::time::Instant::now();
+        let dns_fail_sub = dns_fail_sub_parallel(&classification.dns_fail, 5);
+        timings.push(("dns_fail_sub (фоновые DoH-проверки)", t_dnsfail.elapsed()));
+
+        timings.push((
+            "окно без обхода (проба #2 + ретраи)",
+            t_off.elapsed(),
+        ));
 
         restore_note = bypass_toggle::restore_bypass(app, &saved);
 
@@ -454,14 +478,19 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         let classification =
             analyzer_probe::classify_single(results_on, &browser_failed_set);
 
-        let main_probe = site_probe::probe_domain(&main_host);
+        // DoH-ответы грузятся ОДИН раз (см. ветку обхода выше).
+        let t_probe = std::time::Instant::now();
+        let main_doh_answers = site_probe::resolve_doh_answers(&main_host);
+        let main_probe = site_probe::probe_domain_with_doh(&main_host, &main_doh_answers);
+        timings.push(("probe_domain (диагностика главного домена)", t_probe.elapsed()));
         let main_dns_sub = if main_probe.verdict.site_broken()
             && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
         {
-            site_probe::check_dns_substitution(&main_host, true)
+            site_probe::dns_substitutions_from(&main_host, &main_doh_answers, true)
         } else {
             Vec::new()
         };
+        let t_block = std::time::Instant::now();
         let block_scan = if main_probe.verdict.site_broken()
             && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
         {
@@ -469,17 +498,18 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         } else {
             None
         };
+        timings.push(("block_diagnose (CIDR-скан)", t_block.elapsed()));
 
-        let dns_fail_sub: Vec<(String, Vec<site_probe::DnsSubstitution>)> = classification
-            .dns_fail
-            .iter()
-            .take(5)
-            .map(|h| (h.clone(), site_probe::check_dns_substitution(h, false)))
-            .collect();
+        let t_dnsfail = std::time::Instant::now();
+        let dns_fail_sub = dns_fail_sub_parallel(&classification.dns_fail, 5);
+        timings.push(("dns_fail_sub (фоновые DoH-проверки)", t_dnsfail.elapsed()));
 
         (classification, Some(main_probe), main_dns_sub, dns_fail_sub, block_scan)
     };
 
+    // SSOT: карта списков обхода загружается РАЗ на анализ и едет в meta —
+    // отчёт и решение (`site_solution::decide`) потребляют одни данные.
+    let bypass_map = bypass_lists::load_bypass_domains();
     let meta = ReportMeta {
         target_url,
         discovered,
@@ -491,6 +521,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         main_dns_sub,
         dns_fail_sub,
         block_scan,
+        bypass_map,
     };
 
     let mut report = analyzer_report::build_report(&meta, &classification);
@@ -498,7 +529,52 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
     // decide() читает meta/classification, report_block печатает тот же итог.
     let solution = site_solution::decide(&meta, &classification);
     report.push_str(&site_solution::report_block(&solution));
+    // Тайминги этапов: где анализ провёл время (видно пользователю в логе).
+    report.push_str(&timing_block(&timings, t_total.elapsed()));
 
     Ok(DomainAnalysisOutcome { report, solution })
+}
+
+/// Подмена DNS для доменов из списка «не резолвится» (до `limit`): проверка
+/// параллельна — последовательный `.map` тянул дедлайн DoH (~9 с) на каждый
+/// домен (до 45 с на пятерку). Порядок результатов — исходный.
+fn dns_fail_sub_parallel(
+    hosts: &[String],
+    limit: usize,
+) -> Vec<(String, Vec<site_probe::DnsSubstitution>)> {
+    use std::sync::mpsc;
+    let targets: Vec<String> = hosts.iter().take(limit).cloned().collect();
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let (tx, rx) =
+        mpsc::channel::<(usize, (String, Vec<site_probe::DnsSubstitution>))>();
+    for (idx, h) in targets.iter().enumerate() {
+        let tx = tx.clone();
+        let h = h.clone();
+        std::thread::spawn(move || {
+            let subs = site_probe::check_dns_substitution(&h, false);
+            let _ = tx.send((idx, (h, subs)));
+        });
+    }
+    drop(tx);
+    let mut slots: Vec<Option<(String, Vec<site_probe::DnsSubstitution>)>> =
+        (0..targets.len()).map(|_| None).collect();
+    for _ in 0..targets.len() {
+        if let Ok((idx, item)) = rx.recv() {
+            slots[idx] = Some(item);
+        }
+    }
+    slots.into_iter().flatten().collect()
+}
+
+/// Текстовый блок таймингов анализа: по этапам и суммарно.
+fn timing_block(timings: &[(&str, std::time::Duration)], total: std::time::Duration) -> String {
+    let mut s = String::from("\n⏱ ТЕМИНГ АНАЛИЗА (где прошло время):\n");
+    for (name, dt) in timings {
+        s.push_str(&format!("  • {}: {:.1} с\n", name, dt.as_secs_f64()));
+    }
+    s.push_str(&format!("  ИТОГО: {:.1} с\n", total.as_secs_f64()));
+    s
 }
 

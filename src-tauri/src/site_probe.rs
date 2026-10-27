@@ -13,7 +13,7 @@ use reqwest::blocking::Client;
 
 use crate::diagnostics_probe::{
     body_looks_like_blockpage, body_looks_region_restricted, classify_reqwest_err, dns_multi,
-    is_stub_ip, resolve_doh_all, tcp_connect, DnsInfo, HttpResult,
+    is_stub_ip, resolve_doh_all, tcp_connect, DnsInfo, DohAnswers, HttpResult,
 };
 use crate::site_verdict::{
     classify, explain, hosts_lines, http_result_note, refine_with_isp_redirect, CauseContext,
@@ -211,6 +211,37 @@ fn probe_isp_redirect(host: &str, ip: IpAddr) -> Option<String> {
     Some(format!("{} -> {}", host, target_host))
 }
 
+/// Параллельная проба ISP-редиректа по всем кандидатам сразу (последовательный
+/// перебор мёртвых адресов тянул до 6 с на каждый). Выбирается первый по
+/// порядку адресов найденный редирект — как у прежнего `find_map`.
+fn isp_redirect_parallel(host: &str, primary: &[String], doh: &[String]) -> Option<String> {
+    use std::sync::mpsc;
+    let ips: Vec<IpAddr> = primary
+        .iter()
+        .chain(doh.iter())
+        .filter_map(|s| s.parse::<IpAddr>().ok())
+        .filter(|i| !is_stub_ip(i))
+        .take(4)
+        .collect();
+    let (tx, rx) = mpsc::channel::<(usize, Option<String>)>();
+    for (idx, ip) in ips.iter().enumerate() {
+        let tx = tx.clone();
+        let host = host.to_string();
+        let ip = *ip;
+        std::thread::spawn(move || {
+            let _ = tx.send((idx, probe_isp_redirect(&host, ip)));
+        });
+    }
+    drop(tx);
+    let mut slots: Vec<Option<Option<String>>> = (0..ips.len()).map(|_| None).collect();
+    for _ in 0..ips.len() {
+        if let Ok((idx, r)) = rx.recv() {
+            slots[idx] = Some(r);
+        }
+    }
+    slots.into_iter().flatten().flatten().next()
+}
+
 /// Фолбэк-проба обычного HTTP (порт 80) по проверенным DoH-адресам: жив ли
 /// транспорт до настоящего адреса, когда HTTPS/TLS из приложения не открыл
 /// сайт. Достаточно самого факта осмысленного HTTP-ответа (1xx–4xx):
@@ -218,22 +249,42 @@ fn probe_isp_redirect(host: &str, ip: IpAddr) -> Option<String> {
 /// Любой 5xx считаем «ответили, но ошибка» — подсказку «транспорт жив» такое
 /// не даёт (заглушки ТСПУ тоже умеют отвечать 503).
 fn probe_alive_over_http80(host: &str, ips: &[String]) -> bool {
+    use std::sync::mpsc;
+    // Пробы параллельны: важен только факт «транспорт жив», а не порядок —
+    // последовательный скан мёртвых адресов тянул до 5 с на каждый.
+    // rx.recv() не зависает: каждый HTTP-клиент ограничен своим таймаутом 5 с.
+    let (tx, rx) = mpsc::channel::<bool>();
+    let mut spawned = 0usize;
     for ip in ips.iter().filter_map(|s| s.parse::<IpAddr>().ok()) {
         if is_stub_ip(&ip) {
             continue;
         }
-        let Ok(client) = Client::builder()
-            .resolve(host, SocketAddr::new(ip, 80))
-            .timeout(Duration::from_secs(5))
-            .build()
-        else {
-            continue;
-        };
-        if let Ok(resp) = client.get(format!("http://{}/", host)).send() {
-            let status = resp.status().as_u16();
-            if (100..=499).contains(&status) {
-                return true;
-            }
+        let tx = tx.clone();
+        let host = host.to_string();
+        std::thread::spawn(move || {
+            let alive = (|| {
+                let Ok(client) = Client::builder()
+                    .resolve(&host, SocketAddr::new(ip, 80))
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                else {
+                    return false;
+                };
+                match client.get(format!("http://{}/", host)).send() {
+                    Ok(resp) => (100..=499).contains(&resp.status().as_u16()),
+                    Err(_) => false,
+                }
+            })();
+            let _ = tx.send(alive);
+        });
+        spawned += 1;
+    }
+    drop(tx);
+    for _ in 0..spawned {
+        match rx.recv() {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => break,
         }
     }
     false
@@ -313,39 +364,40 @@ impl ProbeOutcome {
 fn probe_host_at(host: &str, ips: &[String]) -> ProbeOutcome {
     let mut tcp_only: Option<(String, HttpResult)> = None;
     let mut any_reset = false;
-    let mut tried = 0usize;
 
-    for ip in ips.iter() {
-        let Ok(addr) = ip.parse::<IpAddr>() else {
-            continue;
-        };
-        if is_stub_ip(&addr) {
-            continue;
-        }
-        if tried >= MAX_IPS {
-            break;
-        }
-        tried += 1;
-        match tcp_connect(addr, 443).as_str() {
+    // Кандидаты: валидные адреса без заглушек, лимит MAX_IPS.
+    let candidates: Vec<IpAddr> = ips
+        .iter()
+        .filter_map(|s| s.parse::<IpAddr>().ok())
+        .filter(|a| !is_stub_ip(a))
+        .take(MAX_IPS)
+        .collect();
+
+    // TCP-пробы параллельно: последовательный скан мёртвых адресов съедал
+    // до 3.5 с на каждый (worst ~10 с на канал). HTTP-пробы — по-прежнему
+    // последовательно до первого Ok: порядок «первого рабочего IP» сохранён.
+    let tcp = tcp_scan_parallel(&candidates);
+    for (ip, res) in candidates.iter().zip(tcp.iter()) {
+        match res.as_str() {
             "RST/REFUSED" => {
                 any_reset = true;
-                continue;
             }
-            "Success" => {}
-            _ => continue,
-        }
-        let r = http_via_ip(host, addr, 443);
-        if let HttpResult::Ok(code) = r {
-            return ProbeOutcome {
-                tcp_ok: true,
-                ip: Some(ip.clone()),
-                note: format!("HTTPS через {}: HTTP {}", ip, code),
-                http: Some(r),
-                any_reset,
-            };
-        }
-        if tcp_only.is_none() {
-            tcp_only = Some((ip.clone(), r));
+            "Success" => {
+                let r = http_via_ip(host, *ip, 443);
+                if let HttpResult::Ok(code) = r {
+                    return ProbeOutcome {
+                        tcp_ok: true,
+                        ip: Some(ip.to_string()),
+                        note: format!("HTTPS через {}: HTTP {}", ip, code),
+                        http: Some(r),
+                        any_reset,
+                    };
+                }
+                if tcp_only.is_none() {
+                    tcp_only = Some((ip.to_string(), r));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -364,12 +416,56 @@ fn probe_host_at(host: &str, ips: &[String]) -> ProbeOutcome {
     }
 }
 
+/// Параллельный TCP-скан: результат в том же порядке, что и входные адреса.
+/// Каждый поток гарантированно завершается (`tcp_connect` ограничен таймаутом),
+/// поэтому `rx.recv()` не может зависнуть.
+pub fn tcp_scan_parallel(ips: &[IpAddr]) -> Vec<String> {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel::<(usize, String)>();
+    for (idx, ip) in ips.iter().enumerate() {
+        let tx = tx.clone();
+        let ip = *ip;
+        std::thread::spawn(move || {
+            let _ = tx.send((idx, tcp_connect(ip, 443)));
+        });
+    }
+    drop(tx);
+    let mut slots: Vec<Option<String>> = (0..ips.len()).map(|_| None).collect();
+    for _ in 0..ips.len() {
+        if let Ok((idx, res)) = rx.recv() {
+            slots[idx] = Some(res);
+        }
+    }
+    slots
+        .into_iter()
+        .map(|s| s.unwrap_or_else(|| "Timeout".to_string()))
+        .collect()
+}
+
+/// Обёртка для интеграционных тестов: одна DoH-загрузка + проба. В проде не
+/// используется — `analyzer.rs` зовёт `resolve_doh_answers` + `probe_domain_with_doh`
+/// ради SSOT одной загрузки, поэтому функция живёт только под cfg(test)
+/// (иначе — dead_code warning в release-сборке).
+#[cfg(test)]
 pub fn probe_domain(host: &str) -> DomainProbe {
+    let doh_answers = resolve_doh_all(host);
+    probe_domain_with_doh(host, &doh_answers)
+}
+
+/// Единая точка загрузки DoH-ответов для анализа (дверь модуля): одна
+/// загрузка расходуется и на пробу домена, и на «подмену DNS».
+pub fn resolve_doh_answers(host: &str) -> DohAnswers {
+    resolve_doh_all(host)
+}
+
+/// Вариант [`probe_domain`] с уже загруженными DoH-ответами: одна загрузка
+/// на анализ расходуется и на пробу домена, и на «подмену DNS» (SSOT,
+/// минус лишний DoH-проход с его 9-секундным дедлайном).
+pub fn probe_domain_with_doh(host: &str, doh_answers: &DohAnswers) -> DomainProbe {
     let dns = dns_multi(host);
 
     // Адреса из защищённого канала. Это единственный источник проверенных
     // адресов: именно по ним проверяется, открывается ли сайт «настоящий».
-    let doh_answers = resolve_doh_all(host);
     let doh_addr_ips = doh_answers.all_ips();
     let doh_failures = doh_answers.failures();
 
@@ -450,14 +546,10 @@ pub fn probe_domain(host: &str) -> DomainProbe {
 
     // Проба порта 80: ловим подмену редиректа провайдером. Запускаем только
     // когда HTTPS не дал рабочего ответа — при живом сайте она ничего не скажет
-    // и лишь замедлит проверку.
+    // и лишь замедлит проверку. Пробы параллельны, выбирается первый по
+    // порядку адресов редирект (семантика прежнего find_map сохранена).
     let isp_redirect: Option<String> = if base_verdict != Verdict::Open {
-        primary_ips
-            .iter()
-            .chain(doh_ips.iter())
-            .filter_map(|ip| ip.parse::<IpAddr>().ok())
-            .take(4)
-            .find_map(|ip| probe_isp_redirect(host, ip))
+        isp_redirect_parallel(host, &primary_ips, &doh_ips)
     } else {
         None
     };
@@ -618,6 +710,16 @@ pub fn probe_https_by_ip(host: &str, ip: IpAddr) -> HttpResult {
 ///   (для главного домена да/для долгого перебора — нет).
 pub fn check_dns_substitution(host: &str, probe_http: bool) -> Vec<DnsSubstitution> {
     let answers = resolve_doh_all(host);
+    dns_substitutions_from(host, &answers, probe_http)
+}
+
+/// Разбор «подмены DNS» от уже загруженных DoH-ответов: чистая функция без
+/// сети. Переиспользуется с пробой главного домена (одна загрузка на анализ).
+pub fn dns_substitutions_from(
+    host: &str,
+    answers: &DohAnswers,
+    probe_http: bool,
+) -> Vec<DnsSubstitution> {
     let mut out = Vec::new();
     for a in &answers.answers {
         // Собственный адрес сервиса (SNI-прокси) — не решение: проба через него
@@ -683,9 +785,17 @@ fn summarize_substitution(
     // открывшего сайт. Раньше проверялся только первый TCP-ответивший —
     // и если им оказывалась заглушка/битый IP, отчёт врал «не помогла»,
     // хотя следующий адрес сайт открывал (кейс openrouter.ai).
+    // TCP-скан параллельный, порядок живых адресов — исходный.
+    let candidates: Vec<IpAddr> = ips
+        .iter()
+        .filter(|ip| !is_stub_ip(ip))
+        .take(6)
+        .copied()
+        .collect();
+    let tcp = tcp_scan_parallel(&candidates);
     let mut live: Vec<IpAddr> = Vec::new();
-    for ip in ips.iter().filter(|ip| !is_stub_ip(ip)).take(6) {
-        if tcp_connect(*ip, 443) == "Success" {
+    for (ip, res) in candidates.iter().zip(tcp.iter()) {
+        if res == "Success" {
             live.push(*ip);
         }
     }

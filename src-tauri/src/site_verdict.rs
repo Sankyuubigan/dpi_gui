@@ -76,6 +76,22 @@ impl Verdict {
     pub fn needs_address_fix(self) -> bool {
         matches!(self, Verdict::DnsBlocked)
     }
+
+    /// Способен ли обход по hostlist-у изменить исход для этого вердикта.
+    ///
+    /// winws модифицирует TLS/SNI-поток — это помогает, когда цензор рвёт
+    /// или подменяет соединение DPI-методами. Когда TCP до адреса не
+    /// открывается вовсе (`IpUnreachable`, `NoPath`), причина на стороне
+    /// адреса/маршрута, а не формата пакетов: обход оживить её не может.
+    /// Причины «сайт закрыл сам» (`GeoBlocked`, `ServiceRestricted`,
+    /// `BadCert`), «не там искали» (`Open`, `WwwOnly`, `DnsBlocked`) и
+    /// «не разобрались» (`Unknown`) обходом тоже не лечатся.
+    pub fn bypass_relevant(self) -> bool {
+        matches!(
+            self,
+            Verdict::IpReset | Verdict::TlsBroken | Verdict::BlockPage | Verdict::IspBlockRedirect
+        )
+    }
 }
 
 /// Результаты проверки домена, разложенные по каналам разрешения адреса.
@@ -654,6 +670,34 @@ mod tests {
         f.system_http = Some(HttpResult::Ok(200));
         f.any_tcp_ok = true;
         assert_eq!(classify(&f), Verdict::Open);
+    }
+
+    /// Обход (модификация TLS-потока) имеет смысл только для DPI-вересков.
+    /// Кейс vercel 27.10.26: IpUnreachable звали «в обход», а обход мёртвый
+    /// маршрут оживить не может — совет был ложью.
+    #[test]
+    fn bypass_relevant_only_for_dpi_verdicts() {
+        for v in [
+            Verdict::IpReset,
+            Verdict::TlsBroken,
+            Verdict::BlockPage,
+            Verdict::IspBlockRedirect,
+        ] {
+            assert!(v.bypass_relevant(), "{} должен допускать обход", v.verdict_name());
+        }
+        for v in [
+            Verdict::Open,
+            Verdict::WwwOnly,
+            Verdict::IpUnreachable,
+            Verdict::BadCert,
+            Verdict::DnsBlocked,
+            Verdict::GeoBlocked,
+            Verdict::ServiceRestricted,
+            Verdict::NoPath,
+            Verdict::Unknown,
+        ] {
+            assert!(!v.bypass_relevant(), "{} обход не лечит", v.verdict_name());
+        }
     }
 
     /// 200-ответ с маркером регионального ограничения в теле — НЕ «открыт»:

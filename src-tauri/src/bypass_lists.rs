@@ -149,6 +149,29 @@ pub fn find_bypass_matches(discovered: &[String], bypass: &BypassMap) -> Vec<(St
     matches
 }
 
+/// Делит кандидатов на «можно советовать добавить в обход» и «уже покрыт».
+///
+/// Единый источник правды для отчёта и решения (`site_solution::decide`):
+/// оба слоя получают одни и те же данные, поэтому отчёт больше не может
+/// напечатать «уже покрыт — не дублируйте», а итог — «добавьте в обход»
+/// (кейс vercel 27.10.26). Чистая функция: карта приходит аргументом,
+/// файловая система не читается.
+pub fn split_bypass_candidates(
+    hosts: &[String],
+    bypass: &BypassMap,
+) -> (Vec<String>, Vec<String>) {
+    let mut uncovered: Vec<String> = Vec::new();
+    let mut covered: Vec<String> = Vec::new();
+    for host in hosts {
+        if find_bypass_matches(std::slice::from_ref(host), bypass).is_empty() {
+            uncovered.push(host.clone());
+        } else {
+            covered.push(host.clone());
+        }
+    }
+    (uncovered, covered)
+}
+
 /// Какой юзерский список правит [`add_domains`]. Дефолтные файлы (defaults/)
 /// здесь не участвуют: они перезаписываются при каждом старте (контракт
 /// владельца), правки туда терялись бы.
@@ -313,5 +336,60 @@ mod tests {
         assert!(is_excluded_by_entries("example.com", &entries));
         assert!(is_excluded_by_entries("sub.example.com", &entries));
         assert!(!is_excluded_by_entries("notexample.com", &entries));
+    }
+
+    fn bypass_map(entries: &[&str]) -> BypassMap {
+        entries
+            .iter()
+            .map(|e| (e.to_string(), vec![PathBuf::from("list-general.txt")]))
+            .collect()
+    }
+
+    /// Покрытый родителем домен уходит в covered, непокрытый — в uncovered.
+    /// Единый фильтр отчёта и решения (кейс vercel 27.10.26).
+    #[test]
+    fn split_bypass_candidates_divides_covered_and_uncovered() {
+        let map = bypass_map(&["vercel.app"]);
+        let hosts = vec![
+            "sub.vercel.app".to_string(),
+            "example.org".to_string(),
+        ];
+        let (uncovered, covered) = split_bypass_candidates(&hosts, &map);
+        assert_eq!(uncovered, vec!["example.org".to_string()]);
+        assert_eq!(covered, vec!["sub.vercel.app".to_string()]);
+    }
+
+    /// Точное совпадение тоже считается покрытием.
+    #[test]
+    fn split_bypass_candidates_exact_match_is_covered() {
+        let map = bypass_map(&["example.org"]);
+        let (uncovered, covered) =
+            split_bypass_candidates(&["example.org".to_string()], &map);
+        assert!(uncovered.is_empty());
+        assert_eq!(covered, vec!["example.org".to_string()]);
+    }
+
+    /// Пустая карта — всё непокрыто; пустой список — обе стороны пусты.
+    #[test]
+    fn split_bypass_candidates_empty_inputs() {
+        let map = bypass_map(&[]);
+        let (uncovered, covered) =
+            split_bypass_candidates(&["example.org".to_string()], &map);
+        assert_eq!(uncovered, vec!["example.org".to_string()]);
+        assert!(covered.is_empty());
+
+        let (uncovered, covered) = split_bypass_candidates(&[], &bypass_map(&["a.ru"]));
+        assert!(uncovered.is_empty());
+        assert!(covered.is_empty());
+    }
+
+    /// Регистр не влияет: домены списков в нижнем регистре.
+    #[test]
+    fn split_bypass_candidates_case_insensitive() {
+        let map = bypass_map(&["vercel.app"]);
+        let (uncovered, covered) =
+            split_bypass_candidates(&["Sub.VERCEL.app".to_string()], &map);
+        assert!(uncovered.is_empty());
+        assert_eq!(covered, vec!["Sub.VERCEL.app".to_string()]);
     }
 }
