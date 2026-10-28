@@ -1,13 +1,13 @@
 import { useState, type Dispatch, type SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Search, Globe, ShieldQuestion, FileEdit, Trash2, Wrench } from "lucide-react";
+import { Search, Globe, FileEdit, Trash2, Wrench } from "lucide-react";
 import TestingLogPanel, { type LogEntry } from "./TestingLogPanel";
 import { useTestingLog } from "./useTestingLog";
 import type { SiteSolution } from "../App";
 
-/// Вкладка «Починка сайтов»: анализ одного домена, тест подмены DNS по
-/// всему списку DoH и точечная правка hosts. Тесты профилей и диагностика
-/// живут на отдельной вкладке «Профили обхода».
+/// Вкладка «Починка сайтов»: анализ одного домена (с опциональным
+/// принудительным подбором DNS-адреса) и точечная правка hosts. Тесты
+/// профилей и диагностика живут на отдельной вкладке «Профили обхода».
 export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsTesting, solution, setSolution }: {
   log: LogEntry[];
   setLog: Dispatch<SetStateAction<LogEntry[]>>;
@@ -63,56 +63,31 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
     }
   };
 
-  // «Тест подмены DNS» прогоняет ВЕСЬ список DoH-сервисов (lists/defaults/
-  // doh-services.txt) по очереди для одного домена. Список читается при
-  // каждом запуске — свежие правки файла применяются без перезапуска.
-  const runDnsTest = async () => {
-    if (!url) return;
+  // Скрипт подбора рабочего DNS: перебор doh-services.txt с классификацией
+  // ответов (кто проксирует — рабочий, кто отдаёт прямые адреса Google —
+  // бесполезен для гео-блока в сессии, кто мёртв). Независим от «Анализа
+  // сайта»: только DoH-опрос, без проб страницы.
+  const runDnsPick = async () => {
+    const domain = cleanHost(url);
+    if (!domain) {
+      appendEntry("[Подбор DNS] Укажите домен в поле выше.", "fail");
+      return;
+    }
     setIsTesting(true);
-    setLog([{ text: `[Тест DNS] Проверка сайта ${url} через список DoH-сервисов...`, kind: "info" }]);
-
-    let services: string[] = [];
+    appendEntry(`[Подбор DNS] Перебор списка DoH-сервисов для ${domain}...`, "info");
     try {
-      services = await invoke<string[]>("get_doh_services");
-    } catch (e: any) {
-      appendEntry(`[Тест DNS] Не удалось получить список DoH-сервисов: ${e}`, "fail");
-      setIsTesting(false);
-      return;
-    }
-
-    if (services.length === 0) {
-      appendEntry("[Тест DNS] Список DoH-сервисов пуст.", "fail");
-      setIsTesting(false);
-      return;
-    }
-
-    appendEntry(`Сервисов в списке: ${services.length}. Прогон по очереди...`, "info");
-    let okCount = 0;
-    let partialCount = 0;
-    for (const svc of services) {
-      try {
-        const result: string = await invoke("test_dns", { url, dnsIp: svc });
-        const flat = result.replace(/\s*\n\s*/g, " · ");
-        if (result.startsWith("УСПЕХ")) {
-          okCount++;
-          appendEntry(`   ${svc} — ${flat}`, "ok");
-        } else if (result.startsWith("ОШИБКА")) {
-          appendEntry(`   ${svc} — ${flat}`, "fail");
-        } else {
-          // «Доступно, но статус: ...» — DNS и соединение работают, ответ не 2xx.
-          partialCount++;
-          appendEntry(`   ${svc} — ${flat}`, "info");
-        }
-      } catch (e: any) {
-        appendEntry(`   ${svc} — ошибка: ${e}`, "fail");
+      const out = await invoke<{ domain: string; entries: { service: string; resolved: string[]; kind: string; note: string }[]; summary: string }>("pick_dns", { url: domain });
+      for (const e of out.entries) {
+        const kind = e.kind === "proxy" ? "ok" : e.kind === "direct" ? "info" : "fail";
+        const mark = e.kind === "proxy" ? "✅ ПРОКСИРУЕТ (РАБОЧИЙ)" : e.kind === "direct" ? "⚠️ прямые адреса Google" : "❌ мёртв";
+        appendEntry(`${mark} — ${e.service}: ${e.note}`, kind);
       }
+      appendEntry(`[Подбор DNS] ${out.summary}`, out.summary.startsWith("Рабочий DNS") ? "ok" : "fail");
+    } catch (e: any) {
+      appendEntry(`[Подбор DNS] Ошибка: ${e}`, "fail");
+    } finally {
+      setIsTesting(false);
     }
-    const failed = services.length - okCount - partialCount;
-    appendEntry(
-      `[Тест DNS] Итог: успех ${okCount}, частично ${partialCount}, неудач ${failed} из ${services.length}.`,
-      okCount > 0 ? "ok" : "fail"
-    );
-    setIsTesting(false);
   };
 
   const cleanHost = (raw: string) =>
@@ -180,8 +155,8 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
       <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
         <h2 className="text-xl font-bold text-gray-800 mb-4">Починка сайтов</h2>
         <p className="text-gray-500 mb-4 text-sm">
-          Диагностика одного домена: анализ соединения, тест подмены DNS по всему
-          списку DoH и точечная правка hosts.
+          Диагностика одного домена: анализ соединения, подбор рабочего
+          DNS-сервера и точечная правка hosts.
         </p>
 
         <div className="flex gap-2 mb-4">
@@ -234,18 +209,28 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
               Будет применено: {solution.summary}
             </p>
           )}
+        </div>
 
-          <div className="flex gap-3 mt-2 border-t border-gray-100 pt-4">
-            <button
-              onClick={runDnsTest}
-              disabled={isTesting}
-              className="flex-1 flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-400 text-white py-2 rounded-lg font-bold transition"
-              title="Прогоняет весь список DoH-сервисов (файл doh-services.txt) по очереди для этого домена"
-            >
-              <ShieldQuestion size={18} /> Тест подмены DNS (весь список DoH)
-            </button>
-          </div>
+        {/* Скрипт подбора рабочего DNS — отдельная фича, с «Анализом сайта» не связана.
+            Классифицирует ответы всех DoH-сервисов: кто проксирует (рабочий DNS для
+            сайтов с гео-блоком внутри сессии), кто отдаёт прямые адреса, кто мёртв. */}
+        <div className="flex flex-col gap-2 mt-4 border-t border-gray-100 pt-4">
+          <button
+            onClick={runDnsPick}
+            disabled={isTesting}
+            className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-400 text-white py-2 rounded-lg font-bold transition"
+            title="Перебирает весь список DoH-сервисов (doh-services.txt) и классифицирует ответы: кто проксирует трафик (рабочий DNS для сайтов с гео-блоком после входа в аккаунт — например, aistudio.google.com), кто отдаёт прямые адреса Google, кто мёртв. Результат — имя DNS для включения в браузере."
+          >
+            <Globe size={18} /> Подбор рабочего DNS
+          </button>
+          <p className="text-xs text-gray-500 px-1">
+            Для сайтов, которые кидают на страницу региона только после входа в аккаунт:
+            скрипт сам назовёт DNS-сервис, через который трафик идёт через прокси — его
+            нужно включить в браузере (Secure DNS).
+          </p>
+        </div>
 
+        <div className="flex flex-col gap-3">
           <div className="flex gap-2 mt-2 items-center border-t border-gray-100 pt-4">
             <input
               type="text"

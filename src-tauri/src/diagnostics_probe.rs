@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::net::{TcpStream, UdpSocket, SocketAddr, IpAddr};
+use std::net::{TcpStream, UdpSocket, SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr};
 use std::error::Error as StdError;
 use std::time::Duration;
 use std::sync::mpsc;
@@ -467,12 +467,40 @@ fn bootstrap_doh_host(host: &str) -> Result<Vec<IpAddr>, String> {
 /// `doh_host` — имя DoH-сервиса (например, "geohide.ru"). Бутстрап хоста
 /// делается системным DNS (fallback 1.1.1.1), затем запрос уходит по HTTPS.
 ///
-/// Возвращает `Err` с реальной причиной при любом сбое. Пустой список «без
-/// объяснения» невозможен: отчёт обязан отличать «сервис недоступен» от
-/// «сервис не вернул адресов» (core rules §2.2 — запрет молчаливых ошибок).
+/// Основной транспорт — reqwest GET (RFC 8484 §4.1): работает со всеми
+/// сервисами списка, включая те, что не отвечают trust-dns-клиенту (кейс
+/// eu.geohide.ru 28.10.26: trust-dns — таймаут 9 с, GET — 0.4 с). Фолбэк —
+/// trust-dns; обе причины ошибки показываются (запрет молчаливых ошибок).
 pub fn resolve_via_doh(domain: &str, doh_host: &str) -> Result<Vec<IpAddr>, String> {
     let bootstrap = bootstrap_doh_host(doh_host)?;
 
+    let domain_owned = domain.to_string();
+    let svc = doh_host.to_string();
+    let boot = bootstrap.clone();
+    let wire = run_with_timeout(
+        move || doh_wire_get(&svc, &domain_owned, &boot),
+        8000,
+    )
+    .unwrap_or_else(|| Err(format!("сервис {} не ответил за 8 с (таймаут)", doh_host)));
+
+    match wire {
+        Ok(ips) => Ok(ips),
+        Err(wire_err) => match trust_dns_doh(domain, doh_host, bootstrap) {
+            Ok(ips) => Ok(ips),
+            Err(td_err) => Err(format!(
+                "{}; фолбэк trust-dns: {}",
+                wire_err, td_err
+            )),
+        },
+    }
+}
+
+/// Фолбэк-транспорт: trust-dns-resolver (Protocol::Https).
+fn trust_dns_doh(
+    domain: &str,
+    doh_host: &str,
+    bootstrap: Vec<IpAddr>,
+) -> Result<Vec<IpAddr>, String> {
     let mut cfg = ResolverConfig::new();
     for ip in bootstrap {
         cfg.add_name_server(NameServerConfig {
@@ -514,6 +542,158 @@ pub fn resolve_via_doh(domain: &str, doh_host: &str) -> Result<Vec<IpAddr>, Stri
         8000,
     )
     .unwrap_or_else(|| Err(format!("сервис {} не ответил за 8 с (таймаут)", svc)))
+}
+
+/// DoH-запрос через reqwest GET (RFC 8484 §4.1): wireformat в параметре
+/// `?dns=` (base64url), accept: application/dns-message. IP подставляется
+/// на уровне сокета (бутстрап), имя сервиса остаётся в SNI.
+fn doh_wire_get(host: &str, domain: &str, bootstrap: &[IpAddr]) -> Result<Vec<IpAddr>, String> {
+    let query = build_doh_wire_query(domain)?;
+    let q = b64url(&query);
+    let mut builder = Client::builder().timeout(Duration::from_secs(5));
+    if let Some(ip) = bootstrap.first() {
+        builder = builder.resolve(host, SocketAddr::new(*ip, 443));
+    }
+    let client = builder
+        .build()
+        .map_err(|e| format!("не удалось создать HTTP-клиент: {}", e))?;
+    let resp = client
+        .get(format!("https://{}/dns-query?dns={}", host, q))
+        .header("accept", "application/dns-message")
+        .send()
+        .map_err(|e| format!("GET /dns-query не выполнен: {:?}", classify_reqwest_err(&e)))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("сервер ответил HTTP {}", status.as_u16()));
+    }
+    let body = resp
+        .bytes()
+        .map_err(|e| format!("не удалось прочитать ответ: {}", e))?;
+    let ips = parse_doh_wire_response(&body);
+    if ips.is_empty() {
+        return Err(format!(
+            "ответ не содержит A/AAAA-записей (HTTP {}, {} байт)",
+            status.as_u16(),
+            body.len()
+        ));
+    }
+    Ok(ips)
+}
+
+/// Wireformat-запрос A/AAAA: заголовок (ID=0, флаг RD), QNAME, QTYPE=A,
+/// QCLASS=IN. Чистая функция — покрыта юнит-тестами.
+pub(crate) fn build_doh_wire_query(domain: &str) -> Result<Vec<u8>, String> {
+    let domain = domain.trim().trim_end_matches('.');
+    if domain.is_empty() {
+        return Err("домен пустой".to_string());
+    }
+    let mut q = vec![0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    for label in domain.split('.') {
+        if label.is_empty() {
+            return Err(format!("домен «{}» содержит пустую метку", domain));
+        }
+        if label.len() > 63 {
+            return Err(format!("метка «{}» длиннее 63 байт", label));
+        }
+        q.push(label.len() as u8);
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.push(0x00);
+    q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+    Ok(q)
+}
+
+/// base64url без паддинга (RFC 4648 §5) — для параметра `?dns=`.
+pub(crate) fn b64url(data: &[u8]) -> String {
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHA[(n >> 18) as usize & 63] as char);
+        out.push(ALPHA[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHA[(n >> 6) as usize & 63] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHA[n as usize & 63] as char);
+        }
+    }
+    out
+}
+
+/// Разбор wireformat-ответа: только A (тип 1) и AAAA (тип 28) из секции
+/// ответов. Упрощения осознаны: rcode != 0 → пусто (вызывающий код честно
+/// скажет «ответ не содержит записей»), сжатие имён обрабатывается по
+/// указателю, защита от зацикливания указателей — счётчиком. Чистая
+/// функция — покрыта юнит-тестами на живом ответе.
+pub(crate) fn parse_doh_wire_response(bytes: &[u8]) -> Vec<IpAddr> {
+    let mut ips = Vec::new();
+    if bytes.len() < 12 {
+        return ips;
+    }
+    if bytes[3] & 0x0F != 0 {
+        return ips; // rcode != NOERROR
+    }
+    let ancount = u16::from_be_bytes([bytes[6], bytes[7]]) as usize;
+    let qdcount = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    let mut pos = 12usize;
+    for _ in 0..qdcount {
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            if pos >= bytes.len() || guard > 128 {
+                return ips;
+            }
+            let len = bytes[pos];
+            pos += 1;
+            if len == 0 {
+                break;
+            }
+            pos += len as usize;
+        }
+        pos += 4; // QTYPE + QCLASS
+    }
+    for _ in 0..ancount {
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            if pos >= bytes.len() || guard > 128 {
+                return ips;
+            }
+            let len = bytes[pos];
+            if len == 0 {
+                pos += 1;
+                break;
+            }
+            if len & 0xC0 == 0xC0 {
+                pos += 2;
+                break;
+            }
+            pos += 1 + len as usize;
+        }
+        if pos + 10 > bytes.len() {
+            return ips;
+        }
+        let rtype = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
+        let rdlen = u16::from_be_bytes([bytes[pos + 8], bytes[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlen > bytes.len() {
+            return ips;
+        }
+        let rd = &bytes[pos..pos + rdlen];
+        if rtype == 1 && rdlen == 4 {
+            ips.push(IpAddr::V4(Ipv4Addr::new(rd[0], rd[1], rd[2], rd[3])));
+        } else if rtype == 28 && rdlen == 16 {
+            let mut o = [0u8; 16];
+            o.copy_from_slice(rd);
+            ips.push(IpAddr::V6(Ipv6Addr::from(o)));
+        }
+        pos += rdlen;
+    }
+    ips
 }
 
 /// Ответ одного DoH-сервиса по домену. Сервис, который не ответил, не

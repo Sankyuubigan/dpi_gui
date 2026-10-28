@@ -29,6 +29,7 @@ mod fake_payloads;
 mod tls_sni;
 mod quic_sniff;
 mod list_index;
+mod dns_pick;
 mod process_owner;
 mod analysis_queue;
 mod mass_analysis;
@@ -64,19 +65,6 @@ fn open_file(file_type: String) -> Result<(), String> {
     config::open_file_in_editor(&file_type).map_err(|e| e.to_string())
 }
 
-/// Список DoH-сервисов подмены DNS для UI-дропдауна — из дефолт-файла
-/// lists/defaults/doh-services.txt (переписывается при каждом старте).
-/// При сбое чтения файла — встроенный дефолт
-/// (fallback-логика ровно одна, в diagnostics_probe::load_doh_resolvers).
-#[tauri::command]
-fn get_doh_services() -> Vec<String> {
-    let (services, _warnings, _config_error) = diagnostics_probe::load_doh_resolvers();
-    services
-        .iter()
-        .map(|host| format!("https://{}/dns-query", host))
-        .collect()
-}
-
 #[tauri::command]
 fn start_bypass(app: AppHandle, profile_name: String, game_filter: bool) -> Result<String, String> {
     process::start_winws(app, &profile_name, game_filter).map_err(|e| e.to_string())
@@ -98,6 +86,18 @@ fn check_status() -> bool {
 #[tauri::command]
 async fn run_domain_analysis(app: AppHandle, url: String) -> Result<analyzer::DomainAnalysisOutcome, String> {
     analysis_queue::enqueue_manual(app, url).await
+}
+
+/// Скрипт подбора рабочего DNS (отдельная кнопка «Подбор рабочего DNS»):
+/// перебирает doh-services.txt, резолвит домен через каждый сервис и
+/// классифицирует ответы — кто проксирует (рабочий DNS), кто отдаёт прямые
+/// адреса Google (бесполезен для посессийного гео-блока), кто мёртв.
+/// Никаких проб страницы и очереди анализа — только DoH-опрос.
+#[tauri::command]
+async fn pick_dns(url: String) -> Result<dns_pick::DnsPickOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || dns_pick::run_pick(&url))
+        .await
+        .unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
 }
 
 /// Массовый анализ списка «Ошибки сети»: вся пачка в ОДНОМ окне без обхода
@@ -124,13 +124,6 @@ async fn test_profile(app: AppHandle, profile_name: String, url: String, game_fi
         // время ставится на паузу (иначе авто-анализ перемешал бы окна).
         let _guard = analysis_queue::begin_external()?;
         testing::test_single_profile(app, &profile_name, &url, game_filter)
-    }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
-}
-
-#[tauri::command]
-async fn test_dns(url: String, dns_ip: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        testing::test_dns(&url, &dns_ip)
     }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
 }
 
@@ -232,15 +225,14 @@ fn main() {
             save_config,
             get_profiles,
             open_file,
-            get_doh_services,
             start_bypass,
             stop_bypass,
             check_status,
             run_domain_analysis,
             run_mass_analysis,
+            pick_dns,
             apply_solution,
             test_profile,
-            test_dns,
             run_diagnostics,
             apply_hosts_entry,
             remove_hosts_entry,

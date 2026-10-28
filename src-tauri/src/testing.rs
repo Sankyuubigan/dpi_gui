@@ -1,13 +1,8 @@
 use crate::{process, diagnostics_probe};
 use std::thread;
 use std::time::{Duration, Instant};
-use reqwest::blocking::Client;
 use serde::Serialize;
 use tauri::AppHandle;
-use trust_dns_resolver::config::{ResolverConfig, ResolverOpts, NameServerConfig, Protocol};
-use trust_dns_resolver::Resolver;
-use std::net::{SocketAddr, IpAddr};
-use std::str::FromStr;
 
 /// Результат теста одного профиля — возвращается на фронтенд.
 #[derive(Serialize, Debug)]
@@ -96,61 +91,4 @@ pub fn test_single_profile(app: AppHandle, profile_name: &str, url: &str, game_f
         detail,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
-}
-
-pub fn test_dns(url: &str, dns_ip: &str) -> Result<String, String> {
-    let target_url = if !url.starts_with("http") { format!("https://{}", url) } else { url.to_string() };
-
-    // Вытаскиваем домен для резолвинга
-    let parsed_url = url::Url::parse(&target_url).map_err(|e| format!("Неверный URL: {}", e))?;
-    let domain = parsed_url.host_str().ok_or("Не удалось извлечь домен")?.to_string();
-
-    let dns_label = dns_ip.to_string();
-
-    // Два вида резолверов: привычный IP (UDP:53) и DoH-сервис (https://host/dns-query).
-    let resolved_ip: IpAddr;
-    if dns_ip.trim().starts_with("http") {
-        let doh_url = url::Url::parse(dns_ip.trim())
-            .map_err(|e| format!("Неверный URL DoH-резолвера: {}", e))?;
-        let doh_host = doh_url.host_str()
-            .ok_or("Не удалось извлечь хост из DoH-резолвера")?
-            .to_string();
-        let ips = diagnostics_probe::resolve_via_doh(&domain, &doh_host)
-            .map_err(|e| format!("DoH-резолвер {}: {}", doh_host, e))?;
-        resolved_ip = ips.first().copied().ok_or_else(|| {
-            format!("DoH-резолвер {} не вернул IP для {}. Возможно DNS-цензура или сервис недоступен.", doh_host, domain)
-        })?;
-    } else {
-        let dns_addr = IpAddr::from_str(dns_ip.trim()).map_err(|_| "Неверный IP кастомного DNS сервера")?;
-
-        let mut config = ResolverConfig::new();
-        config.add_name_server(NameServerConfig {
-            socket_addr: SocketAddr::new(dns_addr, 53),
-            protocol: Protocol::Udp,
-            tls_dns_name: None,
-            trust_negative_responses: false,
-            tls_config: None,
-            bind_addr: None,
-        });
-
-        // Делаем запрос к кастомному DNS (например, 1.1.1.1)
-        let resolver = Resolver::new(config, ResolverOpts::default()).map_err(|e| format!("Ошибка инициализации DNS клиента: {}", e))?;
-        let response = resolver.lookup_ip(&domain).map_err(|e| format!("Сбой резолвинга (возможно DNS недоступен или домен заблокирован на уровне DNS): {}", e))?;
-        let resolved = response.iter().next().ok_or("Кастомный DNS не вернул IP адреса!")?;
-        resolved_ip = resolved;
-    }
-
-    // Подменяем IP в запросе к reqwest (эмитируем Host заголовок)
-    let client = Client::builder()
-        .resolve(&domain, SocketAddr::new(resolved_ip, 443))
-        .resolve(&domain, SocketAddr::new(resolved_ip, 80))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-
-    match client.get(&target_url).send() {
-        Ok(res) if res.status().is_success() => Ok(format!("УСПЕХ (200 OK)\n DNS: {}\n Разрешенный IP: {}", dns_label, resolved_ip)),
-        Ok(res) => Ok(format!("Доступно, но статус: {}\n DNS: {}\n IP: {}", res.status(), dns_label, resolved_ip)),
-        Err(e) => Ok(format!("ОШИБКА подключения:\n DNS: {}\n IP: {}\n Причина: {}", dns_label, resolved_ip, e))
-    }
 }
