@@ -477,11 +477,21 @@ pub fn resolve_via_doh(domain: &str, doh_host: &str) -> Result<Vec<IpAddr>, Stri
     let domain_owned = domain.to_string();
     let svc = doh_host.to_string();
     let boot = bootstrap.clone();
+    // Бюджет растёт с числом бутстрап-IP: на каждый — попытка (клиент 5 с)
+    // плюс запас. Один IP → 8 с, как раньше; перебор 7 адресов (eu.geohide.ru)
+    // не обрезается общим потолком раньше времени.
+    let wire_ms = 3000 + 5000 * bootstrap.len() as u64;
     let wire = run_with_timeout(
         move || doh_wire_get(&svc, &domain_owned, &boot),
-        8000,
+        wire_ms,
     )
-    .unwrap_or_else(|| Err(format!("сервис {} не ответил за 8 с (таймаут)", doh_host)));
+    .unwrap_or_else(|| {
+        Err(format!(
+            "сервис {} не ответил за {} с (таймаут)",
+            doh_host,
+            wire_ms / 1000
+        ))
+    });
 
     match wire {
         Ok(ips) => Ok(ips),
@@ -547,14 +557,24 @@ fn trust_dns_doh(
 /// DoH-запрос через reqwest GET (RFC 8484 §4.1): wireformat в параметре
 /// `?dns=` (base64url), accept: application/dns-message. IP подставляется
 /// на уровне сокета (бутстрап), имя сервиса остаётся в SNI.
+///
+/// Перебирает ВСЕ бутстрап-IP до первого успеха: пробовать только первый
+/// (`bootstrap.first()`) — попадание в недоступный адрес валило весь сервис
+/// при живых остальных (кейс eu.geohide.ru 28.10.26: 7 A-записей, ответ
+/// приходит не с каждого; curl и браузер тем временем работали). При неудаче —
+/// построчный список «IP — причина» (запрет молчаливых ошибок).
 fn doh_wire_get(host: &str, domain: &str, bootstrap: &[IpAddr]) -> Result<Vec<IpAddr>, String> {
     let query = build_doh_wire_query(domain)?;
     let q = b64url(&query);
-    let mut builder = Client::builder().timeout(Duration::from_secs(5));
-    if let Some(ip) = bootstrap.first() {
-        builder = builder.resolve(host, SocketAddr::new(*ip, 443));
-    }
-    let client = builder
+    try_bootstrap_ips(bootstrap, |ip| doh_wire_get_via(host, &q, ip))
+}
+
+/// Одна попытка `GET /dns-query` через конкретный бутстрап-IP (клиент
+/// создаётся на попытку: адрес подставляется в resolve при сборке).
+fn doh_wire_get_via(host: &str, q: &str, ip: IpAddr) -> Result<Vec<IpAddr>, String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .resolve(host, SocketAddr::new(ip, 443))
         .build()
         .map_err(|e| format!("не удалось создать HTTP-клиент: {}", e))?;
     let resp = client
@@ -578,6 +598,25 @@ fn doh_wire_get(host: &str, domain: &str, bootstrap: &[IpAddr]) -> Result<Vec<Ip
         ));
     }
     Ok(ips)
+}
+
+/// Перебор бутстрап-IP до первого успеха. Логика попыток — чистая функция,
+/// сеть остаётся в замыкании; покрыта юнит-тестами.
+fn try_bootstrap_ips<F>(bootstrap: &[IpAddr], mut attempt: F) -> Result<Vec<IpAddr>, String>
+where
+    F: FnMut(IpAddr) -> Result<Vec<IpAddr>, String>,
+{
+    if bootstrap.is_empty() {
+        return Err("бутстрап пуст: нет IP для попыток".to_string());
+    }
+    let mut fails: Vec<String> = Vec::new();
+    for ip in bootstrap {
+        match attempt(*ip) {
+            Ok(ips) => return Ok(ips),
+            Err(e) => fails.push(format!("{} — {}", ip, e)),
+        }
+    }
+    Err(format!("все IP бутстрапа недоступны: {}", fails.join("; ")))
 }
 
 /// Wireformat-запрос A/AAAA: заголовок (ID=0, флаг RD), QNAME, QTYPE=A,
@@ -921,6 +960,14 @@ pub fn has_ipv6(domain: &str) -> bool {
 /// по ВСЕЙ цепочке причин через source().
 pub fn classify_reqwest_err(e: &reqwest::Error) -> HttpResult {
     let mut msg = e.to_string().to_lowercase();
+    // URL верхней ошибки выбрасываем из текста: адрес DoH-запроса сам несёт
+    // «/dns-query», и ЛЮБОЙ сбой (connect/TLS/timeout) классифицировался как
+    // Dns по подстроке в адресе (кейс eu.geohide.ru 28.10.26). Реальный этап
+    // ищем по цепочке source(): там «dns» встречается только у настоящих
+    // DNS-сбоев.
+    if let Some(url) = e.url() {
+        msg = strip_url(&msg, &url.as_str().to_lowercase());
+    }
     let mut src: Option<&dyn std::error::Error> = e.source();
     while let Some(s) = src {
         msg.push(' ');
@@ -928,6 +975,15 @@ pub fn classify_reqwest_err(e: &reqwest::Error) -> HttpResult {
         src = s.source();
     }
     classify_err_text(&msg)
+}
+
+/// Убирает текст URL из сообщения об ошибке (оба аргумента — в нижнем
+/// регистре). Если URL в текст не попал — сообщение без изменений.
+fn strip_url(msg: &str, url_lower: &str) -> String {
+    if url_lower.is_empty() || !msg.contains(url_lower) {
+        return msg.to_string();
+    }
+    msg.replace(url_lower, " ")
 }
 
 /// Классификация по тексту ошибки — чистая функция, покрыта юнит-тестами.
@@ -1227,5 +1283,100 @@ mod tests {
     fn gateway_owner_empty_map_is_none() {
         let answers = DohAnswers::default();
         assert_eq!(answers.gateway_owner(&"1.2.3.4".parse().unwrap()), None);
+    }
+
+    /// Перебор бутстрап-IP: успех засчитывается на любом элементе, не только
+    /// на первом (кейс eu.geohide.ru — первый IP мёртв, второй отвечает).
+    #[test]
+    fn try_bootstrap_ips_falls_through_dead_first() {
+        let ips: Vec<IpAddr> = ["192.0.2.1", "192.0.2.2"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let mut tried: Vec<IpAddr> = Vec::new();
+        let dead: IpAddr = "192.0.2.1".parse().unwrap();
+        let res = try_bootstrap_ips(&ips, |ip| {
+            tried.push(ip);
+            if ip == dead {
+                Err("GET /dns-query не выполнен: Rst".to_string())
+            } else {
+                Ok(vec!["1.2.3.4".parse().unwrap()])
+            }
+        });
+        assert_eq!(res, Ok(vec!["1.2.3.4".parse().unwrap()]));
+        assert_eq!(tried, ips, "попытки идут в порядке бутстрапа, до первого успеха");
+    }
+
+    /// Все попытки неудачны — ошибка перечисляет КАЖДЫЙ IP с его причиной.
+    #[test]
+    fn try_bootstrap_ips_lists_every_failure() {
+        let ips: Vec<IpAddr> = ["192.0.2.1", "192.0.2.2"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let msg = try_bootstrap_ips(&ips, |ip| Err(format!("причина-{}", ip))).unwrap_err();
+        assert!(msg.contains("192.0.2.1 — причина-192.0.2.1"), "{}", msg);
+        assert!(msg.contains("192.0.2.2 — причина-192.0.2.2"), "{}", msg);
+    }
+
+    /// Пустой бутстрап — честная ошибка, а не «успех с нулём попыток».
+    #[test]
+    fn try_bootstrap_ips_empty_is_error() {
+        let res = try_bootstrap_ips(&[], |_| Ok(vec!["1.2.3.4".parse().unwrap()]));
+        assert!(res.is_err());
+    }
+
+    /// URL DoH-запроса выбрасывается из текста ошибки: подстрока «dns» в
+    /// адресе не должна превращать connect-сбой в DNS-ошибку.
+    #[test]
+    fn strip_url_removes_doh_url_from_message() {
+        let url = "https://eu.geohide.ru/dns-query?dns=aa";
+        let msg = format!("error sending request for url ({}): tcp connect error", url)
+            .to_lowercase();
+        let stripped = strip_url(&msg, &url.to_lowercase());
+        assert!(!stripped.contains("dns"), "{}", stripped);
+        assert!(stripped.contains("tcp connect error"), "{}", stripped);
+        // URL, которого нет в тексте (или пустая строка), ничего не меняет.
+        assert_eq!(strip_url("ошибка без url", "https://x.test/dns-query"), "ошибка без url");
+        assert_eq!(strip_url("ошибка", ""), "ошибка");
+    }
+
+    /// Остаток сообщения после выбрасывания URL классифицируется по реальному
+    /// этапу: connect-сбой — Rst, а не Dns. Контроль подтверждает старую ложь.
+    #[test]
+    fn doh_url_does_not_force_dns_classification() {
+        let url = "https://eu.geohide.ru/dns-query?dns=aa";
+        let msg = format!(
+            "error sending request for url ({}): client error (connect): tcp connect error (os error 10061)",
+            url
+        )
+        .to_lowercase();
+        assert_eq!(classify_err_text(&strip_url(&msg, &url)), HttpResult::Rst);
+        // Без выбрасывания URL старый код ложно давал Dns по подстроке адреса.
+        assert_eq!(classify_err_text(&msg), HttpResult::Dns);
+    }
+
+    /// Реальная ошибка reqwest (закрытый loopback-порт) на URL /dns-query
+    /// НЕ классифицируется как Dns: URL выбрасывается из текста до
+    /// классификации, итог называет реальный этап соединения. Rst или
+    /// Timeout — зависит от того, отвергнут порт или дропнут файрволом.
+    #[test]
+    fn real_reqwest_doh_url_connect_fail_is_not_dns() {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .no_proxy()
+            .build()
+            .expect("клиент собирается");
+        let err = client
+            .get("https://127.0.0.1:1/dns-query?dns=AA")
+            .send()
+            .expect_err("порт 1 на loopback закрыт — обязана быть ошибка");
+        let res = classify_reqwest_err(&err);
+        assert_ne!(res, HttpResult::Dns, "{:?}", res);
+        assert!(
+            matches!(res, HttpResult::Rst | HttpResult::Timeout),
+            "connect-сбой обязан называться Rst/Timeout, а не {:?}",
+            res
+        );
     }
 }
