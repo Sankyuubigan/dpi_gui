@@ -24,9 +24,28 @@ pub(crate) fn be24(b: &[u8], off: usize) -> usize {
     ((b[off] as usize) << 16) | ((b[off + 1] as usize) << 8) | b[off + 2] as usize
 }
 
+/// Строгий hostname: только [a-z0-9.-] (после lowercase), непустой, с точкой,
+/// без точек на краях и двойных точек подряд. Это фильтр МУСОРА, а не полный
+/// RFC-валидатор. Мотивация (кейс 30.10.26): fake-TLS-тулы (TgWsProxy и т.п.)
+/// шлют ClientHello с произвольной строкой в SNI — URL с «https://» и набивкой
+/// из NUL-байтов; NUL — валидный UTF-8 и trim его не убирает, а через DNS-запросы
+/// (DoH 400) и список «Ошибки сети» такой «домен» ломился в анализ. Обычный SNI
+/// браузеров/приложений всегда проходит; UTF-8 без NUL здесь гарантирует from_utf8.
+fn is_valid_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.contains('.')
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+        && !host.contains("..")
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+}
+
 /// Распарсить TLS ClientHello из байтов потока (TCP payload / TLS record) и
 /// взять SNI. Гарантии: не паникует на мусоре/обрезанных байтах; берёт ПЕРВЫЙ
-/// server_name с name_type = 0; домен — lowercase, содержащий хотя бы одну точку.
+/// server_name с name_type = 0; домен — lowercase, с точкой, только из символов
+/// имени хоста ([a-z0-9.-]) — см. `is_valid_hostname`.
 pub fn parse_client_hello(b: &[u8]) -> CliHelloStatus {
     if b.is_empty() {
         return CliHelloStatus::Incomplete;
@@ -121,9 +140,9 @@ pub fn parse_client_hello(b: &[u8]) -> CliHelloStatus {
                 if let Ok(host) = std::str::from_utf8(host_bytes) {
                     let host = host.trim().to_ascii_lowercase();
                     let host = host.trim_end_matches('.');
-                    // Домен обязан быть непустым и содержать точку (SNI-«localhost»
-                    // и пустые имена детектору не интересны).
-                    if !host.is_empty() && host.contains('.') {
+                    // Домен обязан быть валидным именем хоста: SNI-«localhost»,
+                    // пустые имена и МУСОР детектору не интересны.
+                    if is_valid_hostname(host) {
                         return CliHelloStatus::Found(host.to_string());
                     }
                 }
@@ -221,6 +240,45 @@ mod tests {
         match parse_client_hello(bare) {
             CliHelloStatus::Found(host) => assert_eq!(host, "example.test"),
             other => panic!("ожидали Found, получили {:?}", other),
+        }
+    }
+
+    // ---- Санитизация SNI (кейс 30.10.26: fake-TLS-тулы шлют мусорные SNI) ----
+
+    /// Мусорный SNI fake-TLS-тула: URL-строка с NUL-набивкой (реальный кейс
+    /// «https://ww\0\0…com» из отчёта массового анализа) не должен попадать
+    /// в список ошибок ни под каким видом.
+    #[test]
+    fn garbage_sni_with_url_and_nul_padding_is_rejected() {
+        let junk: &[&[u8]] = &[
+            b"https://ww\x00\x00\x00\x00\x00\x00\x00.com",
+            b"ww\x00\x00\x00.com",
+            b"e\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00gstatic.com",
+            b"https://example.com/path",
+            b"not a hostname",
+            b"my_site.example.com", // подчёркивание — не символ имени хоста в SNI
+            b"..double.dots..",
+        ];
+        for host in junk {
+            let res = parse_client_hello(&build_client_hello(host));
+            assert_eq!(res, CliHelloStatus::NotClientHello, "мусорный SNI {:?} обязан быть отброшен", host);
+        }
+    }
+
+    /// Нормальные имена (дефисы, цифры, многоуровневые, punycode) проходят.
+    #[test]
+    fn valid_hostnames_still_pass() {
+        for host in [
+            &b"example.org"[..],
+            b"my-site.example.org",
+            b"123.host.example",
+            b"xn--80ak6aa92e.example",
+            b"a.b.c.d.example.co.uk",
+        ] {
+            match parse_client_hello(&build_client_hello(host)) {
+                CliHelloStatus::Found(h) => assert_eq!(h, String::from_utf8_lossy(host)),
+                other => panic!("валидный SNI {:?} отброшен: {:?}", host, other),
+            }
         }
     }
 }

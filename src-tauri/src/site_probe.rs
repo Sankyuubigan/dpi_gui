@@ -986,6 +986,41 @@ pub fn hosts_entries(probe: &DomainProbe) -> Vec<String> {
     hosts_lines(&probe.host, ip)
 }
 
+/// Факт о записи в системном hosts для анализируемого домена: закреплённый IP
+/// и результат HTTPS-пробы через него. Мотивация (кейс 30.10.26): пробы анализа
+/// резолвят DNS мимо hosts (trust-dns по nameserver'ам), а браузер юзера — ПО
+/// hosts; закреплённый и умерший IP был невидим анализу, хотя именно он ломал
+/// сайт («прописали IP — он умер»).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostsPin {
+    pub domain: String,
+    pub ip: String,
+    pub http: HttpResult,
+}
+
+/// Сломана ли запись hosts для юзера: «сайт через запись не открывается».
+/// Единый критерий для отчёта и решения (SSOT): любой ответ кроме живого
+/// HTTP — запись не работает (RST/таймаут — адрес мёртв; отказ/страница
+/// блокировки — адрес жив, но сайт через него не открыть).
+pub fn hosts_pin_is_broken(http: &HttpResult) -> bool {
+    !matches!(http, HttpResult::Ok(_))
+}
+
+/// Пробы закреплённых в hosts адресов домена (IP берутся из hosts-карты
+/// `hosts::load_hosts_map`). Проба та же, что у кнопки «В hosts + тест»
+/// ([`probe_https_by_ip`]): соединение по IP с SNI домена.
+pub fn probe_hosts_pins(host: &str, ips: &[String]) -> Vec<HostsPin> {
+    ips.iter()
+        .map(|ip| {
+            let http = match ip.parse::<std::net::IpAddr>() {
+                Ok(addr) => probe_https_by_ip(host, addr),
+                Err(_) => HttpResult::Other(format!("«{}» — не похоже на IP-адрес", ip)),
+            };
+            HostsPin { domain: host.to_string(), ip: ip.clone(), http }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

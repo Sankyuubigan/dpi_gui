@@ -179,6 +179,23 @@ pub fn run_mass(app: &AppHandle, requested: Vec<String>) -> Result<String, Strin
     let mut facts = facts_broken;
     facts.extend(collect_facts_on(&light_hosts));
 
+    // Факт «закреплено в hosts» (кейс 30.10.26: прописали IP — он умер):
+    // карта грузится РАЗ на прогон (SSOT, как карты списков ниже); пробы
+    // закреплённых адресов — в рабочем состоянии обхода (после окна), как
+    // по ним ходит браузер юзера. Пинов обычно нет ни у одного домена —
+    // лишних сетевых проб почти не добавляется.
+    let hosts_map = match crate::hosts::load_hosts_map() {
+        Ok(m) => m,
+        Err(e) => {
+            app_log(
+                app,
+                format!("[Массовый анализ] hosts не прочитан — закреплённые записи не проверены: {}", e),
+            );
+            HashMap::new()
+        }
+    };
+    let pins_map = hosts_pins_parallel(&hosts, &hosts_map);
+
     // === Фаза 3: классификация + отчёт + решение по каждому домену ===
     // Классификация — вне окна: это чистые вычисления над уже собранными
     // фактами (те же classify_single/classify_dual, что в одиночном анализе).
@@ -244,6 +261,7 @@ pub fn run_mass(app: &AppHandle, requested: Vec<String>) -> Result<String, Strin
             block_scan: f.block_scan,
             bypass_map: bypass_map.clone(),
             exclude_set: exclude_set.clone(),
+            hosts_pins: pins_map.get(h).cloned().unwrap_or_default(),
         };
         let mut report = analyzer_report::build_report(&meta, &classification);
         let solution = site_solution::decide(&meta, &classification);
@@ -295,6 +313,41 @@ fn set_if(cond: bool, host: &str) -> HashSet<String> {
     } else {
         HashSet::new()
     }
+}
+
+/// Пробы закреплённых в hosts адресов — параллельно (поток на домен), и
+/// ТОЛЬКО для доменов, у которых записи есть: пинов обычно ноль, лишних
+/// сетевых проб не заводим.
+fn hosts_pins_parallel(
+    hosts: &[String],
+    map: &HashMap<String, Vec<String>>,
+) -> HashMap<String, Vec<site_probe::HostsPin>> {
+    let mut out: HashMap<String, Vec<site_probe::HostsPin>> = HashMap::new();
+    let with_pins: Vec<&String> = hosts
+        .iter()
+        .filter(|h| map.contains_key(h.as_str()))
+        .collect();
+    if with_pins.is_empty() {
+        return out;
+    }
+    let pin_hosts = with_pins.len();
+    let (tx, rx) = mpsc::channel::<(String, Vec<site_probe::HostsPin>)>();
+    for h in with_pins {
+        let tx = tx.clone();
+        let h = h.clone();
+        let ips = map.get(&h).cloned().unwrap_or_default();
+        thread::spawn(move || {
+            let pins = site_probe::probe_hosts_pins(&h, &ips);
+            let _ = tx.send((h, pins));
+        });
+    }
+    drop(tx);
+    for _ in 0..pin_hosts {
+        if let Ok((h, pins)) = rx.recv() {
+            out.insert(h, pins);
+        }
+    }
+    out
 }
 
 /// Домены из «не резолвится»: DNS-ошибка в пробе #1 (с обходом) или в

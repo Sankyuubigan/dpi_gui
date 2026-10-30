@@ -38,6 +38,10 @@ pub struct ReportMeta {
     /// проверяются раньше include-листов — nfq/hostlist.c), ни повторно
     /// в исключения.
     pub exclude_set: std::collections::HashSet<String>,
+    /// Записи системного hosts для главного домена и результат HTTPS-пробы
+    /// через каждый закреплённый IP (кейс 30.10.26: прописали IP — он умер,
+    /// а анализ этого не видел: резолвит мимо hosts, браузер — по hosts).
+    pub hosts_pins: Vec<site_probe::HostsPin>,
 }
 
 /// Путь к пользовательскому general-листу (для подсказок «добавьте в обход»).
@@ -75,6 +79,10 @@ pub fn build_report(meta: &ReportMeta, c: &Classification) -> String {
 
     // Факты по главному домену (DNS, IP, матрица проб).
     write_main_domain(&mut log, meta);
+
+    // Закреплённые в hosts адреса главного домена и живость каждого — факт,
+    // который раньше был невидим анализу (браузер ходит по hosts мимо DNS).
+    write_hosts_pins(&mut log, meta);
 
     // Автопроверка подмены DNS — если обычный DNS отравлен и сайт не открывается.
     write_dns_substitution(&mut log, meta);
@@ -338,6 +346,44 @@ fn write_address_table(log: &mut String, probe: &site_probe::DomainProbe) {
     if let Some(wh) = &probe.www_host {
         if !probe.www_ips.is_empty() {
             log.push_str(&format!("    www «{}»: {}\n", wh, probe.www_ips.join(", ")));
+        }
+    }
+    log.push('\n');
+}
+
+/// Блок «Закреплено в hosts»: записи системного hosts для главного домена и
+/// результат HTTPS-пробы через каждый закреплённый IP. Печатается только при
+/// наличии записей — их отсутствие норма, а не событие (молчание честно).
+/// Блок обязан печататься при ЛЮБОМ вердикте: закреплённый мёртвый IP ломает
+/// сайт юзера даже когда DNS-путь (который пробует анализ) открыт.
+fn write_hosts_pins(log: &mut String, meta: &ReportMeta) {
+    if meta.hosts_pins.is_empty() {
+        return;
+    }
+    let host = &meta.hosts_pins[0].domain;
+    log.push_str(&format!("📌 ЗАКРЕПЛЕНО В HOSTS ({}):\n", host));
+    log.push_str("    Браузер идёт по этим адресам НАПРЯМУЮ, минуя DNS (пробы анализа резолвят мимо hosts).\n");
+    for pin in &meta.hosts_pins {
+        let note = crate::site_verdict::http_result_note(&pin.http);
+        if !site_probe::hosts_pin_is_broken(&pin.http) {
+            if let HttpResult::Ok(code) = &pin.http {
+                log.push_str(&format!("  ✅ {} — запись живая (HTTP {})\n", pin.ip, code));
+            }
+        } else {
+            match &pin.http {
+                HttpResult::BlockPage | HttpResult::Forbidden(_) | HttpResult::ServiceRestrict => {
+                    log.push_str(&format!(
+                        "  ⚠️ {} — {} — сайт через запись НЕ открывается: запись бесполезна, уберите её или замените живым адресом\n",
+                        pin.ip, note
+                    ));
+                }
+                _ => {
+                    log.push_str(&format!(
+                        "  ❌ {} — {} — запись ведёт на МЁРТВЫЙ адрес: домен будет падать, пока запись не убрать («Убрать» на вкладке «Починка сайтов») или не заменить живым\n",
+                        pin.ip, note
+                    ));
+                }
+            }
         }
     }
     log.push('\n');
@@ -942,6 +988,7 @@ mod tests {
             block_scan: None,
             bypass_map: std::collections::HashMap::new(),
             exclude_set: std::collections::HashSet::new(),
+            hosts_pins: Vec::new(),
         }
     }
 

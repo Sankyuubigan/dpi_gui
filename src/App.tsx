@@ -31,7 +31,8 @@ export interface Suspicion {
 export type SolutionAction =
   | { type: "addToBypassList"; domains: string[] }
   | { type: "addToExcludeList"; domains: string[] }
-  | { type: "writeHosts"; ip: string; domain: string };
+  | { type: "writeHosts"; ip: string; domain: string }
+  | { type: "removeHosts"; domain: string };
 
 export interface SiteSolution {
   found: boolean;
@@ -202,7 +203,14 @@ export default function App() {
   };
 
   return (
-    <div className="flex flex-col h-full bg-gray-50">
+    <div
+      className="flex flex-col h-full bg-gray-50"
+      // ПКМ в программе отключена ВЕЗДЕ (по требованию UI): нативное контекстное
+      // меню webview только мешает. Исключение — строки «Ошибок сети» в
+      // ControlTab: их onContextMenu делает stopPropagation, так что этот
+      // обработчик для них не срабатывает и открывается наше ПКМ-меню.
+      onContextMenu={(e) => e.preventDefault()}
+    >
       {/* Навигация */}
       <div className="flex border-b bg-white shadow-sm">
         <button

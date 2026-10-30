@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, type Dispatch, type SetStateAction, type ReactNode } from "react";
+import { useState, useEffect, useRef, type Dispatch, type SetStateAction, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Play, Square, Activity, Eye, Terminal, Trash2, Search, Copy,
@@ -38,10 +38,48 @@ export default function ControlTab({
   const [selectedDomain, setSelectedDomain] = useState<string | null>(null);
   // Идёт массовый анализ (локальная блокировка кнопки до ответа команды).
   const [massPending, setMassPending] = useState(false);
+  // Идёт «Починить все» (батч-применение решений).
+  const [fixAllPending, setFixAllPending] = useState(false);
+  // Открытое контекстное меню (ПКМ) строки списка ошибок: позиция курсора
+  // и домен строки. null = меню закрыто. Единственное ПКМ-меню в программе.
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; domain: string } | null>(null);
+  // Существующие записи системного hosts для доменов списка (чип «в hosts: …»).
+  // Проверка нужна, чтобы видеть сценарий «прописали IP в hosts, он умер —
+  // домен падает»: анализ резолвит DNS мимо hosts, а браузер — по hosts.
+  const [hostsMap, setHostsMap] = useState<Record<string, string[]>>({});
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "auto" });
   }, [logs]);
+
+  // Esc закрывает контекстное меню (клики мимо закрывает оверлей).
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setCtxMenu(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [ctxMenu]);
+
+  // Записи hosts для доменов списка: перечитываются с дебаунсом при изменении
+  // списка и при каждом заходе на вкладку (компонент монтируется заново),
+  // иначе чип соврал бы после ручных правок hosts на другой вкладке.
+  useEffect(() => {
+    if (suspicions.length === 0) {
+      setHostsMap({});
+      return;
+    }
+    const t = setTimeout(() => {
+      invoke<Record<string, string[]>>("hosts_entries_for_domains", {
+        domains: suspicions.map(s => s.domain),
+      })
+        .then(setHostsMap)
+        .catch((e) => logMsg(`Ошибки сети: не удалось проверить записи hosts: ${e}`));
+    }, 600);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [suspicions]);
 
   // PRP §7.1: храним до 5000 строк в App, рендерим последние ~500 для скорости.
   const visibleLogs = logs.slice(-500);
@@ -65,6 +103,23 @@ export default function ControlTab({
     logMsg(`Ошибки сети: домен ${domain} отправлен на вкладку «Починка сайтов»`);
     onFixDomain(domain);
   };
+
+  // Контекстное меню строки (ПКМ): выбор позиции под курсором + открытие меню
+  // у курсора (с отступом от краёв окна, чтобы меню не уходило за экран).
+  const openContextMenu = (e: ReactMouseEvent, domain: string) => {
+    e.preventDefault();
+    e.stopPropagation(); // глобальный запрет ПКМ в App не должен гасить это меню
+    setSelectedDomain(domain);
+    const MENU_W = 240;
+    const MENU_H = 130;
+    setCtxMenu({
+      x: Math.min(e.clientX, window.innerWidth - MENU_W),
+      y: Math.min(e.clientY, window.innerHeight - MENU_H),
+      domain,
+    });
+  };
+
+  const closeContextMenu = () => setCtxMenu(null);
 
   // Статус анализа выбранной позиции и готовность «Починить».
   const selectedAnalysis = selectedDomain ? analysisMap[selectedDomain] : undefined;
@@ -106,6 +161,42 @@ export default function ControlTab({
     }
   };
 
+  // «Починить все»: все найденные решения пачкой одной командой (бэкенд сливает
+  // их в ОДНУ правку списков и ОДИН перезапуск обхода); домены без решения
+  // очищаются из списка. При ошибке применения список НЕ трогаем — честно
+  // оставляем как было (правило core §2.2: ошибка ≠ тихая «очистка»).
+  const fixAll = async () => {
+    if (suspicions.length === 0 || analysisBusy) return;
+    const rows = suspicions.map(s => ({ domain: s.domain, an: analysisMap[s.domain] }));
+    const solutions = rows
+      .filter(r => r.an?.state === "done" && r.an?.solution?.found)
+      .map(r => r.an!.solution!);
+    const noSolution = rows.filter(r => r.an?.state === "done" && !r.an?.solution?.found).length;
+    const notAnalyzed = rows.length - solutions.length - noSolution;
+    setFixAllPending(true);
+    try {
+      let applied = 0;
+      if (solutions.length > 0) {
+        logMsg(`Починить все: применяю ${solutions.length} реш. (один перезапуск обхода)...`);
+        const result: string = await invoke("apply_solutions_batch", { solutions });
+        for (const line of result.split("\n")) logMsg(line);
+        applied = solutions.length;
+      }
+      // Всё обработано: с решениями — применено, остальные — очищены по задумке.
+      setSuspicions([]);
+      setSelectedDomain(null);
+      logMsg(
+        `Починить все: готово — применено решений: ${applied}; очищено позиций: ` +
+        `${noSolution} без решения, ${notAnalyzed} без анализа.` +
+        (notAnalyzed > 0 ? " Повторные ошибки домена снова попадут в список." : "")
+      );
+    } catch (e: any) {
+      logMsg(`Починить все: ошибка — список не изменён: ${e}`);
+    } finally {
+      setFixAllPending(false);
+    }
+  };
+
   // Запись одной позиции списка — человекочитаемая строка (то, что видно в UI).
   const suspicionLine = (s: Suspicion): string => {
     const parts = [
@@ -128,6 +219,12 @@ export default function ControlTab({
       else if (an.state === "failed") parts.push(`анализ — ошибка: ${an.error || "неизвестная"}`);
       else if (an.state === "running") parts.push("анализ — идёт");
       else if (an.state === "queued") parts.push("анализ — в очереди");
+    }
+    // Записи hosts показываем только когда они есть: отсутствие записи —
+    // норма, а не событие (в UI — тот же принцип: чипа нет = записей нет).
+    const hostsIps = hostsMap[s.domain];
+    if (hostsIps && hostsIps.length > 0) {
+      parts.push(`в hosts: ${hostsIps.join(", ")}`);
     }
     return parts.join(" — ");
   };
@@ -261,7 +358,9 @@ export default function ControlTab({
           </div>
           {/* Кнопки списка. Авто-анализа больше НЕТ: он глушил обход чаще,
               чем тот был включён (инцидент 27.10.26). Анализ — только по
-              кнопке «Массовый анализ»: вся пачка в одном окне без обхода. */}
+              кнопке «Массовый анализ»: вся пачка в одном окне без обхода.
+              Точечные действия (Анализ / Починить / Очистить) — в контекстном
+              меню по ПКМ на строке списка (ниже), в шапке их больше нет. */}
           <div className="flex items-center gap-3">
             {suspicions.length > 0 && (
               <div className="flex items-center gap-2">
@@ -283,67 +382,32 @@ export default function ControlTab({
                 {massPending ? <Loader2 size={16} className="animate-spin" /> : <Search size={16} />}
                 Массовый анализ
               </button>
+              {/* «Починить все»: найденные решения применяются пачкой (одна правка
+                  списков + один перезапуск обхода), домены без решения удаляются. */}
+              <button
+                onClick={fixAll}
+                disabled={analysisBusy || fixAllPending}
+                className={
+                  "flex items-center gap-2 px-4 py-2 rounded-md font-bold text-sm transition-colors border " +
+                  (analysisBusy || fixAllPending
+                    ? "border-gray-200 text-gray-400 cursor-not-allowed"
+                    : "border-orange-400 text-orange-700 hover:bg-orange-50")
+                }
+                title={
+                  analysisBusy || fixAllPending
+                    ? "Дождитесь завершения анализа/починки"
+                    : "Применить ВСЕ найденные решения пачкой (один перезапуск обхода) и очистить из списка домены без решения. Повторные ошибки домена снова попадут в список"
+                }
+              >
+                {fixAllPending ? <Loader2 size={16} className="animate-spin" /> : <Wrench size={16} />}
+                Починить все
+              </button>
               <button
                 onClick={copyList}
                 className="flex items-center gap-2 px-4 py-2 rounded-md font-bold text-sm transition-colors border border-gray-300 text-gray-600 hover:bg-gray-50"
-                title="Скопировать весь список ошибок (домен, причина, процесс, списки, счётчик, время и результат анализа) в буфер обмена"
+                title="Скопировать ВЕСЬ список ошибок (домен, причина, процесс, списки, счётчик, время и результат анализа) в буфер обмена"
               >
-                <Copy size={16} /> Копировать
-              </button>
-              <button
-                onClick={sendDomainToFix}
-                disabled={!selectedDomain}
-                className={
-                  "flex items-center gap-2 px-4 py-2 rounded-md font-bold text-sm transition-colors border " +
-                  (selectedDomain
-                    ? "border-purple-300 text-purple-600 hover:bg-purple-50"
-                    : "border-gray-200 text-gray-400 cursor-not-allowed")
-                }
-                title={
-                  selectedDomain
-                    ? `Перенести домен на вкладку «Починка сайтов» для анализа: ${selectedDomain}`
-                    : "Сначала выберите позицию — кликните на строку списка"
-                }
-              >
-                <Search size={16} /> Анализ
-              </button>
-              {/* «Починить»: активна, только когда у выбранного домена готово
-                  найденное решение (бейдж «решение: …»). */}
-              <button
-                onClick={fixSelected}
-                disabled={!canFixSelected}
-                className={
-                  "flex items-center gap-2 px-4 py-2 rounded-md font-bold text-sm transition-colors border " +
-                  (canFixSelected
-                    ? "border-orange-300 text-orange-600 hover:bg-orange-50"
-                    : "border-gray-200 text-gray-400 cursor-not-allowed")
-                }
-                title={
-                  canFixSelected
-                    ? `Применить решение: ${selectedAnalysis?.solution?.summary}`
-                    : selectedAnalysis?.state === "done" && selectedAnalysis.noneReason
-                      ? `Решения нет: ${selectedAnalysis.noneReason}`
-                      : "Кнопка активируется, когда для выбранного домена анализ найдёт решение (дождитесь бейджа «решение: …»)"
-                }
-              >
-                <Wrench size={16} /> Починить
-              </button>
-              <button
-                onClick={clearSelected}
-                disabled={!selectedDomain}
-                className={
-                  "flex items-center gap-2 px-4 py-2 rounded-md font-bold text-sm transition-colors border " +
-                  (selectedDomain
-                    ? "border-red-300 text-red-600 hover:bg-red-50"
-                    : "border-gray-200 text-gray-400 cursor-not-allowed")
-                }
-                title={
-                  selectedDomain
-                    ? `Удалить выбранную позицию из списка: ${selectedDomain}`
-                    : "Сначала выберите позицию — кликните на строку списка"
-                }
-              >
-                <Trash2 size={16} /> Очистить
+                <Copy size={16} /> Копировать все
               </button>
               </div>
             )}
@@ -355,6 +419,8 @@ export default function ControlTab({
             детектором, когда обход активен. Анализ доменов — по кнопке
             «Массовый анализ» (одно выключение обхода на весь список) или
             вручную через «Анализ» на вкладке «Починка сайтов».
+            Точечные действия над позицией — в контекстном меню по ПКМ
+            на строке списка.
           </p>
         ) : (
           <div className="max-h-48 overflow-y-auto divide-y divide-gray-100">
@@ -380,7 +446,7 @@ export default function ControlTab({
                 badgeIcon = <CheckCircle2 size={10} />;
                 badgeText = `решение: ${an.summary}`;
                 badgeCls = "border-green-200 bg-green-50 text-green-700";
-                badgeTitle = `Найденное решение: ${an.summary}\n\nКнопка «Починить» применит его к выбранной позиции.`;
+                badgeTitle = `Найденное решение: ${an.summary}\n\n«Починить все» в шапке применит его, либо ПКМ по строке → «Починить».`;
               } else if (an?.state === "done") {
                 badgeIcon = <XCircle size={10} />;
                 badgeText = "решения нет";
@@ -396,6 +462,7 @@ export default function ControlTab({
                 <div
                   key={s.domain}
                   onClick={() => setSelectedDomain(isSelected ? null : s.domain)}
+                  onContextMenu={(e) => openContextMenu(e, s.domain)}
                   className={
                     "flex items-start justify-between gap-3 py-2 cursor-pointer select-none " +
                     (isSelected
@@ -404,8 +471,8 @@ export default function ControlTab({
                   }
                   title={
                     isSelected
-                      ? "Выбрано. Повторный клик — снять выбор; кнопки выше: «Анализ» перенесёт домен на «Починку сайтов», «Очистить» удалит позицию"
-                      : "Клик — выбрать позицию, затем «Анализ» перенесёт домен на «Починку сайтов», «Очистить» удалит её из списка"
+                      ? "Выбрано. Повторный клик — снять выбор; действия над позицией — по ПКМ на строке (Анализ / Починить / Очистить)"
+                      : "Клик — выбрать позицию; ПКМ — контекстное меню действий (Анализ / Починить / Очистить)"
                   }
                 >
                   <div className="min-w-0 flex-wrap">
@@ -456,6 +523,21 @@ export default function ControlTab({
                         в списках отсутствует
                       </span>
                     )}
+                    {/* Чип «в hosts»: у домена есть записи в системном hosts.
+                        Сценарий: прописали IP, он умер — браузер ходит по hosts
+                        прямо на мёртвый адрес (анализ резолвит мимо hosts). */}
+                    {(hostsMap[s.domain]?.length ?? 0) > 0 && (
+                      <span
+                        className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700"
+                        title={
+                          "В системном hosts (C:\\Windows\\System32\\drivers\\etc\\hosts) есть записи для этого домена: " +
+                          (hostsMap[s.domain] || []).join(", ") +
+                          "\n\nБраузер идёт на этот IP напрямую, минуя DNS. Если прописанный IP устарел/умер — домен будет «падать» именно так, пока запись не убрать: вкладка «Починка сайтов» → «Убрать»."
+                        }
+                      >
+                        в hosts: {(hostsMap[s.domain] || []).join(", ")}
+                      </span>
+                    )}
                     {s.count > 1 && (
                       <span className="font-semibold text-gray-500 text-[11px]">×{s.count}</span>
                     )}
@@ -478,6 +560,66 @@ export default function ControlTab({
           <div ref={logEndRef} />
         </div>
       </div>
+
+      {/* Контекстное меню строки «Ошибок сети» (ПКМ): ЕДИНСТВЕННОЕ ПКМ-меню
+          программы — во всех остальных местах правый клик отключён (App.tsx).
+          Пункты — бывшие кнопки шапки «Анализ / Починить / Очистить».
+          Оверлей под меню ловит клик и ПКМ мимо пунктов и закрывает меню. */}
+      {ctxMenu && (
+        <>
+          <div
+            className="fixed inset-0 z-40"
+            onClick={closeContextMenu}
+            onContextMenu={(e) => { e.preventDefault(); closeContextMenu(); }}
+          />
+          <div
+            className="fixed z-50 w-60 bg-white rounded-lg shadow-xl border border-gray-200 py-1"
+            style={{ left: ctxMenu.x, top: ctxMenu.y }}
+            onClick={closeContextMenu}
+          >
+            <div
+              className="px-3 py-1.5 text-[11px] text-gray-400 truncate border-b border-gray-100 mb-1"
+              title={ctxMenu.domain}
+            >
+              {ctxMenu.domain}
+            </div>
+            <button
+              onClick={sendDomainToFix}
+              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-gray-700 hover:bg-purple-50 hover:text-purple-700 transition-colors"
+              title="Перенести домен на вкладку «Починка сайтов» — там запустится «Анализ сайта / IP»"
+            >
+              <Search size={14} /> Анализ
+            </button>
+            {/* «Починить»: активно, только когда у домена готово найденное решение. */}
+            <button
+              onClick={fixSelected}
+              disabled={!canFixSelected}
+              className={
+                "w-full flex items-center gap-2 px-3 py-2 text-sm transition-colors " +
+                (canFixSelected
+                  ? "text-gray-700 hover:bg-orange-50 hover:text-orange-700"
+                  : "text-gray-400 cursor-not-allowed")
+              }
+              title={
+                canFixSelected
+                  ? `Применить решение: ${selectedAnalysis?.solution?.summary}`
+                  : selectedAnalysis?.state === "done" && selectedAnalysis.noneReason
+                    ? `Решения нет: ${selectedAnalysis.noneReason}`
+                    : "Пункт активируется, когда анализ найдёт решение (запустите «Массовый анализ» и дождитесь бейджа «решение: …»)"
+              }
+            >
+              <Wrench size={14} /> Починить
+            </button>
+            <button
+              onClick={clearSelected}
+              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-gray-700 hover:bg-red-50 hover:text-red-700 transition-colors"
+              title={`Удалить позицию из списка: ${ctxMenu.domain}`}
+            >
+              <Trash2 size={14} /> Очистить
+            </button>
+          </div>
+        </>
+      )}
     </div>
   );
 }

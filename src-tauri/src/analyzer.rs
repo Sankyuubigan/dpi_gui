@@ -493,6 +493,32 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
     // SSOT: карта списков обхода загружается РАЗ на анализ и едет в meta —
     // отчёт и решение (`site_solution::decide`) потребляют одни данные.
     let bypass_map = bypass_lists::load_bypass_domains();
+
+    // Факт «закреплено в hosts» для главного домена (кейс 30.10.26: прописали
+    // IP — он умер, а анализ резолвит мимо hosts, браузер — по hosts). Пробы
+    // закреплённых адресов — в рабочем состоянии обхода (окно уже закрыто),
+    // как по ним ходит браузер юзера.
+    let t_pins = std::time::Instant::now();
+    let hosts_pins = {
+        let map = match crate::hosts::load_hosts_map() {
+            Ok(m) => m,
+            Err(e) => {
+                crate::events::app_log(
+                    app,
+                    format!("[Анализ] hosts не прочитан — закреплённые записи не проверены: {}", e),
+                );
+                std::collections::HashMap::new()
+            }
+        };
+        let ips = map.get(&main_host).cloned().unwrap_or_default();
+        if ips.is_empty() {
+            Vec::new()
+        } else {
+            site_probe::probe_hosts_pins(&main_host, &ips)
+        }
+    };
+    timings.push(("hosts_pins (пробы закреплённых адресов)", t_pins.elapsed()));
+
     let meta = ReportMeta {
         target_url,
         discovered,
@@ -506,6 +532,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         block_scan,
         bypass_map,
         exclude_set: bypass_lists::load_exclude_domains(),
+        hosts_pins,
     };
 
     let mut report = analyzer_report::build_report(&meta, &classification);

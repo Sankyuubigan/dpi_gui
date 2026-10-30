@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::net::IpAddr;
 use std::os::windows::process::CommandExt;
@@ -126,6 +127,45 @@ fn maps_domain(line: &str, domain: &str) -> bool {
         .any(|tok| tok.eq_ignore_ascii_case(domain))
 }
 
+/// Разобрать строки hosts в карту «домен (lowercase) → список IP» (без дублей).
+/// Чистая функция: комментарии (`#` — и в начале строки, и инлайном) пропускаются,
+/// строка вида `IP домен [домен2 …]` маппит каждый домен на IP; строка с невалидным
+/// первым токеном (не IP) пропускается целиком. Пустые домены и точки на конце
+/// (FQDN-форма `domain.`) нормализуются.
+fn parse_hosts_lines(lines: &[&str]) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for line in lines {
+        // Всё после `#` — комментарий: и полные строки, и инлайновые метки
+        // (наши записи выглядят как `1.2.3.4 domain # DPI_GUI`).
+        let t = line.split('#').next().unwrap_or("").trim();
+        let mut tokens = t.split_whitespace();
+        let Some(ip_tok) = tokens.next() else { continue };
+        let Ok(ip) = IpAddr::from_str(ip_tok) else { continue };
+        for dom in tokens {
+            let dom = dom.trim_end_matches('.').to_lowercase();
+            if dom.is_empty() {
+                continue;
+            }
+            let ips = map.entry(dom).or_default();
+            let ip_s = ip.to_string();
+            if !ips.contains(&ip_s) {
+                ips.push(ip_s);
+            }
+        }
+    }
+    map
+}
+
+/// Прочитать системный hosts и вернуть карту «домен → список IP». ЕДИНСТВЕННАЯ
+/// точка чтения существующих записей (SSOT): чип «в hosts: …» в списке «Ошибки
+/// сети» показывает юзеру его же закреплённые адреса — сценарий «прописали IP,
+/// он умер, домен падает» виден прямо в строке ошибки.
+pub fn load_hosts_map() -> Result<HashMap<String, Vec<String>>, String> {
+    let raw = read_hosts_raw()?;
+    let refs: Vec<&str> = raw.iter().map(|s| s.as_str()).collect();
+    Ok(parse_hosts_lines(&refs))
+}
+
 /// Атомарная запись: во временный файл в той же папке, затем rename поверх.
 fn write_hosts(lines: &[String]) -> Result<(), String> {
     let path = hosts_path();
@@ -155,5 +195,62 @@ fn flush_dns() -> Result<String, String> {
         Ok("DNS-кэш сброшен".to_string())
     } else {
         Ok("DNS-кэш не сброшен (ipconfig /flushdns вернул ошибку)".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Базовый разбор: IP + домены, инлайновый комментарий-метка, дубль IP.
+    #[test]
+    fn parse_basic_and_marker_comment() {
+        let lines = vec![
+            "127.0.0.1 localhost",
+            "1.2.3.4 example.com www.example.com # DPI_GUI",
+            "1.2.3.4 example.com # DPI_GUI", // дубль IP — не должен задвоиться
+            "5.6.7.8 example.com",           // второй IP того же домена — копится
+        ];
+        let m = parse_hosts_lines(&lines);
+        assert_eq!(
+            m.get("example.com").map(|v| v.as_slice()),
+            Some(&["1.2.3.4".to_string(), "5.6.7.8".to_string()][..])
+        );
+        assert_eq!(
+            m.get("www.example.com").map(|v| v.as_slice()),
+            Some(&["1.2.3.4".to_string()][..])
+        );
+        assert_eq!(m.get("localhost").map(|v| v.as_slice()), Some(&["127.0.0.1".to_string()][..]));
+    }
+
+    /// Комментарии, мусорные строки, IPv6 и FQDN-точка на конце.
+    #[test]
+    fn parse_skips_comments_and_junk_keeps_ipv6() {
+        let lines = vec![
+            "# комментарий целиком",
+            "   ",
+            "not-an-ip example.com", // первый токен не IP — строка пропущена
+            "0.0.0.0 blocked.example # блокировка",
+            "::1 v6.example",
+            "9.9.9.9 fqdn.example.",
+        ];
+        let m = parse_hosts_lines(&lines);
+        assert!(m.get("example.com").is_none(), "строка с мусором вместо IP не маппится");
+        assert_eq!(
+            m.get("blocked.example").map(|v| v.as_slice()),
+            Some(&["0.0.0.0".to_string()][..])
+        );
+        assert_eq!(m.get("v6.example").map(|v| v.as_slice()), Some(&["::1".to_string()][..]));
+        assert_eq!(m.get("fqdn.example").map(|v| v.as_slice()), Some(&["9.9.9.9".to_string()][..]));
+        assert!(m.get("fqdn.example.").is_none(), "точка на конце нормализуется");
+    }
+
+    /// Регистр домена в hosts не важен — ключ всегда lowercase.
+    #[test]
+    fn parse_is_case_insensitive() {
+        let lines = vec!["1.1.1.1 Example.COM"];
+        let m = parse_hosts_lines(&lines);
+        assert!(m.contains_key("example.com"));
+        assert!(!m.contains_key("Example.COM"));
     }
 }

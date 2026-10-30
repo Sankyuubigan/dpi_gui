@@ -24,6 +24,10 @@ pub enum SolutionAction {
     AddToExcludeList { domains: Vec<String> },
     /// Записать проверенный IP в hosts для домена (apex + www).
     WriteHosts { ip: String, domain: String },
+    /// Убрать записи DPI_GUI для домена из hosts (мёртвая закреплённая запись —
+    /// кейс 30.10.26 «прописали IP, он умер»). Чужие (непомеченные) записи
+    /// приложение не трогает — remove_hosts_entry честно отчитается.
+    RemoveHosts { domain: String },
 }
 
 /// Найденное (или не найденное) решение анализа.
@@ -61,6 +65,20 @@ pub struct SiteSolution {
 /// `meta.bypass_map` / `meta.exclude_set` (SSOT: отчёт и решение потребляют
 /// одну загрузку).
 pub fn decide(meta: &ReportMeta, c: &Classification) -> SiteSolution {
+    // 0. Мёртвая запись hosts (кейс 30.10.26 «прописали IP — он умер»):
+    //    браузер ходит по закреплённому адресу НАПРЯМУЮ, минуя DNS, поэтому
+    //    починка записи — приоритет над всеми действиями про DNS-путь. Другие
+    //    действия при раннем возврате не добавляются: состояние DNS-пути
+    //    (обход/VPN/исключения) после починки записи честно описано в отчёте,
+    //    а совет «в списки» рядом с hosts-фиксом — противоречие (кейс vercel).
+    if let Some(pin) = meta
+        .hosts_pins
+        .iter()
+        .find(|p| site_probe::hosts_pin_is_broken(&p.http))
+    {
+        return hosts_pin_solution(meta, pin);
+    }
+
     let mut actions: Vec<SolutionAction> = Vec::new();
     let mut summaries: Vec<String> = Vec::new();
 
@@ -234,6 +252,69 @@ pub fn decide(meta: &ReportMeta, c: &Classification) -> SiteSolution {
     }
 }
 
+/// Решение при мёртвой записи hosts. Приоритеты:
+/// 1. Замена на проверенный живой адрес — когда DNS-путь сломан, но анализ
+///    нашёл рабочий адрес (та же проверка, что у обычного hosts-совета:
+///    DoH-источник + живой HTTPS, либо DoH-подмена с HTTP-пробой). Замена
+///    имеет смысл только на адрес, отличный от мёртвого закреплённого.
+/// 2. Убрать запись — когда DNS-путь открывается (запись только мешает) либо
+///    рабочего адреса найти не удалось. В summary честно называется вердикт
+///    DNS-пути: удаление записи возвращает браузер на DNS-путь, чьё состояние
+///    описано в отчёте, — «починено и открыто» здесь не обещается.
+fn hosts_pin_solution(meta: &ReportMeta, pin: &site_probe::HostsPin) -> SiteSolution {
+    let host = pin.domain.clone();
+    let replacement = meta.main_probe.as_ref().and_then(|probe| {
+        let from_probe = verified_hosts_ip(probe);
+        let from_sub = meta
+            .main_dns_sub
+            .iter()
+            .find(|s| s.http_ok)
+            .and_then(|s| s.working_ip.clone());
+        from_probe.or(from_sub)
+    });
+
+    let dns_path_open = meta
+        .main_probe
+        .as_ref()
+        .map(|p| p.verdict == Verdict::Open)
+        .unwrap_or(false);
+
+    match replacement {
+        // Замена: живой проверенный адрес, отличный от мёртвого закреплённого.
+        Some(ip) if ip != pin.ip && !dns_path_open => SiteSolution {
+            found: true,
+            actions: vec![SolutionAction::WriteHosts { ip: ip.clone(), domain: host.clone() }],
+            summary: format!(
+                "заменить мёртвую запись hosts ({} → {}) на проверенный живой адрес {} (адрес проверен DoH-каналом и HTTPS-пробой)",
+                pin.ip, host, ip
+            ),
+            none_reason: None,
+        },
+        _ => {
+            let dns_note = match meta.main_probe.as_ref().map(|p| p.verdict) {
+                Some(v) => format!("путь по DNS после удаления: {}", v.verdict_name()),
+                None => "состояние DNS-пути — в отчёте".to_string(),
+            };
+            SiteSolution {
+                found: true,
+                actions: vec![SolutionAction::RemoveHosts { domain: host.clone() }],
+                summary: format!(
+                    "убрать мёртвую запись hosts ({} → {}); {}; {}",
+                    pin.ip,
+                    host,
+                    dns_note,
+                    if dns_path_open {
+                        "без записи сайт открывается по DNS".to_string()
+                    } else {
+                        "дальнейшие шаги — в отчёте анализа".to_string()
+                    }
+                ),
+                none_reason: None,
+            }
+        }
+    }
+}
+
 /// Главный домен открывается без обхода (вердикт Open) — в обход его
 /// советовать нельзя.
 fn is_main_open(meta: &ReportMeta, host: &str) -> bool {
@@ -356,6 +437,102 @@ pub fn report_block(solution: &SiteSolution) -> String {
     s
 }
 
+/// Слить несколько решений в ОДНО для кнопки «Починить все»: действия
+/// собираются по типам в порядке приоритета `decide` (исключения → обход →
+/// hosts), домены/IP дедуплицируются — повторная запись того же значения
+/// была бы ложным «успехом» поверх уже применённого. Найденные, но пустые
+/// по действиям решения отбрасываются: применять нечего — не pretending.
+pub fn merge_solutions(solutions: &[SiteSolution]) -> SiteSolution {
+    let mut excludes: Vec<String> = Vec::new();
+    let mut bypass: Vec<String> = Vec::new();
+    let mut hosts: Vec<(String, String)> = Vec::new();
+    let mut removes: Vec<String> = Vec::new();
+    let mut summaries: Vec<String> = Vec::new();
+
+    for s in solutions {
+        if !s.found {
+            continue;
+        }
+        for a in &s.actions {
+            match a {
+                SolutionAction::AddToExcludeList { domains } => {
+                    for d in domains {
+                        if !excludes.contains(d) {
+                            excludes.push(d.clone());
+                        }
+                    }
+                }
+                SolutionAction::AddToBypassList { domains } => {
+                    for d in domains {
+                        if !bypass.contains(d) {
+                            bypass.push(d.clone());
+                        }
+                    }
+                }
+                SolutionAction::WriteHosts { ip, domain } => {
+                    if !hosts.iter().any(|(i, h)| i == ip && h == domain) {
+                        hosts.push((ip.clone(), domain.clone()));
+                    }
+                }
+                SolutionAction::RemoveHosts { domain } => {
+                    if !removes.contains(domain) {
+                        removes.push(domain.clone());
+                    }
+                }
+            }
+        }
+        if !s.summary.is_empty() && !summaries.contains(&s.summary) {
+            summaries.push(s.summary.clone());
+        }
+    }
+
+    let mut actions: Vec<SolutionAction> = Vec::new();
+    if !excludes.is_empty() {
+        actions.push(SolutionAction::AddToExcludeList { domains: excludes });
+    }
+    // Домен, попавший и в исключения, и в обход (противоречивые решения пачки),
+    // остаётся только в исключениях: в winws исключения проверяются раньше
+    // include-листов, так что обходная запись для него — нулевой эффект.
+    let bypass: Vec<String> = bypass
+        .into_iter()
+        .filter(|d| !actions.iter().any(|a| matches!(a,
+            SolutionAction::AddToExcludeList { domains } if domains.contains(d))))
+        .collect();
+    if !bypass.is_empty() {
+        actions.push(SolutionAction::AddToBypassList { domains: bypass });
+    }
+    for (ip, domain) in hosts {
+        actions.push(SolutionAction::WriteHosts { ip, domain });
+    }
+    // Удаление записи для домена, который в этой же пачке получают новую живую
+    // запись (WriteHosts), лишнее: apply_hosts_entry сам заменяет прежние
+    // строки — «убрать, чтобы тут же записать» — лишняя перезапись hosts.
+    let removes: Vec<String> = removes
+        .into_iter()
+        .filter(|d| !actions.iter().any(|a| matches!(a,
+            SolutionAction::WriteHosts { domain, .. } if domain == d)))
+        .collect();
+    for domain in removes {
+        actions.push(SolutionAction::RemoveHosts { domain });
+    }
+
+    if actions.is_empty() {
+        SiteSolution {
+            found: false,
+            actions: Vec::new(),
+            summary: String::new(),
+            none_reason: Some("ни одно из переданных решений не содержит действий".to_string()),
+        }
+    } else {
+        SiteSolution {
+            found: true,
+            actions,
+            summary: summaries.join("; "),
+            none_reason: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +609,7 @@ mod tests {
             block_scan: None,
             bypass_map: std::collections::HashMap::new(),
             exclude_set: std::collections::HashSet::new(),
+            hosts_pins: Vec::new(),
         }
     }
 
@@ -832,5 +1010,249 @@ mod tests {
         assert_eq!(v["actions"][0]["type"], "writeHosts");
         assert_eq!(v["actions"][0]["ip"], "1.2.3.4");
         assert_eq!(v["actions"][1]["type"], "addToBypassList");
+    }
+
+    // ---- «Починить все»: слияние пачки решений в одно ----
+
+    fn sol(
+        summary: &str,
+        actions: Vec<SolutionAction>,
+    ) -> SiteSolution {
+        SiteSolution {
+            found: true,
+            actions,
+            summary: summary.to_string(),
+            none_reason: None,
+        }
+    }
+
+    /// Действия собираются по типам в порядке приоритета decide, домены и
+    /// пары (ip, домен) дедуплицируются.
+    #[test]
+    fn merge_dedups_and_keeps_priority_order() {
+        let batch = vec![
+            sol(
+                "s1",
+                vec![
+                    SolutionAction::WriteHosts {
+                        ip: "1.2.3.4".to_string(),
+                        domain: "a.com".to_string(),
+                    },
+                    SolutionAction::AddToBypassList {
+                        domains: vec!["b.com".to_string()],
+                    },
+                ],
+            ),
+            sol(
+                "s2",
+                vec![
+                    SolutionAction::AddToExcludeList {
+                        domains: vec!["c.com".to_string(), "b.com".to_string()],
+                    },
+                    SolutionAction::AddToBypassList {
+                        domains: vec!["b.com".to_string(), "d.com".to_string()],
+                    },
+                    SolutionAction::WriteHosts {
+                        ip: "1.2.3.4".to_string(),
+                        domain: "a.com".to_string(),
+                    },
+                    SolutionAction::WriteHosts {
+                        ip: "5.6.7.8".to_string(),
+                        domain: "a.com".to_string(),
+                    },
+                ],
+            ),
+        ];
+        let m = merge_solutions(&batch);
+        assert!(m.found);
+        // b.com был и в исключениях, и в обходе: остаётся ТОЛЬКО в исключениях —
+        // в winws они проверяются раньше include-листов, обходная запись
+        // для исключённого домена не действует.
+        assert_eq!(
+            m.actions,
+            vec![
+                SolutionAction::AddToExcludeList {
+                    domains: vec!["c.com".to_string(), "b.com".to_string()]
+                },
+                SolutionAction::AddToBypassList {
+                    domains: vec!["d.com".to_string()]
+                },
+                SolutionAction::WriteHosts {
+                    ip: "1.2.3.4".to_string(),
+                    domain: "a.com".to_string()
+                },
+                SolutionAction::WriteHosts {
+                    ip: "5.6.7.8".to_string(),
+                    domain: "a.com".to_string()
+                },
+            ],
+            "порядок: исключения → обход → hosts, дубликаты и противоречия убраны: {:?}",
+            m.actions
+        );
+        assert_eq!(m.summary, "s1; s2");
+    }
+
+    /// Пустая/безрешительная пачка — честное «решения нет», не found=true
+    /// с пустым списком действий.
+    #[test]
+    fn merge_empty_batch_is_honest_none() {
+        let none = SiteSolution {
+            found: false,
+            actions: Vec::new(),
+            summary: String::new(),
+            none_reason: Some("x".to_string()),
+        };
+        let m = merge_solutions(&[none.clone(), none]);
+        assert!(!m.found, "{:?}", m);
+        assert!(m.none_reason.is_some());
+    }
+
+    /// Удаление записи для домена, получающего в той же пачке новую живую
+    /// запись, отбрасывается: WriteHosts сам заменяет прежние строки.
+    #[test]
+    fn merge_write_hosts_beats_remove_hosts() {
+        let batch = vec![
+            sol(
+                "s1",
+                vec![SolutionAction::RemoveHosts { domain: "a.com".to_string() }],
+            ),
+            sol(
+                "s2",
+                vec![SolutionAction::WriteHosts {
+                    ip: "1.2.3.4".to_string(),
+                    domain: "a.com".to_string(),
+                }],
+            ),
+        ];
+        let m = merge_solutions(&batch);
+        assert_eq!(
+            m.actions,
+            vec![SolutionAction::WriteHosts {
+                ip: "1.2.3.4".to_string(),
+                domain: "a.com".to_string()
+            }],
+            "{:?}",
+            m.actions
+        );
+    }
+
+    // ---- Мёртвая запись hosts (кейс 30.10.26 «прописали IP — он умер») ----
+
+    fn pin(ip: &str, http: HttpResult) -> crate::site_probe::HostsPin {
+        crate::site_probe::HostsPin {
+            domain: "example.com".to_string(),
+            ip: ip.to_string(),
+            http,
+        }
+    }
+
+    /// DNS-путь сломан (подмена), но DoH нашёл живой адрес — мёртвая запись
+    /// заменяется живой, а не удаляется.
+    #[test]
+    fn dead_pin_with_doh_working_ip_gives_replacement() {
+        let mut m = meta(probe(
+            Verdict::DnsBlocked,
+            Some(HttpResult::Ok(200)),
+            Some(IpSource::Doh),
+        ));
+        m.hosts_pins = vec![pin("1.2.3.4", HttpResult::Rst)];
+        let s = decide(&m, &empty_classification());
+        assert!(s.found, "{:?}", s);
+        assert_eq!(
+            s.actions,
+            vec![SolutionAction::WriteHosts {
+                ip: "5.6.7.8".to_string(),
+                domain: "example.com".to_string()
+            }],
+            "{:?}",
+            s.actions
+        );
+        assert!(s.summary.contains("заменить"), "{}", s.summary);
+        assert!(s.summary.contains("1.2.3.4"), "{}", s.summary);
+    }
+
+    /// DNS-путь открыт — мёртвая запись только мешает: убрать, не заменять.
+    #[test]
+    fn dead_pin_with_open_dns_path_gives_remove() {
+        let mut m = meta(probe(
+            Verdict::Open,
+            Some(HttpResult::Ok(200)),
+            Some(IpSource::SystemDns),
+        ));
+        m.hosts_pins = vec![pin("1.2.3.4", HttpResult::Timeout)];
+        let s = decide(&m, &empty_classification());
+        assert!(s.found, "{:?}", s);
+        assert_eq!(
+            s.actions,
+            vec![SolutionAction::RemoveHosts { domain: "example.com".to_string() }],
+            "{:?}",
+            s.actions
+        );
+        assert!(s.summary.contains("убрать"), "{}", s.summary);
+        assert!(s.summary.contains("открывается по DNS"), "{}", s.summary);
+    }
+
+    /// DNS-путь сломан, рабочего адреса нет — запись убирается, в summary
+    /// честно назван вердикт DNS-пути (удаление ≠ «сайт починен»).
+    #[test]
+    fn dead_pin_broken_path_no_replacement_gives_remove_with_verdict() {
+        let mut m = meta(probe(Verdict::IpReset, Some(HttpResult::Rst), None));
+        m.hosts_pins = vec![pin("1.2.3.4", HttpResult::Rst)];
+        let s = decide(&m, &empty_classification());
+        assert!(s.found, "{:?}", s);
+        assert_eq!(
+            s.actions,
+            vec![SolutionAction::RemoveHosts { domain: "example.com".to_string() }],
+            "{:?}",
+            s.actions
+        );
+        assert!(s.summary.contains("СБРОС СОЕДИНЕНИЯ"), "{}", s.summary);
+    }
+
+    /// Живая запись hosts обычный ход решения не меняет (hosts не при чём).
+    #[test]
+    fn alive_pin_keeps_regular_flow() {
+        let mut m = meta(probe(
+            Verdict::DnsBlocked,
+            Some(HttpResult::Ok(200)),
+            Some(IpSource::Doh),
+        ));
+        m.hosts_pins = vec![pin("1.2.3.4", HttpResult::Ok(200))];
+        let s = decide(&m, &empty_classification());
+        assert!(s.found, "{:?}", s);
+        assert_eq!(
+            s.actions,
+            vec![SolutionAction::WriteHosts {
+                ip: "5.6.7.8".to_string(),
+                domain: "example.com".to_string()
+            }],
+            "обычный hosts-совет по подмене DNS: {:?}",
+            s.actions
+        );
+    }
+
+    /// Сломанность записи: живой HTTP — единственный «не сломан» ответ.
+    #[test]
+    fn hosts_pin_broken_criterion() {
+        use crate::site_probe::hosts_pin_is_broken;
+        assert!(!hosts_pin_is_broken(&HttpResult::Ok(200)));
+        assert!(hosts_pin_is_broken(&HttpResult::Rst));
+        assert!(hosts_pin_is_broken(&HttpResult::Timeout));
+        assert!(hosts_pin_is_broken(&HttpResult::Forbidden(403)));
+        assert!(hosts_pin_is_broken(&HttpResult::BlockPage));
+    }
+
+    /// Serde-контракт нового действия: тег removeHosts.
+    #[test]
+    fn serde_remove_hosts_tag() {
+        let s = SiteSolution {
+            found: true,
+            summary: "x".to_string(),
+            actions: vec![SolutionAction::RemoveHosts { domain: "a.com".to_string() }],
+            none_reason: None,
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["actions"][0]["type"], "removeHosts");
+        assert_eq!(v["actions"][0]["domain"], "a.com");
     }
 }

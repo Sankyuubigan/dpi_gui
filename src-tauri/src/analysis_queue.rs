@@ -95,6 +95,10 @@ enum Job {
     /// Применение решения — через очередь: правка списков + перезапуск winws
     /// трогают то же глобальное состояние, что и анализ.
     Apply { solution: SiteSolution, respond: mpsc::Sender<Result<String, String>> },
+    /// «Починить все»: пачка решений сливается в ОДНО (site_solution::merge_solutions)
+    /// и применяется одним проходом — одна правка списков, ОДИН перезапуск
+    /// обхода на всю пачку (N отдельных вызовов рестартили бы winws N раз).
+    ApplyBatch { solutions: Vec<SiteSolution>, respond: mpsc::Sender<Result<String, String>> },
 }
 
 struct QueueState {
@@ -192,6 +196,16 @@ fn worker(app: AppHandle) {
                 let _ = respond.send(r);
                 finish_job();
             }
+            Job::ApplyBatch { solutions, respond } => {
+                let merged = crate::site_solution::merge_solutions(&solutions);
+                let r = if merged.found {
+                    apply_solution_now(&app, &merged)
+                } else {
+                    Err(merged.none_reason.unwrap_or_else(|| "применять нечего".into()))
+                };
+                let _ = respond.send(r);
+                finish_job();
+            }
         }
     }
 }
@@ -272,6 +286,21 @@ pub async fn enqueue_apply(app: AppHandle, solution: SiteSolution) -> Result<Str
     .unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
 }
 
+/// «Починить все»: пачка решений одним джобом (см. комментарий Job::ApplyBatch).
+pub async fn enqueue_apply_batch(app: AppHandle, solutions: Vec<SiteSolution>) -> Result<String, String> {
+    let (tx, rx) = mpsc::channel();
+    {
+        let mut st = state().lock().expect("analysis queue poisoned");
+        st.push_manual(Job::ApplyBatch { solutions, respond: tx });
+    }
+    ensure_worker(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        rx.recv().unwrap_or_else(|_| Err("очередь анализа не ответила: воркер завершился".into()))
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
+}
+
 // ---------------------------------------------------------------------------
 // Внешние операции, рулящие обходом (тесты профилей, диагностика).
 // ---------------------------------------------------------------------------
@@ -333,6 +362,10 @@ fn apply_solution_now(app: &AppHandle, solution: &SiteSolution) -> Result<String
             crate::site_solution::SolutionAction::WriteHosts { ip, domain } => {
                 let r = crate::hosts::apply_hosts_entry(ip, domain)?;
                 report_lines.push(format!("📄 {}", r));
+            }
+            crate::site_solution::SolutionAction::RemoveHosts { domain } => {
+                let r = crate::hosts::remove_hosts_entry(domain)?;
+                report_lines.push(format!("🧹 {}", r));
             }
         }
     }

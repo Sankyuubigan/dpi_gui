@@ -1,5 +1,5 @@
 import type { Dispatch, SetStateAction } from "react";
-import { ClipboardCopy, CheckCircle2, XCircle } from "lucide-react";
+import { ClipboardCopy, CheckCircle2, Trash2, XCircle } from "lucide-react";
 
 export type LogKind = "info" | "ok" | "fail" | "sys";
 export type LogEntry = { text: string; kind: LogKind };
@@ -22,18 +22,31 @@ export default function TestingLogPanel({ log, setLog }: {
     );
   };
 
+  // Полная очистка панели: пустой массив заменяет весь стейт лога.
+  const clearLogs = () => setLog([]);
+
   return (
     <div className="flex-1 bg-gray-900 rounded-xl p-4 flex flex-col min-h-[300px]">
       <div className="flex items-center justify-between mb-2 border-b border-gray-700 pb-2">
         <span className="text-gray-400 text-sm font-semibold">Результаты тестирования</span>
-        <button
-          onClick={copyLogs}
-          disabled={log.length === 0}
-          className="flex items-center gap-1 bg-gray-700 hover:bg-gray-800 disabled:bg-gray-500 text-white px-3 py-1 rounded text-xs font-bold transition"
-          title="Скопировать все логи в буфер обмена"
-        >
-          <ClipboardCopy size={14} /> Копировать логи
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={copyLogs}
+            disabled={log.length === 0}
+            className="flex items-center gap-1 bg-gray-700 hover:bg-gray-800 disabled:bg-gray-500 text-white px-3 py-1 rounded text-xs font-bold transition"
+            title="Скопировать все логи в буфер обмена"
+          >
+            <ClipboardCopy size={14} /> Копировать логи
+          </button>
+          <button
+            onClick={clearLogs}
+            disabled={log.length === 0}
+            className="flex items-center gap-1 bg-gray-700 hover:bg-red-700 disabled:bg-gray-500 text-white px-3 py-1 rounded text-xs font-bold transition"
+            title="Очистить все логи этой панели"
+          >
+            <Trash2 size={14} /> Очистить логи
+          </button>
+        </div>
       </div>
       <div className="flex-1 overflow-y-auto font-mono text-sm break-all space-y-1 whitespace-pre-wrap">
         {log.length === 0 ? (

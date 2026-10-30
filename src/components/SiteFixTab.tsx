@@ -53,7 +53,7 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
     try {
       const result: string = await invoke("apply_solution", { solution });
       for (const line of result.split("\n")) {
-        const kind = line.startsWith("⚠️") ? "fail" : line.startsWith("♻️") || line.startsWith("🛡️") || line.startsWith("⛔") || line.startsWith("📄") ? "ok" : "info";
+        const kind = line.startsWith("⚠️") ? "fail" : line.startsWith("♻️") || line.startsWith("🛡️") || line.startsWith("⛔") || line.startsWith("📄") || line.startsWith("🧹") ? "ok" : "info";
         appendEntry(line, kind);
       }
     } catch (e: any) {
@@ -211,9 +211,10 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
           )}
         </div>
 
-        {/* Скрипт подбора рабочего DNS — отдельная фича, с «Анализом сайта» не связана.
-            Классифицирует ответы всех DoH-сервисов: кто проксирует (рабочий DNS для
-            сайтов с гео-блоком внутри сессии), кто отдаёт прямые адреса, кто мёртв. */}
+        {/* «DNS для обхода геоблока» (бывш. «Подбор рабочего DNS») — отдельная фича,
+            с «Анализом сайта» не связана. Классифицирует ответы всех DoH-сервисов:
+            кто проксирует (рабочий DNS для сайтов с гео-блоком внутри сессии),
+            кто отдаёт прямые адреса, кто мёртв. */}
         <div className="flex flex-col gap-2 mt-4 border-t border-gray-100 pt-4">
           <button
             onClick={runDnsPick}
@@ -221,7 +222,7 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
             className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-400 text-white py-2 rounded-lg font-bold transition"
             title="Перебирает весь список DoH-сервисов (doh-services.txt) и классифицирует ответы: кто проксирует трафик (рабочий DNS для сайтов с гео-блоком после входа в аккаунт — например, aistudio.google.com), кто отдаёт прямые адреса Google, кто мёртв. Результат — имя DNS для включения в браузере."
           >
-            <Globe size={18} /> Подбор рабочего DNS
+            <Globe size={18} /> DNS для обхода геоблока
           </button>
           <p className="text-xs text-gray-500 px-1">
             Для сайтов, которые кидают на страницу региона только после входа в аккаунт:

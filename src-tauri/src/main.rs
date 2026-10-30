@@ -117,6 +117,14 @@ async fn apply_solution(app: AppHandle, solution: site_solution::SiteSolution) -
     analysis_queue::enqueue_apply(app, solution).await
 }
 
+/// «Починить все» (список «Ошибки сети»): пачка найденных решений сливается
+/// в одно (site_solution::merge_solutions) и применяется ОДНИМ проходом —
+/// одна правка списков и один перезапуск обхода на всю пачку.
+#[tauri::command]
+async fn apply_solutions_batch(app: AppHandle, solutions: Vec<site_solution::SiteSolution>) -> Result<String, String> {
+    analysis_queue::enqueue_apply_batch(app, solutions).await
+}
+
 #[tauri::command]
 async fn test_profile(app: AppHandle, profile_name: String, url: String, game_filter: bool) -> Result<testing::ProfileTestOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -144,6 +152,22 @@ fn apply_hosts_entry(ip: String, domain: String) -> Result<String, String> {
 #[tauri::command]
 fn remove_hosts_entry(domain: String) -> Result<String, String> {
     hosts::remove_hosts_entry(&domain)
+}
+
+/// Существующие записи системного hosts для перечисленных доменов (чип
+/// «в hosts: …» в списке «Ошибки сети»). Возвращаются ТОЛЬКО домены, у которых
+/// записи есть: отсутствие записи — норма, молчать об этом не ложь.
+#[tauri::command]
+fn hosts_entries_for_domains(
+    domains: Vec<String>,
+) -> Result<std::collections::HashMap<String, Vec<String>>, String> {
+    let map = hosts::load_hosts_map()?;
+    Ok(domains
+        .into_iter()
+        .map(|d| d.trim().trim_end_matches('.').to_lowercase())
+        .filter(|d| !d.is_empty())
+        .filter_map(|d| map.get(&d).cloned().map(|ips| (d, ips)))
+        .collect())
 }
 
 /// Чей это собственный IP-шлюз среди DoH-сервисов (для предупреждения перед
@@ -232,10 +256,12 @@ fn main() {
             run_mass_analysis,
             pick_dns,
             apply_solution,
+            apply_solutions_batch,
             test_profile,
             run_diagnostics,
             apply_hosts_entry,
             remove_hosts_entry,
+            hosts_entries_for_domains,
             verify_site_via_ip
         ])
         .on_window_event(|_window, event| {
