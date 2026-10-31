@@ -22,6 +22,11 @@ pub enum SolutionAction {
     AddToBypassList { domains: Vec<String> },
     /// Добавить домены в исключения — обход их ломает.
     AddToExcludeList { domains: Vec<String> },
+    /// Убрать точные записи из юзерского списка исключений (инцидент
+    /// 31.10.26, opencode: домен лежал в исключениях, десинк к нему не
+    /// применялся вообще). Убирается именно та запись, которую вернул
+    /// `bypass_lists::is_excluded`.
+    RemoveFromExcludeList { domains: Vec<String> },
     /// Записать проверенный IP в hosts для домена (apex + www).
     WriteHosts { ip: String, domain: String },
     /// Убрать записи DPI_GUI для домена из hosts (мёртвая закреплённая запись —
@@ -77,6 +82,22 @@ pub fn decide(meta: &ReportMeta, c: &Classification) -> SiteSolution {
         .find(|p| site_probe::hosts_pin_is_broken(&p.http))
     {
         return hosts_pin_solution(meta, pin);
+    }
+
+    // 0.5. Фильтр «больших ClientHello» (инцидент 31.10.26, opencode): сайт
+    //      открывается классическому TLS-клиенту, но большой ClientHello
+    //      (~1.7 КБ, постквантовые клиенты Bun/Node/свежий Chromium)
+    //      провайдер молча дропает — у реального клиента сайт мёртв, хотя
+    //      все классические пробы зелёные. Лечение — десинк winws
+    //      (multisplit раздробит рукопожатие). Ветка стоит ДО исключений:
+    //      если обход что-то ломает (bypass_breaks), приоритет у исключений —
+    //      большой ClientHello подождёт следующего анализа.
+    if c.bypass_breaks.is_empty() {
+        if let Some(probe) = &meta.main_probe {
+            if probe.big_ch_dropped == Some(true) {
+                return big_ch_solution(meta, probe);
+            }
+        }
     }
 
     let mut actions: Vec<SolutionAction> = Vec::new();
@@ -315,6 +336,118 @@ fn hosts_pin_solution(meta: &ReportMeta, pin: &site_probe::HostsPin) -> SiteSolu
     }
 }
 
+/// Решение для фильтра «больших ClientHello» (инцидент 31.10.26, opencode):
+/// сайт открывается классическому TLS-клиенту, но большие ClientHello
+/// (~1.7 КБ, постквантовые клиенты Bun/Node/Chromium) провайдер молча
+/// дропает. Лечение — десинк winws: multisplit раздробит рукопожатие на
+/// мелкие сегменты, и фильтр размера перестанет срабатывать. hosts-лечение
+/// родным/DoH-адресом здесь бессильно: адрес лежит в том же отфильтрованном
+/// диапазоне (проверено 31.10.26 на 172.65.90.21: тишина на любой SNI),
+/// помогает только смена адреса на edge из чистого диапазона
+/// (`probe.big_ch_working_ip`) или дробление рукопожатия десинком.
+fn big_ch_solution(meta: &ReportMeta, probe: &site_probe::DomainProbe) -> SiteSolution {
+    let host = probe.host.clone();
+    // Фоновым доменам (трекерам) правки списков не советуем — как и в
+    // основном обходном пути.
+    if is_background_host(&host) {
+        return SiteSolution {
+            found: false,
+            actions: Vec::new(),
+            summary: String::new(),
+            none_reason: Some(format!(
+                "большие ClientHello дропаются и на фоновом домене {host} — \
+                 правки списков ради трекера не нужны"
+            )),
+        };
+    }
+    let excluded_entry = bypass_lists::is_excluded(&host, &meta.exclude_set);
+    let (_, covered_list) =
+        bypass_lists::split_bypass_candidates(std::slice::from_ref(&host), &meta.bypass_map);
+    let covered = !covered_list.is_empty();
+
+    if let Some(entry) = &excluded_entry {
+        // Запись из исключений может жить в дефолтном default-exclude.txt —
+        // тот перегенерируется при каждом старте и не редактируется; обещать
+        // removal там ложь. Чистое решение: юзерские записи приезжают в meta
+        // (SSOT), файловая система в decide не читается.
+        if meta.user_exclude_entries.contains(entry) {
+            let mut actions = vec![SolutionAction::RemoveFromExcludeList {
+                domains: vec![entry.clone()],
+            }];
+            if !covered {
+                actions.push(SolutionAction::AddToBypassList { domains: vec![host.clone()] });
+            }
+            let mut summary = format!(
+                "убрать {host} из исключений обхода («{entry}»): исключения сильнее \
+                 include-листов, десинк к домену не применялся вовсе"
+            );
+            if !covered {
+                summary.push_str("; добавить в список обхода — десинк раздробит большое \
+                    рукопожатие (~1.7 КБ, постквантовые клиенты), которое провайдер дропает");
+            }
+            if entry != &host {
+                summary.push_str(&format!(
+                    "; внимание: запись «{entry}» накрывает и другие поддомены — \
+                     они тоже выйдут из исключений"
+                ));
+            }
+            return SiteSolution { found: true, actions, summary, none_reason: None };
+        }
+        // Нередактируемая (дефолтная) запись: «добавить в обход» — ложь
+        // (исключения сильнее include-листов, кейс api.messenger.yandex.net
+        // 27.10.26). Лечит только edge-адрес или другой профиль десинка.
+        return big_ch_edge_or_none(probe, &host);
+    }
+
+    if !covered {
+        return SiteSolution {
+            found: true,
+            actions: vec![SolutionAction::AddToBypassList { domains: vec![host.clone()] }],
+            summary: format!(
+                "добавить {host} в список обхода: провайдер дропает большие ClientHello \
+                 (~1.7 КБ, постквантовые клиенты Bun/Node/Chromium) — десинк раздробит \
+                 рукопожатие, фильтр размера перестанет срабатывать"
+            ),
+            none_reason: None,
+        };
+    }
+
+    // Домен уже покрыт обходом, но большой ClientHello всё равно дропается:
+    // либо профиль не дробит большие рукопожатия, либо фильтр сильнее.
+    big_ch_edge_or_none(probe, &host)
+}
+
+/// Хвост big_ch_solution «десинк домен не спасает»: единственное лечение —
+/// проверенный большим ClientHello edge-адрес в hosts; нет его — честное
+/// «лечить нечем» (нужен другой профиль с fake/multisplit).
+fn big_ch_edge_or_none(probe: &site_probe::DomainProbe, host: &str) -> SiteSolution {
+    if let Some(ip) = &probe.big_ch_working_ip {
+        return SiteSolution {
+            found: true,
+            actions: vec![SolutionAction::WriteHosts {
+                ip: ip.clone(),
+                domain: host.to_string(),
+            }],
+            summary: format!(
+                "записать в hosts {ip} → {host} (адрес проверен пробой большим \
+                 ClientHello — фильтр размера провайдера на него не действует)"
+            ),
+            none_reason: None,
+        };
+    }
+    SiteSolution {
+        found: false,
+        actions: Vec::new(),
+        summary: String::new(),
+        none_reason: Some(format!(
+            "провайдер дропает большие ClientHello (~1.7 КБ, постквантовые клиенты) \
+             на {host} даже под текущим профилем десинка; рабочий edge-адрес пробой \
+             не найден — попробуйте другой профиль (нужны fake/multisplit-трюки, \
+             дробящие большое рукопожатие)"
+        )),
+    }
+}
+
 /// Главный домен открывается без обхода (вердикт Open) — в обход его
 /// советовать нельзя.
 fn is_main_open(meta: &ReportMeta, host: &str) -> bool {
@@ -365,7 +498,18 @@ fn no_solution_reason(
     });
     let mut reason = match probe.verdict {
         Verdict::Open if c.bypass_breaks.is_empty() => {
-            "сайт открывается — чинить нечего".to_string()
+            // Инцидент 31.10.26 (opencode): классически сайт открыт, но
+            // постквантовый большой ClientHello дропается — «чинить нечего»
+            // здесь ложь для реального клиента. (Обычно этот кейс ловит
+            // big_ch_solution ранним возвратом; строка — вторая линия обороны.)
+            if probe.big_ch_dropped == Some(true) {
+                "сайт открывается классическому TLS-клиенту, но большие ClientHello \
+                 (~1.7 КБ, постквантовые клиенты) провайдер молча дропает, а вылечить \
+                 нечем: домен уже покрыт обходом, рабочий альтернативный адрес не найден"
+                    .to_string()
+            } else {
+                "сайт открывается — чинить нечего".to_string()
+            }
         }
         Verdict::Open => {
             format!(
@@ -439,11 +583,13 @@ pub fn report_block(solution: &SiteSolution) -> String {
 
 /// Слить несколько решений в ОДНО для кнопки «Починить все»: действия
 /// собираются по типам в порядке приоритета `decide` (исключения → обход →
-/// hosts), домены/IP дедуплицируются — повторная запись того же значения
+/// hosts; удаления из исключений — первыми, до включения в обход),
+/// домены/IP дедуплицируются — повторная запись того же значения
 /// была бы ложным «успехом» поверх уже применённого. Найденные, но пустые
 /// по действиям решения отбрасываются: применять нечего — не pretending.
 pub fn merge_solutions(solutions: &[SiteSolution]) -> SiteSolution {
     let mut excludes: Vec<String> = Vec::new();
+    let mut excludes_remove: Vec<String> = Vec::new();
     let mut bypass: Vec<String> = Vec::new();
     let mut hosts: Vec<(String, String)> = Vec::new();
     let mut removes: Vec<String> = Vec::new();
@@ -459,6 +605,13 @@ pub fn merge_solutions(solutions: &[SiteSolution]) -> SiteSolution {
                     for d in domains {
                         if !excludes.contains(d) {
                             excludes.push(d.clone());
+                        }
+                    }
+                }
+                SolutionAction::RemoveFromExcludeList { domains } => {
+                    for d in domains {
+                        if !excludes_remove.contains(d) {
+                            excludes_remove.push(d.clone());
                         }
                     }
                 }
@@ -487,6 +640,15 @@ pub fn merge_solutions(solutions: &[SiteSolution]) -> SiteSolution {
     }
 
     let mut actions: Vec<SolutionAction> = Vec::new();
+    // Противоречие пачки «убрать из исключений» vs «добавить в исключения»:
+    // добавление побеждает (безопаснее не выключать обход для домена).
+    let excludes_remove: Vec<String> = excludes_remove
+        .into_iter()
+        .filter(|d| !excludes.contains(d))
+        .collect();
+    if !excludes_remove.is_empty() {
+        actions.push(SolutionAction::RemoveFromExcludeList { domains: excludes_remove });
+    }
     if !excludes.is_empty() {
         actions.push(SolutionAction::AddToExcludeList { domains: excludes });
     }
@@ -591,6 +753,8 @@ mod tests {
             dns_spoofed: matches!(verdict, Verdict::DnsBlocked).then(|| "расхождение".to_string()),
             geo_dns_note: None,
             doh_failures: vec![],
+            big_ch_dropped: None,
+            big_ch_working_ip: None,
             diagnosis: Some(diagnosis(verdict, "example.com", Some("5.6.7.8"))),
         }
     }
@@ -609,6 +773,7 @@ mod tests {
             block_scan: None,
             bypass_map: std::collections::HashMap::new(),
             exclude_set: std::collections::HashSet::new(),
+            user_exclude_entries: std::collections::HashSet::new(),
             hosts_pins: Vec::new(),
         }
     }
@@ -1254,5 +1419,207 @@ mod tests {
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["actions"][0]["type"], "removeHosts");
         assert_eq!(v["actions"][0]["domain"], "a.com");
+    }
+
+    // ---- Инцидент 31.10.26 (opencode): фильтр «больших ClientHello» ----
+
+    /// Главный домен открыт классическим TLS, но большой ClientHello дропается.
+    fn big_ch_probe(host: &str, dropped: bool, alt_ip: Option<&str>) -> DomainProbe {
+        let mut p = probe(Verdict::Open, Some(HttpResult::Ok(200)), Some(IpSource::Doh));
+        p.host = host.to_string();
+        p.big_ch_dropped = Some(dropped);
+        p.big_ch_working_ip = alt_ip.map(|s| s.to_string());
+        p
+    }
+
+    /// Домен не покрыт списками: единственное лечение — в обход.
+    #[test]
+    fn big_ch_uncovered_domain_gets_bypass_action() {
+        let m = meta(big_ch_probe("opencode.ai", true, None));
+        let s = decide(&m, &empty_classification());
+        assert!(s.found, "{:?}", s);
+        assert_eq!(
+            s.actions,
+            vec![SolutionAction::AddToBypassList {
+                domains: vec!["opencode.ai".to_string()]
+            }]
+        );
+        assert!(s.summary.contains("большие ClientHello"), "{}", s.summary);
+    }
+
+    /// Юзерская запись исключений: убрать из исключений + добавить в обход.
+    #[test]
+    fn big_ch_excluded_domain_gets_remove_and_bypass() {
+        let mut m = meta(big_ch_probe("opencode.ai", true, None));
+        m.exclude_set = std::iter::once("opencode.ai".to_string()).collect();
+        m.user_exclude_entries = m.exclude_set.clone();
+        let s = decide(&m, &empty_classification());
+        assert!(s.found, "{:?}", s);
+        assert_eq!(
+            s.actions,
+            vec![
+                SolutionAction::RemoveFromExcludeList {
+                    domains: vec!["opencode.ai".to_string()]
+                },
+                SolutionAction::AddToBypassList {
+                    domains: vec!["opencode.ai".to_string()]
+                },
+            ]
+        );
+    }
+
+    /// Дефолтная запись исключений (в юзерском файле её нет): обещать
+    /// удаление ложь, «добавить в обход» тоже ложь (исключения сильнее
+    /// include-листов) — честное «решения нет».
+    #[test]
+    fn big_ch_default_exclude_entry_is_honest_none() {
+        let mut m = meta(big_ch_probe("api.messenger.yandex.net", true, None));
+        m.exclude_set = std::iter::once("yandex.net".to_string()).collect();
+        m.user_exclude_entries = std::collections::HashSet::new();
+        let s = decide(&m, &empty_classification());
+        assert!(!s.found, "{:?}", s);
+        assert!(s.actions.is_empty());
+        assert!(s.none_reason.unwrap().contains("большие ClientHello"));
+    }
+
+    /// Домен уже покрыт обходом, но большой ClientHello дропается, и проба
+    /// нашла edge, который проходит: hosts на этот edge.
+    #[test]
+    fn big_ch_covered_with_alt_ip_suggests_hosts_edge() {
+        let m = bypass_meta(
+            big_ch_probe("opencode.ai", true, Some("8.47.69.5")),
+            &["opencode.ai"],
+        );
+        let s = decide(&m, &empty_classification());
+        assert!(s.found, "{:?}", s);
+        assert_eq!(
+            s.actions,
+            vec![SolutionAction::WriteHosts {
+                ip: "8.47.69.5".to_string(),
+                domain: "opencode.ai".to_string(),
+            }]
+        );
+    }
+
+    /// Домен покрыт обходом, edge не найден: «чинить нечего» здесь ложь —
+    /// честная причина вместо неё.
+    #[test]
+    fn big_ch_covered_without_alt_ip_is_honest_none() {
+        let m = bypass_meta(big_ch_probe("opencode.ai", true, None), &["opencode.ai"]);
+        let s = decide(&m, &empty_classification());
+        assert!(!s.found, "{:?}", s);
+        assert!(s.none_reason.unwrap().contains("большие ClientHello"));
+    }
+
+    /// Обход ломает домен: исключения приоритетнее ветки big-CH
+    /// (большой ClientHello подождёт следующего анализа).
+    #[test]
+    fn big_ch_yields_to_bypass_breaks() {
+        let mut c = empty_classification();
+        c.bypass_breaks = vec![("opencode.ai".to_string(), "rst".to_string())];
+        let m = meta(big_ch_probe("opencode.ai", true, None));
+        let s = decide(&m, &c);
+        assert_eq!(
+            s.actions,
+            vec![SolutionAction::AddToExcludeList {
+                domains: vec!["opencode.ai".to_string()]
+            }],
+            "исключения должны победить: {:?}",
+            s
+        );
+    }
+
+    /// merge_solutions: удаления из исключений дедуплицируются и не теряют
+    /// обходную запись того же домена.
+    #[test]
+    fn merge_solutions_keeps_remove_from_exclude_with_bypass() {
+        let a = SiteSolution {
+            found: true,
+            actions: vec![
+                SolutionAction::RemoveFromExcludeList {
+                    domains: vec!["opencode.ai".to_string()]
+                },
+                SolutionAction::AddToBypassList {
+                    domains: vec!["opencode.ai".to_string()]
+                },
+            ],
+            summary: "x".to_string(),
+            none_reason: None,
+        };
+        let b = SiteSolution {
+            found: true,
+            actions: vec![SolutionAction::RemoveFromExcludeList {
+                domains: vec!["opencode.ai".to_string()]
+            }],
+            summary: "y".to_string(),
+            none_reason: None,
+        };
+        let m = merge_solutions(&[a, b]);
+        let removes = m
+            .actions
+            .iter()
+            .filter(|a| matches!(a, SolutionAction::RemoveFromExcludeList { .. }))
+            .count();
+        assert_eq!(removes, 1, "дедуп удалений: {:?}", m.actions);
+        assert!(
+            m.actions.iter().any(|a| matches!(
+                a,
+                SolutionAction::AddToBypassList { domains }
+                    if domains == &vec!["opencode.ai".to_string()]
+            )),
+            "обходная запись не потерялась: {:?}",
+            m.actions
+        );
+    }
+
+    /// Противоречие пачки: «убрать из исключений» против «добавить в
+    /// исключения» — побеждает добавление (безопаснее не выключать обход).
+    #[test]
+    fn merge_solutions_exclude_add_beats_remove() {
+        let remove = SiteSolution {
+            found: true,
+            actions: vec![SolutionAction::RemoveFromExcludeList {
+                domains: vec!["a.com".to_string()]
+            }],
+            summary: String::new(),
+            none_reason: None,
+        };
+        let add = SiteSolution {
+            found: true,
+            actions: vec![SolutionAction::AddToExcludeList {
+                domains: vec!["a.com".to_string()]
+            }],
+            summary: String::new(),
+            none_reason: None,
+        };
+        let m = merge_solutions(&[remove, add]);
+        assert!(
+            !m.actions
+                .iter()
+                .any(|a| matches!(a, SolutionAction::RemoveFromExcludeList { .. })),
+            "удаление при противоречии должно отпасть: {:?}",
+            m.actions
+        );
+        assert!(
+            m.actions
+                .iter()
+                .any(|a| matches!(a, SolutionAction::AddToExcludeList { .. }))
+        );
+    }
+
+    /// Serde-контракт: тег нового действия removeFromExcludeList.
+    #[test]
+    fn serde_remove_from_exclude_tag() {
+        let s = SiteSolution {
+            found: true,
+            summary: "x".to_string(),
+            actions: vec![SolutionAction::RemoveFromExcludeList {
+                domains: vec!["opencode.ai".to_string()],
+            }],
+            none_reason: None,
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["actions"][0]["type"], "removeFromExcludeList");
+        assert_eq!(v["actions"][0]["domains"][0], "opencode.ai");
     }
 }

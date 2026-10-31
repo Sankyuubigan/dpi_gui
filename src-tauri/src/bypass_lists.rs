@@ -303,6 +303,79 @@ fn list_name(t: TargetList) -> &'static str {
     }
 }
 
+/// Записи ТОЛЬКО юзерского списка исключений (без дефолтов) — множество
+/// редактируемых записей для решений (SSOT с [`remove_domains`]: убираем
+/// то, что реально есть в файле). Записи дефолтного default-exclude.txt
+/// сюда не попадают: он перегенерируется при каждом старте (контракт
+/// владельца), удалять из него бессмысленно.
+pub fn user_exclude_entries() -> HashSet<String> {
+    TargetList::Exclude.existing_entries()
+}
+
+/// Убирает записи из юзерского списка (обход или исключения). Сравнение —
+/// по точной строке (lowercase): убираем именно ту запись, которую вернул
+/// [`is_excluded`]; суффикс-матч здесь опасен — снёс бы чужие строки.
+/// Комментарии и пустые строки не трогаются. Возвращает честный отчёт:
+/// что убрано, чего в списке не было.
+pub fn remove_domains(target: TargetList, entries: &[String]) -> Result<String, String> {
+    if entries.is_empty() {
+        return Err("список доменов пуст — убирать нечего".to_string());
+    }
+    let path = target.user_file();
+    let content = fs::read_to_string(&path).unwrap_or_default();
+    let want: HashSet<String> = entries.iter().map(|e| e.trim().to_lowercase()).collect();
+    let mut removed: Vec<String> = Vec::new();
+    let mut kept: Vec<&str> = Vec::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        let drop_it =
+            !line.is_empty() && !line.starts_with('#') && want.contains(&line.to_lowercase());
+        if drop_it {
+            removed.push(line.to_string());
+        } else {
+            kept.push(raw);
+        }
+    }
+    if removed.is_empty() {
+        return Err(format!(
+            "в {} нет записей {}: убирать нечего",
+            list_name(target),
+            entries.join(", ")
+        ));
+    }
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    // Атомарная запись: temp + rename, как в add_domains/hosts.rs.
+    let tmp = path.with_extension("txt.tmp");
+    fs::write(&tmp, out).map_err(|e| format!("не удалось записать {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, &path)
+        .map_err(|e| format!("не удалось заменить {}: {e}", path.display()))?;
+
+    let mut report = format!(
+        "Убрано {} записей из {}: {}",
+        removed.len(),
+        list_name(target),
+        removed.join(", ")
+    );
+    let missing: Vec<&str> = entries
+        .iter()
+        .filter(|e| {
+            let el = e.trim().to_lowercase();
+            !removed.iter().any(|r| r == &el)
+        })
+        .map(|e| e.as_str())
+        .collect();
+    if !missing.is_empty() {
+        report.push_str(&format!(
+            "; в списке не найдены (оставлены как есть): {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

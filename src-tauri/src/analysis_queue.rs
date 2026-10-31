@@ -359,6 +359,14 @@ fn apply_solution_now(app: &AppHandle, solution: &SiteSolution) -> Result<String
                 report_lines.push(format!("⛔ {}", r));
                 lists_changed = true;
             }
+            crate::site_solution::SolutionAction::RemoveFromExcludeList { domains } => {
+                // Убираем точные записи из юзерского файла; если запись жила
+                // только в дефолтах, remove_domains честно отчитается, что
+                // убирать нечего (решение её не советует, но пачка могла).
+                let r = crate::bypass_lists::remove_domains(crate::bypass_lists::TargetList::Exclude, domains)?;
+                report_lines.push(format!("✂️ {}", r));
+                lists_changed = true;
+            }
             crate::site_solution::SolutionAction::WriteHosts { ip, domain } => {
                 let r = crate::hosts::apply_hosts_entry(ip, domain)?;
                 report_lines.push(format!("📄 {}", r));

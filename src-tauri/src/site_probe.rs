@@ -80,6 +80,16 @@ pub struct DomainProbe {
     pub geo_dns_note: Option<String>,
     /// Почему не сработал хотя бы один DoH-сервис (пусто — все ответили).
     pub doh_failures: Vec<String>,
+    /// Проба «большим ClientHello» по рабочему адресу (инцидент 31.10.26,
+    /// opencode): Some(true) — сайт открывается классическим TLS, но большой
+    /// ClientHello (~1.7 КБ, постквантовые клиенты с X25519MLKEM768) молча
+    /// дропается провайдером; Some(false) — большой ClientHello тоже
+    /// проходит; None — проба не проводилась (сайт не открылся
+    /// классическим TLS, рабочего адреса нет).
+    pub big_ch_dropped: Option<bool>,
+    /// Альтернативный адрес, на котором большой ClientHello проходит
+    /// (заполняется только при `big_ch_dropped == Some(true)`).
+    pub big_ch_working_ip: Option<String>,
     /// Разбор причины и подсказки.
     pub diagnosis: Option<crate::site_verdict::Diagnosis>,
 }
@@ -649,6 +659,24 @@ pub fn probe_domain_with_doh(host: &str, doh_answers: &DohAnswers) -> DomainProb
         &doh_probe,
     );
 
+    // Проба «большим ClientHello» (инцидент 31.10.26, opencode): сайт может
+    // открываться классическому TLS-клиенту и одновременно молча дропаться
+    // для постквантовых (Bun/Node 24+/свежий Chromium, X25519MLKEM768,
+    // пакет ~1.7 КБ). Смысл есть только когда сайт реально открылся —
+    // иначе судить о «работе» нечего. Проба идёт сырым сокетом через тот
+    // же путь, что и трафик реального клиента, — winws видит её так же.
+    let (big_ch_dropped, big_ch_working_ip) = match (&working_ip, &working_http) {
+        (Some(ip), Some(HttpResult::Ok(_))) => {
+            // Кандидаты альтернативных адресов: сначала проверенный DoH,
+            // потом системные.
+            let mut cands = doh_ips.clone();
+            cands.extend(primary_ips.iter().cloned());
+            let c = crate::big_ch::check_domain(host, ip, &cands);
+            (Some(c.dropped), c.working_ip)
+        }
+        _ => (None, None),
+    };
+
     // Проба порта 80: ловим подмену редиректа провайдером. Запускаем только
     // когда HTTPS не дал рабочего ответа — при живом сайте она ничего не скажет
     // и лишь замедлит проверку. Пробы параллельны, выбирается первый по
@@ -728,6 +756,8 @@ pub fn probe_domain_with_doh(host: &str, doh_answers: &DohAnswers) -> DomainProb
         dns_spoofed,
         geo_dns_note,
         doh_failures,
+        big_ch_dropped,
+        big_ch_working_ip,
         diagnosis: Some(diagnosis),
     }
 }
@@ -1156,6 +1186,8 @@ mod tests {
             dns_spoofed: Some("системный DNS вернул 188.186.154.88, DoH-резолверы — 104.21.95.93 (пересечений нет)".to_string()),
             geo_dns_note: None,
             doh_failures: vec!["dns.dns-ai.ru: HTTP 505".to_string()],
+            big_ch_dropped: None,
+            big_ch_working_ip: None,
             diagnosis: None,
         };
         assert_eq!(
@@ -1190,6 +1222,8 @@ mod tests {
             dns_spoofed: Some("расхождение".to_string()),
             geo_dns_note: None,
             doh_failures: vec![],
+            big_ch_dropped: None,
+            big_ch_working_ip: None,
             diagnosis: None,
         };
         assert!(hosts_entries(&probe).is_empty());

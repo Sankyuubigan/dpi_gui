@@ -532,6 +532,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         block_scan,
         bypass_map,
         exclude_set: bypass_lists::load_exclude_domains(),
+        user_exclude_entries: bypass_lists::user_exclude_entries(),
         hosts_pins,
     };
 

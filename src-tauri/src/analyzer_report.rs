@@ -38,6 +38,12 @@ pub struct ReportMeta {
     /// проверяются раньше include-листов — nfq/hostlist.c), ни повторно
     /// в исключения.
     pub exclude_set: std::collections::HashSet<String>,
+    /// Записи ТОЛЬКО юзерского списка исключений (list-exclude.txt, без
+    /// дефолтного default-exclude.txt). SSOT: одна загрузка на анализ.
+    /// Решение (decide) советует удалять из исключений только то, что
+    /// реально есть в редактируемом файле: дефолтный перегенерируется при
+    /// каждом старте, удалять из него бессмысленно (инцидент 31.10.26).
+    pub user_exclude_entries: std::collections::HashSet<String>,
     /// Записи системного hosts для главного домена и результат HTTPS-пробы
     /// через каждый закреплённый IP (кейс 30.10.26: прописали IP — он умер,
     /// а анализ этого не видел: резолвит мимо hosts, браузер — по hosts).
@@ -205,6 +211,34 @@ fn write_diagnosis(log: &mut String, meta: &ReportMeta, c: &Classification) {
     // и в отчёте обязана быть адресная таблица — за ней юзер и приходит
     // (кейс AI-студий: данные собирались, но прятались от пользователя).
     if probe.verdict == SiteVerdict::Open {
+        // Фильтр «больших ClientHello» (инцидент 31.10.26, opencode): сайт
+        // классически открыт, но постквантовый ClientHello (~1.7 КБ) провайдер
+        // молча дропает. Печатать здесь безусловное «в порядке» — ложь: у
+        // реального клиента (Bun/Node/свежий Chromium) сайт мёртв.
+        if probe.big_ch_dropped == Some(true) {
+            log.push_str(&format!(
+                "⚠️ САЙТ «{}» ОТКРЫВАЕТСЯ ТОЛЬКО КЛАССИЧЕСКОМУ TLS-КЛИЕНТУ:\n",
+                probe.host
+            ));
+            log.push_str("  фильтр провайдера молча дропает большие ClientHello (~1.7 КБ —\n");
+            log.push_str("  постквантовые клиенты: Bun, Node 24+, свежий Chromium с X25519MLKEM768).\n");
+            log.push_str("  Классическая проба проходит, а реальный клиент (opencode, CLI на\n");
+            log.push_str("  Bun/Node) висит до таймаута (ECONNRESET уже после обрыва).\n");
+            log.push_str("\n  ✅ ЧТО СДЕЛАТЬ:\n");
+            log.push_str("     • Добавьте домен в список обхода — десинк (multisplit) раздробит\n");
+            log.push_str("       большое рукопожатие, и фильтр размера перестанет срабатывать.\n");
+            if let Some(ip) = &probe.big_ch_working_ip {
+                log.push_str(&format!(
+                    "     • Альтернатива: hosts-запись {ip} → {} — адрес проверен пробой\n       большим ClientHello, фильтр размера на него не действует.\n",
+                    probe.host
+                ));
+            }
+            log.push_str("\n  ❌ ЧТО НЕ ПОМОЖЕТ:\n");
+            log.push_str("     • hosts на родной/DoH-адрес: адрес лежит в том же отфильтрованном диапазоне.\n");
+            log.push_str("     • Смена DNS: дело не в DNS — пакет дропается по размеру.\n\n");
+            write_address_table(log, probe);
+            return;
+        }
         log.push_str(&format!(
             "✅ САЙТ «{}» ДОСТУПЕН — домен и сеть в порядке ({}).\n\n",
             probe.host, probe.http_note
@@ -988,6 +1022,7 @@ mod tests {
             block_scan: None,
             bypass_map: std::collections::HashMap::new(),
             exclude_set: std::collections::HashSet::new(),
+            user_exclude_entries: std::collections::HashSet::new(),
             hosts_pins: Vec::new(),
         }
     }
@@ -1033,6 +1068,8 @@ mod tests {
             dns_spoofed: None,
             geo_dns_note: None,
             doh_failures: vec![],
+            big_ch_dropped: None,
+            big_ch_working_ip: None,
             diagnosis: Some(diagnosis),
         }
     }
@@ -1375,6 +1412,8 @@ let log = build_report(&meta_with(p), &empty_classification());
             dns_spoofed: Some("системный DNS вернул 188.186.146.207, DoH-резолверы — 104.21.95.93 (пересечений нет)".to_string()),
             geo_dns_note: None,
             doh_failures: vec!["dns.dns-ai.ru: не ответил за 9 с (таймаут)".to_string()],
+            big_ch_dropped: None,
+            big_ch_working_ip: None,
             diagnosis: Some(diagnosis),
         };
         let log = build_report(&meta_with(probe), &empty_classification());
@@ -1433,6 +1472,8 @@ let log = build_report(&meta_with(p), &empty_classification());
             dns_spoofed: Some("расхождение доказано".to_string()),
             geo_dns_note: None,
             doh_failures: vec![],
+            big_ch_dropped: None,
+            big_ch_working_ip: None,
             diagnosis: Some(diagnosis),
         };
         let log = build_report(&meta_with(probe), &empty_classification());
@@ -1535,6 +1576,8 @@ let log = build_report(&meta_with(p), &empty_classification());
             dns_spoofed: Some("перехват доказан".to_string()),
             geo_dns_note: None,
             doh_failures: vec![],
+            big_ch_dropped: None,
+            big_ch_working_ip: None,
             diagnosis: Some(diagnosis),
         });
         meta.discovered = vec![host.to_string()];
@@ -1601,6 +1644,8 @@ let log = build_report(&meta_with(p), &empty_classification());
             dns_spoofed: None,
             geo_dns_note: None,
             doh_failures: vec![],
+            big_ch_dropped: None,
+            big_ch_working_ip: None,
             diagnosis: Some(diagnosis),
         });
         meta.discovered = vec![host.to_string()];
@@ -1713,6 +1758,8 @@ let log = build_report(&meta_with(p), &empty_classification());
             dns_spoofed: None,
             geo_dns_note: None,
             doh_failures: vec![],
+            big_ch_dropped: None,
+            big_ch_working_ip: None,
             diagnosis: Some(diagnosis),
         };
         let log = build_report(&meta_with(probe), &empty_classification());
@@ -1780,6 +1827,8 @@ let log = build_report(&meta_with(p), &empty_classification());
             dns_spoofed: None,
             geo_dns_note: Some(crate::site_probe::GEO_DNS_NOTE.to_string()),
             doh_failures: vec![],
+            big_ch_dropped: None,
+            big_ch_working_ip: None,
             diagnosis: Some(diagnosis),
         };
         let log = build_report(&meta_with(probe), &empty_classification());

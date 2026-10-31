@@ -7,6 +7,9 @@
 //!
 //! Порядок фаз:
 //! 1. Проба #1 всех доменов (обход в текущем состоянии), параллельно.
+//! 1.5. DoH-резолв ВСЕХ доменов ДО окна, параллельно: ответы DoH от состояния
+//!      обхода не зависят, а внутри чистого окна DoH-сервисы сами под
+//!      фильтром и каждый домен выедал свой 9-секундный дедлайн (31.10.26).
 //! 2. Если обход был включён — ОДНО окно без обхода, и ТОЛЬКО для сломанных:
 //!    проба #2 + ретраи, проверка подмены DNS «не резолвящихся», полная
 //!    диагностика сломанных (DoH-проба, CIDR-скан) — параллельно, поток на
@@ -122,6 +125,14 @@ pub fn run_mass(app: &AppHandle, requested: Vec<String>) -> Result<String, Strin
         })
         .collect();
 
+    // === Фаза 1.5: DoH-резолв ВСЕХ доменов ДО окна ===
+    // Ответы DoH от состояния обхода не зависят (защищённый канал, ответы те
+    // же), а при рабочем обходе резолв быстрый — как у браузера пользователя.
+    // Резолв внутри чистого окна выедал на каждый домен полный 9-секундный
+    // дедлайн через мёртвый канал (DoH-сервисы сами под фильтром провайдера):
+    // инцидент 31.10.26 — окно 48 доменов тянуло почти 10 минут.
+    let doh_map = resolve_doh_all(app, &hosts);
+
     // === Фаза 2: чистое окно — ОДНО на всю пачку, и ТОЛЬКО для сломанных ===
     let bypass_toggled = bypass_on;
 
@@ -138,6 +149,13 @@ pub fn run_mass(app: &AppHandle, requested: Vec<String>) -> Result<String, Strin
     let (facts_broken, mut dns_subs, restore_note) = if bypass_on {
         let off_window = OffWindowGuard::open(app);
         let t_off = Instant::now();
+        app_log(
+            app,
+            format!(
+                "[Массовый анализ] чистое окно: проба #2 (без обхода), {} дом.",
+                broken_on.len()
+            ),
+        );
 
         // Итоги пробы #2 (без обхода): запись есть только у доменов,
         // сломанных с обходом; отсутствие записи = проба не требовалась.
@@ -155,7 +173,7 @@ pub fn run_mass(app: &AppHandle, requested: Vec<String>) -> Result<String, Strin
 
         // Полная диагностика сломанных — в чистом окне, параллельно
         // (поток на домен: CIDR-скан одного домена не задерживает остальных).
-        let facts_broken = collect_facts_off(app, &broken_on, &off_map);
+        let facts_broken = collect_facts_off(app, &broken_on, &off_map, &doh_map);
 
         app_log(
             app,
@@ -168,7 +186,7 @@ pub fn run_mass(app: &AppHandle, requested: Vec<String>) -> Result<String, Strin
         (facts_broken, dns_subs, restore_note)
     } else {
         // Обход и так был выключен: чистые условия есть без окна.
-        let facts_broken = collect_facts_off(app, &broken_on, &HashMap::new());
+        let facts_broken = collect_facts_off(app, &broken_on, &HashMap::new(), &doh_map);
 
         let dns_fail_hosts = dns_fail_hosts_of(&hosts, &on_map, &HashMap::new());
         let dns_subs = dns_fail_subs(&dns_fail_hosts);
@@ -177,7 +195,7 @@ pub fn run_mass(app: &AppHandle, requested: Vec<String>) -> Result<String, Strin
 
     // Лёгкие факты остальных доменов — в рабочем режиме (обход как был).
     let mut facts = facts_broken;
-    facts.extend(collect_facts_on(&light_hosts));
+    facts.extend(collect_facts_on(app, &light_hosts, &doh_map));
 
     // Факт «закреплено в hosts» (кейс 30.10.26: прописали IP — он умер):
     // карта грузится РАЗ на прогон (SSOT, как карты списков ниже); пробы
@@ -207,6 +225,7 @@ pub fn run_mass(app: &AppHandle, requested: Vec<String>) -> Result<String, Strin
     // домену потребляет одни данные (как в одиночном анализе).
     let bypass_map = bypass_lists::load_bypass_domains();
     let exclude_set = bypass_lists::load_exclude_domains();
+    let user_excludes = bypass_lists::user_exclude_entries();
 
     for h in &hosts {
         let Some(mut f) = facts.remove(h) else {
@@ -261,6 +280,7 @@ pub fn run_mass(app: &AppHandle, requested: Vec<String>) -> Result<String, Strin
             block_scan: f.block_scan,
             bypass_map: bypass_map.clone(),
             exclude_set: exclude_set.clone(),
+            user_exclude_entries: user_excludes.clone(),
             hosts_pins: pins_map.get(h).cloned().unwrap_or_default(),
         };
         let mut report = analyzer_report::build_report(&meta, &classification);
@@ -384,19 +404,24 @@ fn dns_fail_subs(
 /// там, где обход гарантированно не работает: в реальном окне после
 /// `OffWindowGuard::open` либо когда обход и так был выключен). Параллельно,
 /// поток на домен: CIDR-скан одного домена не задерживает остальных.
+/// DoH-ответы берутся из предрассчитанной карты (`resolve_doh_all`); при
+/// промахе — честный фолбэк на резолв на месте (дольше, но корректно).
 fn collect_facts_off(
     app: &AppHandle,
     broken_on: &[String],
     off_map: &HashMap<String, analyzer_probe::OffProbe>,
+    doh_map: &HashMap<String, crate::diagnostics_probe::DohAnswers>,
 ) -> HashMap<String, HostFacts> {
     let (tx, rx) = mpsc::channel::<(String, HostFacts)>();
     for h in broken_on {
         let off = off_map.get(h).copied();
+        let answers = doh_map.get(h).cloned();
         let tx = tx.clone();
         let h = h.clone();
         let app = app.clone();
         thread::spawn(move || {
-            let answers = site_probe::resolve_doh_answers(&h);
+            let answers =
+                answers.unwrap_or_else(|| site_probe::resolve_doh_answers(&h));
             let main_probe = site_probe::probe_domain_with_doh(&h, &answers);
             let (main_dns_sub, block_scan) =
                 if main_probe.verdict.site_broken() && main_probe.verdict != Verdict::WwwOnly {
@@ -421,9 +446,24 @@ fn collect_facts_off(
     }
     drop(tx);
     let mut facts: HashMap<String, HostFacts> = HashMap::new();
+    let mut done = 0usize;
+    let mut last_log = Instant::now();
     for _ in 0..broken_on.len() {
         if let Ok((h, f)) = rx.recv() {
+            done += 1;
             facts.insert(h, f);
+        }
+        // Прогресс с троттлингом: окно может тянуться минутами, а молчащая
+        // крутилка — это «завис намертво» для пользователя (жалоба 31.10.26).
+        if last_log.elapsed().as_secs() >= 5 {
+            last_log = Instant::now();
+            app_log(
+                app,
+                format!(
+                    "[Массовый анализ] чистое окно: {done}/{} доменов готовы",
+                    broken_on.len()
+                ),
+            );
         }
     }
     facts
@@ -432,21 +472,30 @@ fn collect_facts_off(
 /// Лёгкие факты доменов, которым чистый замер не нужен (открывшиеся с
 /// обходом / не резолвящиеся): одна DoH-проба в рабочем режиме — том же,
 /// в котором домен реально используется. Параллельно, после окна.
-fn collect_facts_on(light_hosts: &[String]) -> HashMap<String, HostFacts> {
+fn collect_facts_on(
+    app: &AppHandle,
+    light_hosts: &[String],
+    doh_map: &HashMap<String, crate::diagnostics_probe::DohAnswers>,
+) -> HashMap<String, HostFacts> {
     let (tx, rx) = mpsc::channel::<(String, site_probe::DomainProbe)>();
     for h in light_hosts {
+        let answers = doh_map.get(h).cloned();
         let tx = tx.clone();
         let h = h.clone();
         thread::spawn(move || {
-            let answers = site_probe::resolve_doh_answers(&h);
+            let answers =
+                answers.unwrap_or_else(|| site_probe::resolve_doh_answers(&h));
             let probe = site_probe::probe_domain_with_doh(&h, &answers);
             let _ = tx.send((h, probe));
         });
     }
     drop(tx);
     let mut facts: HashMap<String, HostFacts> = HashMap::new();
+    let mut done = 0usize;
+    let mut last_log = Instant::now();
     for _ in 0..light_hosts.len() {
         if let Ok((h, probe)) = rx.recv() {
+            done += 1;
             facts.insert(
                 h,
                 HostFacts {
@@ -458,6 +507,62 @@ fn collect_facts_on(light_hosts: &[String]) -> HashMap<String, HostFacts> {
                 },
             );
         }
+        if last_log.elapsed().as_secs() >= 5 {
+            last_log = Instant::now();
+            app_log(
+                app,
+                format!(
+                    "[Массовый анализ] лёгкие домены: {done}/{} готовы",
+                    light_hosts.len()
+                ),
+            );
+        }
     }
     facts
+}
+
+/// DoH-резолв ВСЕХ доменов пачки ДО чистого окна — параллельно, поток на
+/// домен. Ответы DoH от состояния обхода не зависят, а при рабочем обходе
+/// резолв быстрый; внутри окна каждый домен выедал свой 9-секундный дедлайн
+/// через мёртвый канал (инцидент 31.10.26). Прогресс — в лог с троттлингом.
+fn resolve_doh_all(app: &AppHandle, hosts: &[String]) -> HashMap<String, crate::diagnostics_probe::DohAnswers> {
+    if hosts.is_empty() {
+        return HashMap::new();
+    }
+    let t = Instant::now();
+    let (tx, rx) = mpsc::channel::<(String, crate::diagnostics_probe::DohAnswers)>();
+    for h in hosts {
+        let tx = tx.clone();
+        let h = h.clone();
+        thread::spawn(move || {
+            let answers = site_probe::resolve_doh_answers(&h);
+            let _ = tx.send((h, answers));
+        });
+    }
+    drop(tx);
+    let mut out: HashMap<String, crate::diagnostics_probe::DohAnswers> = HashMap::new();
+    let mut done = 0usize;
+    let mut last_log = Instant::now();
+    for _ in 0..hosts.len() {
+        if let Ok((h, answers)) = rx.recv() {
+            done += 1;
+            out.insert(h, answers);
+        }
+        if last_log.elapsed().as_secs() >= 5 {
+            last_log = Instant::now();
+            app_log(
+                app,
+                format!("[Массовый анализ] DoH-резолв: {done}/{} доменов готово", hosts.len()),
+            );
+        }
+    }
+    app_log(
+        app,
+        format!(
+            "[Массовый анализ] DoH-резолв: {} доменов за {:.1} с",
+            hosts.len(),
+            t.elapsed().as_secs_f64()
+        ),
+    );
+    out
 }
