@@ -282,6 +282,10 @@ pub fn run_mass(app: &AppHandle, requested: Vec<String>) -> Result<String, Strin
             exclude_set: exclude_set.clone(),
             user_exclude_entries: user_excludes.clone(),
             hosts_pins: pins_map.get(h).cloned().unwrap_or_default(),
+            // Контрольная проба С обходом (кейс Patreon 01.11.26) делается
+            // только одиночным «Анализом сайта»: на поток она добавила бы
+            // ~6 с на каждый домен.
+            bypass_on_http: None,
         };
         let mut report = analyzer_report::build_report(&meta, &classification);
         let solution = site_solution::decide(&meta, &classification);

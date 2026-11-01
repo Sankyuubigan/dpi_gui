@@ -348,7 +348,8 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
     // обязаны идти БЕЗ активного winws: обход перехватывает ВЕСЬ трафик процесса,
     // и при включённом профиле, который ломает сайт, отчёт получал ложные
     // «IP не отвечает / фильтрация маршрута» вместо правды (кейс sostav.ru).
-    let (classification, main_probe, main_dns_sub, dns_fail_sub, block_scan) = if bypass_on {
+    let (classification, main_probe, main_dns_sub, dns_fail_sub, block_scan, bypass_on_http) =
+        if bypass_on {
         // Окно без обхода с гарантией восстановления: паника внутри ветки
         // больше не оставляет обход выключенным (OffWindowGuard::Drop).
         let off_window = bypass_toggle::OffWindowGuard::open(app);
@@ -455,7 +456,27 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
 
         restore_note = off_window.close();
 
-        (classification, Some(main_probe), main_dns_sub, dns_fail_sub, block_scan)
+        // === Контрольная проба С обходом (кейс Patreon 01.11.26) ===
+        // Все фактовые пробы выше шли в чистом окне и честно видели RST (DPI
+        // режет TLS). Но отказ самого сайта (гео-блок/WAF — Cloudflare 1009)
+        // проявляется только С обходом: TLS проходит, и сервер отвечает сам.
+        // Обход только что восстановлен — пробуем главный домен по настоящему
+        // DoH-адресу, как ходит браузер юзера. GeoBlocked/ServiceRestricted
+        // пропускаем: отказ сайта уже виден в чистом окне, отчёт печатает его
+        // без контрольной пробы.
+        let t_ctrl = std::time::Instant::now();
+        let bypass_on_http = if main_probe.verdict.site_broken()
+            && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
+            && main_probe.verdict != crate::site_verdict::Verdict::GeoBlocked
+            && main_probe.verdict != crate::site_verdict::Verdict::ServiceRestricted
+        {
+            site_probe::bypass_on_control_probe(&main_host, &main_doh_answers)
+        } else {
+            None
+        };
+        timings.push(("контроль с обходом (главный домен)", t_ctrl.elapsed()));
+
+        (classification, Some(main_probe), main_dns_sub, dns_fail_sub, block_scan, bypass_on_http)
     } else {
         // Обход был выключен изначально — весь анализ и так шёл в чистом окне.
         let classification =
@@ -487,7 +508,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         let dns_fail_sub = dns_fail_sub_parallel(&classification.dns_fail, 5);
         timings.push(("dns_fail_sub (фоновые DoH-проверки)", t_dnsfail.elapsed()));
 
-        (classification, Some(main_probe), main_dns_sub, dns_fail_sub, block_scan)
+        (classification, Some(main_probe), main_dns_sub, dns_fail_sub, block_scan, None)
     };
 
     // SSOT: карта списков обхода загружается РАЗ на анализ и едет в meta —
@@ -534,6 +555,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         exclude_set: bypass_lists::load_exclude_domains(),
         user_exclude_entries: bypass_lists::user_exclude_entries(),
         hosts_pins,
+        bypass_on_http,
     };
 
     let mut report = analyzer_report::build_report(&meta, &classification);

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::analyzer_probe::Classification;
 use crate::analyzer_report::{is_background_host, ReportMeta};
 use crate::bypass_lists;
+use crate::diagnostics_probe::HttpResult;
 use crate::site_probe;
 use crate::site_verdict::Verdict;
 
@@ -97,6 +98,27 @@ pub fn decide(meta: &ReportMeta, c: &Classification) -> SiteSolution {
             if probe.big_ch_dropped == Some(true) {
                 return big_ch_solution(meta, probe);
             }
+        }
+    }
+
+    // КОНТРОЛЬ С ОБХОДОМ (кейс Patreon 01.11.26): с включённым обходом сайт
+    // сам отвечает отказом (гео-блок/WAF; у Cloudflare — ошибка 1009). Никакая
+    // починка (списки обхода, исключения, hosts, смена DNS) отказ сайта не
+    // уберёт — советовать действия значило бы обещать ложный успех. Вердикт
+    // для юзера печатает отчёт: «САЙТ САМ ОГРАНИЧИВАЕТ — нужен VPN».
+    if let Some((_, r)) = &meta.bypass_on_http {
+        if matches!(r, HttpResult::Forbidden(_) | HttpResult::ServiceRestrict) {
+            return SiteSolution {
+                found: false,
+                actions: Vec::new(),
+                summary: String::new(),
+                none_reason: Some(
+                    "сайт сам отказывает при включённом обходе (гео-блок/WAF; у Cloudflare — \
+                     ошибка 1009): поможет только VPN/прокси, починка списками/hosts/DNS \
+                     бессильна"
+                        .to_string(),
+                ),
+            };
         }
     }
 
@@ -775,6 +797,7 @@ mod tests {
             exclude_set: std::collections::HashSet::new(),
             user_exclude_entries: std::collections::HashSet::new(),
             hosts_pins: Vec::new(),
+            bypass_on_http: None,
         }
     }
 
@@ -806,6 +829,22 @@ mod tests {
         let s = decide(&m, &empty_classification());
         assert!(!s.found);
         assert!(s.none_reason.as_ref().unwrap().contains("VPN"), "{:?}", s.none_reason);
+    }
+
+    /// Кейс patreon.com 01.11.26: чистое окно видит RST (DPI) и вердикт
+    /// DnsBlocked, но контрольная проба с обходом поймала отказ самого сайта
+    /// (Cloudflare 1009). Решение не должно звать «Починить сайт»: списки,
+    /// hosts и смена DNS отказ сайта не уберут — только VPN.
+    #[test]
+    fn forbidden_on_bypass_on_control_blocks_solution() {
+        let m = meta(probe(Verdict::DnsBlocked, Some(HttpResult::Rst), None));
+        let mut m = m;
+        m.bypass_on_http = Some(("104.16.24.14".parse().unwrap(), HttpResult::Forbidden(403)));
+        let s = decide(&m, &empty_classification());
+        assert!(!s.found, "{:?}", s);
+        let reason = s.none_reason.expect("none_reason");
+        assert!(reason.contains("VPN"), "{}", reason);
+        assert!(reason.contains("1009"), "{}", reason);
     }
 
     /// Кейс nnmclub: подмена DNS + проверенный DoH-адрес → решение «в hosts».

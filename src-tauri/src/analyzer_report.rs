@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use crate::analyzer_probe::Classification;
@@ -48,6 +49,13 @@ pub struct ReportMeta {
     /// через каждый закреплённый IP (кейс 30.10.26: прописали IP — он умер,
     /// а анализ этого не видел: резолвит мимо hosts, браузер — по hosts).
     pub hosts_pins: Vec<site_probe::HostsPin>,
+    /// Контрольная проба главного домена С включённым обходом (кейс Patreon
+    /// 01.11.26): фактовые пробы идут в чистом окне и честно видят RST (DPI),
+    /// а отказ самого сайта (гео-блок/WAF, у Cloudflare — ошибка 1009)
+    /// проявляется только с обходом — как в браузере юзера. None — проба не
+    /// выполнялась (обход не включался / нет настоящего DoH-адреса / вердикт
+    /// GeoBlocked|ServiceRestricted уже получен в чистом окне).
+    pub bypass_on_http: Option<(IpAddr, HttpResult)>,
 }
 
 /// Путь к пользовательскому general-листу (для подсказок «добавьте в обход»).
@@ -248,6 +256,47 @@ fn write_diagnosis(log: &mut String, meta: &ReportMeta, c: &Classification) {
             "  ℹ️ Проверено открытие самой страницы. Часть сервисов (AI-платформы, хостинги,\n  соцсети) ограничивает доступ ВНУТРИ страницы или по региону клиента — одним\n  GET-запросом это не видно. Если сайт фактически не работает при «ДОСТУПЕН» —\n  попробуйте VPN (смена исходного IP), а не смену DNS/hosts.\n\n",
         );
         return;
+    }
+
+    // КОНТРОЛЬ С ОБХОДОМ (кейс Patreon 01.11.26): чистое окно видит RST (DPI
+    // режет TLS) и зовёт это DNS/DPI-блоком. Но гео-блок сайта проявляется
+    // только С обходом — TLS проходит, и сервер отвечает отказом сам. Проба
+    // шла в рабочем состоянии обхода, как у браузера юзера, поэтому её отказ
+    // сайта — вердикт для пользователя: транспорт чинить нечего, нужен VPN.
+    // BlockPage не считаем отказом сайта: маркеры в теле — страница оператора,
+    // а не сервера (иная причина и иной совет).
+    if let Some((ip, r)) = &meta.bypass_on_http {
+        if matches!(r, HttpResult::Forbidden(_) | HttpResult::ServiceRestrict) {
+            log.push_str(&format!(
+                "🌍 ВЕРОЯТНАЯ ПРИЧИНА (САЙТ «{}» САМ ОГРАНИЧИВАЕТ — ГЕО-БЛОК/WAF):\n",
+                probe.host
+            ));
+            log.push_str(&format!(
+                "  Контрольная проба с включённым обходом по настоящему адресу {}: {}.\n",
+                ip,
+                site_probe::substitution_note(r)
+            ));
+            log.push_str(
+                "  TLS до сайта проходит (DPI не режет), но сервер сам отвечает отказом:\n",
+            );
+            log.push_str(
+                "  владелец запретил ваш регион/сеть источника. У Cloudflare это ошибка\n",
+            );
+            log.push_str("  1009 «Access denied» с Ray ID — смотрите её на странице ошибки.\n");
+            log.push_str("\n  ✅ ЧТО СДЕЛАТЬ:\n");
+            log.push_str(
+                "     • Используйте VPN/прокси (смена исходного IP) — единственное, что\n",
+            );
+            log.push_str("       помогает при отказе самого сайта.\n");
+            log.push_str("\n  ❌ ЧТО НЕ ПОМОЖЕТ:\n");
+            log.push_str(
+                "     • Смена DNS и hosts: адреса настоящие, сайт доступен — отказывает он сам.\n",
+            );
+            log.push_str(
+                "     • Настройка профиля обхода: TLS уже проходит, дело не в цензоре.\n\n",
+            );
+            return;
+        }
     }
 
     let diag = match &probe.diagnosis {
@@ -994,7 +1043,7 @@ fn write_already_in_bypass(log: &mut String, meta: &ReportMeta, c: &Classificati
 mod tests {
     use super::*;
     use crate::analyzer_probe::Classification;
-    use crate::diagnostics_probe::{DnsInfo, DnsState};
+    use crate::diagnostics_probe::{DnsInfo, DnsState, HttpResult};
     use crate::site_probe::{DomainProbe, IpSource};
     use crate::site_verdict::{CauseContext, Verdict};
 
@@ -1024,6 +1073,7 @@ mod tests {
             exclude_set: std::collections::HashSet::new(),
             user_exclude_entries: std::collections::HashSet::new(),
             hosts_pins: Vec::new(),
+            bypass_on_http: None,
         }
     }
 
@@ -1145,6 +1195,40 @@ let log = build_report(&meta_with(p), &empty_classification());
         let log = build_report(&meta_with(p), &empty_classification());
         assert!(log.contains("ДОСТУПЕН"), "{}", log);
         assert!(!log.contains("ВЕРОЯТНАЯ ПРИЧИНА"), "{}", log);
+    }
+
+    /// Кейс patreon.com 01.11.26: чистое окно видит RST (DPI) и вердикт
+    /// DnsBlocked, но контрольная проба С обходом поймала отказ самого сайта
+    /// (Cloudflare 1009). Отчёт обязан вести с гео-блоком (VPN), а совет
+    /// «смените DNS» из DNS-армии чистого окна не печатать — он для этого
+    /// кейса дезинформация.
+    #[test]
+    fn bypass_on_forbidden_leads_with_geo_block() {
+        let mut p = www_only_probe();
+        p.host = "www.patreon.com".to_string();
+        p.verdict = Verdict::DnsBlocked;
+        p.dns_spoofed = Some("расхождение системного DNS и DoH".to_string());
+        let mut m = meta_with(p);
+        m.bypass_on_http = Some(("104.16.24.14".parse().unwrap(), HttpResult::Forbidden(403)));
+        let log = build_report(&m, &empty_classification());
+        assert!(log.contains("САМ ОГРАНИЧИВАЕТ"), "{}", log);
+        assert!(log.contains("104.16.24.14"), "{}", log);
+        assert!(log.contains("1009"), "{}", log);
+        assert!(log.contains("VPN"), "{}", log);
+        assert!(!log.contains("смените DNS"), "{}", log);
+    }
+
+    /// Контрольная проба вернула страницу оператора (маркеры в теле) — это НЕ
+    /// отказ сайта, гео-блок-блок не печатается, работает обычная диагностика.
+    #[test]
+    fn bypass_on_blockpage_keeps_regular_diagnosis() {
+        let mut p = www_only_probe();
+        p.verdict = Verdict::DnsBlocked;
+        let mut m = meta_with(p);
+        m.bypass_on_http = Some(("104.16.24.14".parse().unwrap(), HttpResult::BlockPage));
+        let log = build_report(&m, &empty_classification());
+        assert!(!log.contains("САМ ОГРАНИЧИВАЕТ"), "{}", log);
+        assert!(log.contains("ВЕРОЯТНАЯ ПРИЧИНА"), "{}", log);
     }
 
     /// Кейс eu.aptabase.com: обход ломает главный домен (классификация

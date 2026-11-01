@@ -1,7 +1,7 @@
 import type { Dispatch, SetStateAction } from "react";
-import { ClipboardCopy, CheckCircle2, Trash2, XCircle } from "lucide-react";
+import { AlertTriangle, ClipboardCopy, CheckCircle2, Trash2, XCircle } from "lucide-react";
 
-export type LogKind = "info" | "ok" | "fail" | "sys";
+export type LogKind = "info" | "ok" | "fail" | "warn" | "sys";
 export type LogEntry = { text: string; kind: LogKind };
 
 /// Тёмная панель «Результаты тестирования» — общая для вкладок
@@ -65,6 +65,16 @@ export default function TestingLogPanel({ log, setLog }: {
               return (
                 <div key={i} className="flex items-start gap-1.5 text-red-400">
                   <XCircle size={15} className="mt-0.5 shrink-0" />
+                  <span>{l.text}</span>
+                </div>
+              );
+            }
+            // «warn» — не ошибка, а предупреждение с действием (например,
+            // «резолверы исправны, но TLS режет DPI — включите обход»).
+            if (l.kind === "warn") {
+              return (
+                <div key={i} className="flex items-start gap-1.5 text-amber-400">
+                  <AlertTriangle size={15} className="mt-0.5 shrink-0" />
                   <span>{l.text}</span>
                 </div>
               );

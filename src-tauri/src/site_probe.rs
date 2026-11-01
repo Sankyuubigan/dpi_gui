@@ -838,6 +838,28 @@ pub fn probe_https_by_ip(host: &str, ip: IpAddr) -> HttpResult {
     http_via_ip(host, ip, 443)
 }
 
+/// Контрольная проба главного домена С активным обходом — вызывается из
+/// analyzer.rs ПОСЛЕ закрытия «чистого окна», когда обход уже восстановлен.
+///
+/// Зачем: фактовые пробы анализа идут без обхода и честно видят RST (DPI
+/// режет TLS). Но отказ самого сайта — гео-блок/WAF (у Cloudflare ошибка 1009
+/// «Access denied») — проявляется ТОЛЬКО с обходом, когда TLS проходит и
+/// сервер отвечает сам (кейс patreon.com 01.11.26). Проба идёт по первому
+/// настоящему DoH-адресу: не шлюз сервиса (шлюз соврёт своим HTTP 200 — см.
+/// доку `DohAnswers.own_ips`), не заглушка (`all_ips` уже отфильтровал).
+///
+/// `None` — настоящего адреса нет (только шлюзы/пусто), пробовать нечего.
+pub fn bypass_on_control_probe(
+    host: &str,
+    doh_answers: &DohAnswers,
+) -> Option<(IpAddr, HttpResult)> {
+    let ip = doh_answers
+        .all_ips()
+        .into_iter()
+        .find(|ip| doh_answers.gateway_owner(ip).is_none())?;
+    Some((ip, probe_https_by_ip(host, ip)))
+}
+
 /// Проверка «подмены DNS»: резолв домена через DoH-сервисы и поиск рабочего IP.
 /// Если системный/публичный UDP-DNS отравлен, эти сервисы могут вернуть
 /// настоящий адрес, и сайт откроется через подмену.
@@ -987,7 +1009,9 @@ fn summarize_substitution(
     }
 }
 
-fn substitution_note(r: &HttpResult) -> String {
+/// Человекочитаемый текст результата HTTP-пробы. Публичный SSOT формулировок:
+/// dns_pick переиспользует его же в заметках проб (одни слова — один смысл).
+pub fn substitution_note(r: &HttpResult) -> String {
     match r {
         HttpResult::Ok(code) => format!("HTTP {}", code),
         HttpResult::BlockPage => "страница блокировки".to_string(),

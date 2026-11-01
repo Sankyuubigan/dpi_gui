@@ -63,10 +63,11 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
     }
   };
 
-  // Скрипт подбора рабочего DNS: перебор doh-services.txt с классификацией
-  // ответов (кто проксирует — рабочий, кто отдаёт прямые адреса Google —
-  // бесполезен для гео-блока в сессии, кто мёртв). Независим от «Анализа
-  // сайта»: только DoH-опрос, без проб страницы.
+  // Скрипт подбора рабочего DNS: перебор doh-services.txt. Вердикт — по
+  // сквозной HTTPS-пробе (кейс Patreon 01.11.26, ownership IP не считается):
+  // кто резолвит верно (адреса совпали с консенсусом), кто отдаёт собственные
+  // шлюзы (фронтинг), кто расходится с большинством, кто мёртв; проба говорит,
+  // открывается ли сайт через эти адреса. Независим от «Анализа сайта».
   const runDnsPick = async () => {
     const domain = cleanHost(url);
     if (!domain) {
@@ -76,13 +77,27 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
     setIsTesting(true);
     appendEntry(`[Подбор DNS] Перебор списка DoH-сервисов для ${domain}...`, "info");
     try {
-      const out = await invoke<{ domain: string; entries: { service: string; resolved: string[]; kind: string; note: string }[]; summary: string }>("pick_dns", { url: domain });
+      const out = await invoke<{
+        domain: string;
+        entries: { service: string; resolved: string[]; kind: string; note: string; probe: string | null; probeNote: string }[];
+        summary: string;
+        verdictLevel: "ok" | "warn" | "fail";
+      }>("pick_dns", { url: domain });
       for (const e of out.entries) {
-        const kind = e.kind === "proxy" ? "ok" : e.kind === "direct" ? "info" : "fail";
-        const mark = e.kind === "proxy" ? "✅ ПРОКСИРУЕТ (РАБОЧИЙ)" : e.kind === "direct" ? "⚠️ прямые адреса Google" : "❌ мёртв";
-        appendEntry(`${mark} — ${e.service}: ${e.note}`, kind);
+        const mark =
+          e.kind === "gateway" ? "🛰 СВОИ ШЛЮЗЫ (ФРОНТИНГ)"
+            : e.kind === "resolves" ? "✅ РЕЗОЛВИТ ВЕРНО"
+              : e.kind === "diverges" ? "⚠️ РАСХОДИТСЯ С ДРУГИМИ"
+                : "❌ МЁРТВ";
+        const level =
+          (e.kind === "resolves" && e.probe === "open") ||
+            (e.kind === "gateway" && e.probe === "gatewayAlive") ? "ok"
+            : e.kind === "dead" ? "fail"
+              : "info";
+        const probeSuffix = e.probe ? `; проба: ${e.probeNote}` : "";
+        appendEntry(`${mark} — ${e.service}: ${e.note}${probeSuffix}`, level);
       }
-      appendEntry(`[Подбор DNS] ${out.summary}`, out.summary.startsWith("Рабочий DNS") ? "ok" : "fail");
+      appendEntry(`[Подбор DNS] ${out.summary}`, out.verdictLevel);
     } catch (e: any) {
       appendEntry(`[Подбор DNS] Ошибка: ${e}`, "fail");
     } finally {
@@ -211,23 +226,25 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
           )}
         </div>
 
-        {/* «DNS для обхода геоблока» (бывш. «Подбор рабочего DNS») — отдельная фича,
-            с «Анализом сайта» не связана. Классифицирует ответы всех DoH-сервисов:
-            кто проксирует (рабочий DNS для сайтов с гео-блоком внутри сессии),
-            кто отдаёт прямые адреса, кто мёртв. */}
+        {/* «Подбор рабочего DNS» — отдельная фича, с «Анализом сайта» не связана.
+            Классифицирует ответы всех DoH-сервисов (свои шлюзы / резолвит верно /
+            расходится / мёртв) и проверяет сквозной HTTPS-пробой, открывается ли
+            сайт через эти адреса. Кейс сессий-геоблоков (aistudio) покрыт
+            универсально: шлюзы сервиса = фронтинг-кандидат. */}
         <div className="flex flex-col gap-2 mt-4 border-t border-gray-100 pt-4">
           <button
             onClick={runDnsPick}
             disabled={isTesting}
             className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-400 text-white py-2 rounded-lg font-bold transition"
-            title="Перебирает весь список DoH-сервисов (doh-services.txt) и классифицирует ответы: кто проксирует трафик (рабочий DNS для сайтов с гео-блоком после входа в аккаунт — например, aistudio.google.com), кто отдаёт прямые адреса Google, кто мёртв. Результат — имя DNS для включения в браузере."
+            title="Перебирает весь список DoH-сервисов (doh-services.txt), классифицирует ответы (свои шлюзы / резолвит верно / расходится с другими / мёртв) и проверяет сквозной HTTPS-пробой, открывается ли сайт через эти адреса. Результат — имя DNS для включения в браузере (Secure DNS)."
           >
-            <Globe size={18} /> DNS для обхода геоблока
+            <Globe size={18} /> Подбор DNS для обхода геоблока
           </button>
           <p className="text-xs text-gray-500 px-1">
-            Для сайтов, которые кидают на страницу региона только после входа в аккаунт:
-            скрипт сам назовёт DNS-сервис, через который трафик идёт через прокси — его
-            нужно включить в браузере (Secure DNS).
+            Проверяет, через какой DNS-сервис сайт реально открывается (сквозная
+            проба), и назовёт рабочий DNS для браузера (Secure DNS). Если дело не
+            в DNS — честно скажет: TLS режет DPI (нужен обход) или сайт сам
+            отказывает (гео-блок — нужен VPN).
           </p>
         </div>
 
