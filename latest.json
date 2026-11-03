@@ -1,11 +1,11 @@
 {
-  "version": "26.10.5",
-  "notes": "DPI_GUI 26.10.5",
-  "pub_date": "2026-10-17T11:03:43.660Z",
+  "version": "26.11.1",
+  "notes": "DPI_GUI 26.11.1",
+  "pub_date": "2026-11-03T17:37:26.597Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVURlh4c2JxZjRQYTFDSHVKdVZWaENhQUhPZVZ1UUp6bWJocDZ5akgvL3hMVVorY1NzVGUrRWhlMXlvdXQrSjI5N0U1ajB5bmIyaTdPR3IxL2VwWExSR2IyekRJYi9xc0FvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjM1MDE5CWZpbGU6RFBJX0dVSV8yNi4xMC41X3g2NC1zZXR1cC5leGUKcmZTSW9scVJqWGloRHEyNjQxcGNmaVY5RmJYak9xWndDaHBPVG10VGlGMS9YR3V5V01nY0dkSGs3Nk5MSDhzVzVIelNrTklxSWdRUW9wc2VnV2tSQXc9PQo=",
-      "url": "https://github.com/Sankyuubigan/dpi_gui/releases/download/v26.10.5/DPI_GUI_26.10.5_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVURlh4c2JxZjRQYTQzUVNwdnVEaWVBMHFRejNPek5wVms5d1hMWFhVM056QVdJQ2VZOUpwc3FHK0k3S0lrOWw4TGpKN0grMFJDODdXWjkrMk00SFdRcEd3QWRpWHBaRVFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNzI3NDQxCWZpbGU6RFBJX0dVSV8yNi4xMS4xX3g2NC1zZXR1cC5leGUKdUVyNStqbU1ydjhMMGJ6cDd2eGpoU2Rvei9pMmRPT29lYXFGMkhHc3BCTUViVjljbFpTb0hqUlpJbVRaWlZZcm44UzhvNmRkNjl4SFlqaWZjS2FEREE9PQo=",
+      "url": "https://github.com/Sankyuubigan/dpi_gui/releases/download/v26.11.1/DPI_GUI_26.11.1_x64-setup.exe"
     }
   }
 }
