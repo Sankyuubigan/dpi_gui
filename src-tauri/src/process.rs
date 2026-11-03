@@ -24,22 +24,23 @@ pub fn get_bin_dir() -> PathBuf {
     PathBuf::from("bin")
 }
 
-/// Строит итоговый список аргументов winws из шаблона (с плейсхолдерами).
-/// Вынесено отдельно, чтобы переиспользоваться и для запуска по имени профиля,
-/// и для запуска произвольного шаблона (диагностика).
-///
-/// В тихом режиме (`quiet`) не сыпем служебные строки «ПРОПУСК АРГУМЕНТА» и
-/// «Итоговые аргументы», чтобы логи тестов/диагностики оставались чистыми.
-fn resolve_args(app: &AppHandle, raw_args_template: &str, game_filter: bool, quiet: bool) -> Result<Vec<String>, String> {
-    let app_dir = config::get_app_dir();
-    let lists_dir = app_dir.join("lists").to_string_lossy().replace("\\", "/");
-    let bin_dir = get_bin_dir().to_string_lossy().replace("\\", "/");
+/// Чистое ядро resolve_args без AppHandle: плейсхолдеры → пути, ipset-аргументы
+/// вырезаются, после каждого пользовательского hostlist-аргумента дописывается
+/// дефолтный список. Возвращает итоговые аргументы и список вырезанных
+/// ipset-аргументов (вызывающая сторона логирует их при !quiet). Чистота нужна
+/// для юнит-теста корпуса профилей (PRP §5.4): AppHandle в тест не пробросить.
+fn resolve_args_core(
+    raw_args_template: &str,
+    game_filter: bool,
+    lists_dir: &str,
+    bin_dir: &str,
+) -> Result<(Vec<String>, Vec<String>), String> {
     let game_ports = if game_filter { "1024-65535" } else { "12" };
 
     let raw_args = raw_args_template
-        .replace("{LISTS_DIR}", &lists_dir)
-        .replace("{BIN_DIR}", &bin_dir)
-        .replace("{EXCLUDE_DIR}", &lists_dir)
+        .replace("{LISTS_DIR}", lists_dir)
+        .replace("{BIN_DIR}", bin_dir)
+        .replace("{EXCLUDE_DIR}", lists_dir)
         .replace("{GAME_FILTER}", game_ports);
 
     let parsed_args = match shlex::split(&raw_args) {
@@ -48,6 +49,7 @@ fn resolve_args(app: &AppHandle, raw_args_template: &str, game_filter: bool, qui
     };
 
     let mut final_args = Vec::new();
+    let mut skipped_args = Vec::new();
     // Дефолтные списки живут в единой папке lists/defaults/ (config.rs
     // перезаписывает их при каждом запуске).
     let default_exclude_arg = format!("--hostlist-exclude={}/defaults/default-exclude.txt", lists_dir);
@@ -57,9 +59,7 @@ fn resolve_args(app: &AppHandle, raw_args_template: &str, game_filter: bool, qui
     for arg in parsed_args {
         // Мы жестко вырезаем логику IPSet, чтобы не зависеть от лишних файлов
         if arg.starts_with("--ipset=") || arg.starts_with("--ipset-exclude=") {
-            if !quiet {
-                let _ = app.emit("log", format!("[ПРОПУСК АРГУМЕНТА] {}", arg));
-            }
+            skipped_args.push(arg);
             continue;
         }
         final_args.push(arg.clone());
@@ -77,7 +77,26 @@ fn resolve_args(app: &AppHandle, raw_args_template: &str, game_filter: bool, qui
         }
     }
 
+    Ok((final_args, skipped_args))
+}
+
+/// Строит итоговый список аргументов winws из шаблона (с плейсхолдерами).
+/// Вынесено отдельно, чтобы переиспользоваться и для запуска по имени профиля,
+/// и для запуска произвольного шаблона (диагностика).
+///
+/// В тихом режиме (`quiet`) не сыпем служебные строки «ПРОПУСК АРГУМЕНТА» и
+/// «Итоговые аргументы», чтобы логи тестов/диагностики оставались чистыми.
+fn resolve_args(app: &AppHandle, raw_args_template: &str, game_filter: bool, quiet: bool) -> Result<Vec<String>, String> {
+    let app_dir = config::get_app_dir();
+    let lists_dir = app_dir.join("lists").to_string_lossy().replace("\\", "/");
+    let bin_dir = get_bin_dir().to_string_lossy().replace("\\", "/");
+
+    let (final_args, skipped_args) = resolve_args_core(raw_args_template, game_filter, &lists_dir, &bin_dir)?;
+
     if !quiet {
+        for arg in &skipped_args {
+            let _ = app.emit("log", format!("[ПРОПУСК АРГУМЕНТА] {}", arg));
+        }
         let _ = app.emit("log", format!("Итоговые аргументы запуска ({} шт.)", final_args.len()));
     }
 
@@ -284,4 +303,126 @@ pub fn is_winws_running() -> bool {
     sys.processes().values().any(|process| {
         process.name().to_string_lossy().to_lowercase() == WINWS_EXE
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_profiles() -> Vec<serde_json::Value> {
+        serde_json::from_str(include_str!("../profiles_default.json")).expect("дефолтный JSON профилей")
+    }
+
+    fn resolve(name: &str, game_filter: bool) -> (Vec<String>, Vec<String>) {
+        let profiles = default_profiles();
+        let p = profiles
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("профиль «{}» не найден в profiles_default.json", name));
+        let args = p["args"].as_str().expect("args — строка");
+        resolve_args_core(args, game_filter, "C:/fake/lists", "C:/fake/bin").expect("resolve без ошибок")
+    }
+
+    /// Общий инвариант корпуса (PRP §5.4): после resolve_args_core у профиля
+    /// ipset-аргументы вырезаны, плейсхолдеров не осталось, каждый юзерский
+    /// hostlist получил ровно один дефолт-аппенд, game_filter подставлен.
+    fn assert_corpus_invariants(final_args: &[String], skipped: &[String], game_filter: bool) {
+        let joined = final_args.join("\u{1}");
+        // ipset вырезан, а skipped — только ipset.
+        assert!(!joined.contains("--ipset"), "ipset-аргументы обязаны быть вырезаны");
+        assert!(!skipped.is_empty(), "в корпусных профилях есть ipset-аргументы");
+        assert!(
+            skipped.iter().all(|a| a.starts_with("--ipset=") || a.starts_with("--ipset-exclude=")),
+            "skipped содержит только ipset-аргументы: {:?}",
+            skipped
+        );
+        // Все плейсхолдеры заменены.
+        assert!(!joined.contains('{') && !joined.contains('}'), "остались плейсхолдеры: {}", joined);
+        // User-списки апстрима не протекли.
+        assert!(!joined.contains("-user.txt"), "upstream user-списки выбрасываются (§3.4)");
+
+        // Ровно один дефолт-аппенд на каждый юзерский hostlist/exclude.
+        // Юзерский аргумент отличаем по отсутствию сегмента /defaults/
+        // (иначе дефолт …/defaults/list-general.txt сам оканчивается на
+        // /list-general.txt и попал бы в счётчик юзерских).
+        let count = |prefix: &str, path: &str, is_default: bool| -> usize {
+            final_args
+                .iter()
+                .filter(|a| {
+                    a.starts_with(prefix) && a.ends_with(path) && a.contains("/defaults/") == is_default
+                })
+                .count()
+        };
+        for (user_path, default_path) in [
+            ("/list-general.txt", "/defaults/list-general.txt"),
+            ("/list-google.txt", "/defaults/list-google.txt"),
+            ("/list-exclude.txt", "/defaults/default-exclude.txt"),
+        ] {
+            let users = count("--hostlist=", user_path, false) + count("--hostlist-exclude=", user_path, false);
+            let defaults = count("--hostlist=", default_path, true) + count("--hostlist-exclude=", default_path, true);
+            assert!(users > 0, "в профиле нет юзерского {} — шаблон битый", user_path);
+            assert_eq!(users, defaults, "дефолт-аппендов {} != юзерских {}", default_path, user_path);
+        }
+
+        // {GAME_FILTER} → порты: включён 1024-65535, выключен 12.
+        let ports = if game_filter { "1024-65535" } else { "12" };
+        assert!(
+            final_args.iter().any(|a| a.contains(ports)),
+            "game_ports {} не подставлены",
+            ports
+        );
+    }
+
+    #[test]
+    fn alt12_resolves_with_game_filter_on() {
+        let (final_args, skipped) = resolve("1.10.4 - General (ALT12)", true);
+        assert_corpus_invariants(&final_args, &skipped, true);
+        assert!(final_args.iter().any(|a| a.contains("--filter-tcp=1024-65535")), "tcp game-секция");
+        assert!(final_args.iter().any(|a| a.contains("--filter-udp=1024-65535")), "udp game-секция");
+    }
+
+    #[test]
+    fn alt12_resolves_with_game_filter_off() {
+        let (final_args, skipped) = resolve("1.10.4 - General (ALT12)", false);
+        assert_corpus_invariants(&final_args, &skipped, false);
+        assert!(final_args.iter().any(|a| a.contains("--filter-tcp=12")), "порты по умолчанию");
+        assert!(
+            !final_args.iter().any(|a| a.contains("1024-65535")),
+            "выключенный game filter не оставляет 1024-65535"
+        );
+    }
+
+    #[test]
+    fn exp_resolves_and_keeps_fake_files() {
+        let (final_args, skipped) = resolve("1.10.4 - General (EXP)", true);
+        assert_corpus_invariants(&final_args, &skipped, true);
+        assert!(
+            final_args.iter().any(|a| a.contains("--filter-l7=quic")),
+            "EXP несёт --filter-l7=quic"
+        );
+    }
+
+    #[test]
+    fn alt13_and_fake_tls_auto_alt3_resolve_clean() {
+        for name in ["1.10.4 - General (ALT13)", "1.10.4 - General (FAKE TLS AUTO ALT3)"] {
+            let (final_args, skipped) = resolve(name, true);
+            assert_corpus_invariants(&final_args, &skipped, true);
+        }
+    }
+
+    #[test]
+    fn whole_default_corpus_resolves() {
+        // Каждый дефолтный профиль обязан разрешаться без ошибок и мусора —
+        // защита от опечаток в будущих правках profiles_default.json.
+        let profiles = default_profiles();
+        assert!(profiles.len() >= 23, "полный корпус на месте, найден {}", profiles.len());
+        for p in &profiles {
+            let name = p["name"].as_str().unwrap_or("?");
+            let args = p["args"].as_str().expect("args строка");
+            let (final_args, _) = resolve_args_core(args, true, "C:/fake/lists", "C:/fake/bin")
+                .unwrap_or_else(|e| panic!("{}: resolve упал: {}", name, e));
+            let joined = final_args.join("\u{1}");
+            assert!(!joined.contains('{'), "{}: остались плейсхолдеры", name);
+        }
+    }
 }

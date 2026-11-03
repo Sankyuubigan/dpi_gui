@@ -198,26 +198,53 @@ pub fn write_config(config: &serde_json::Value) -> Result<(), std::io::Error> {
 
 pub fn read_profiles() -> Result<Vec<serde_json::Value>, std::io::Error> {
     let path = get_app_dir().join("profiles.json");
-    
+
+    // Встроенные дефолты (SSOT миграции профилей).
+    let default_profiles_str = include_str!("../profiles_default.json");
+    let default_profiles: Vec<serde_json::Value> = serde_json::from_str(default_profiles_str)
+        .expect("Invalid default profiles JSON schema!");
+
     // Пытаемся прочесть текущий файл
     if let Ok(data) = fs::read_to_string(&path) {
         if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(&data) {
-            // Защита от бага: если файл пустой массив - восстанавливаем
-            if !parsed.is_empty() {
-                return Ok(parsed);
+            if parsed.is_empty() {
+                // Защита от бага: файл пустой массив - восстанавливаем дефолты
+                let _ = fs::write(&path, serde_json::to_string_pretty(&default_profiles).unwrap());
+                return Ok(default_profiles);
             }
+
+            // Merge-миграция (появилась вместе с профилями 1.10.4): у существующей
+            // установки старый read_profiles() возвращал файл как есть, и новые
+            // дефолтные профили НИКОГДА не появлялись. Теперь: каждый дефолт,
+            // имя которого отсутствует в пользовательском файле, дописывается
+            // В КОНЕЦ; существующие профили (включая автопрофиль диагностики)
+            // не трогаются ни разом — совпавшие по имени пропускаются.
+            let has: std::collections::HashSet<String> = parsed
+                .iter()
+                .filter_map(|p| p["name"].as_str().map(|s| s.to_string()))
+                .collect();
+            let mut merged = parsed;
+            let mut changed = false;
+            for d in &default_profiles {
+                match d["name"].as_str() {
+                    Some(name) if !has.contains(name) => {
+                        merged.push(d.clone());
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+            if changed {
+                let _ = fs::write(&path, serde_json::to_string_pretty(&merged).unwrap());
+            }
+            return Ok(merged);
         }
     }
-    
+
     // Если файла нет или он поврежден (пустой/невалидный), восстанавливаем из дефолтных
-    let default_profiles_str = include_str!("../profiles_default.json");
-    let parsed_profiles: Vec<serde_json::Value> = serde_json::from_str(default_profiles_str)
-        .expect("Invalid default profiles JSON schema!");
-        
-    // Сохраняем восстановленный профиль
-    let _ = fs::write(&path, serde_json::to_string_pretty(&parsed_profiles).unwrap());
-    
-    Ok(parsed_profiles)
+    let _ = fs::write(&path, serde_json::to_string_pretty(&default_profiles).unwrap());
+
+    Ok(default_profiles)
 }
 
 /// Добавляет (или заменяет, если имя совпадает) профиль в profiles.json.
@@ -358,6 +385,7 @@ mod tests {
         // 1) lists/defaults/ получает все 4 дефолта (жёсткая перезапись);
         // 2) старые места дефолтов удаляются;
         // 3) юзерские списки в корне lists/ не трогаются.
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK");
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("время системное")
@@ -399,6 +427,109 @@ mod tests {
         let user_list = std::fs::read_to_string(dir.join("lists").join("list-general.txt"))
             .expect("юзерский список на месте");
         assert_eq!(user_list, "example.com\n", "юзерские списки ensure не перезаписывает");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Оба env-теста (ensure… и merge-миграция) крутят общий DPI_GUI_APP_DIR —
+    /// без сериализации они гонялись бы за переменной окружения.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn profiles_default_json_valid_unique_and_bins_exist() {
+        // Корпус дефолтных профилей (включая добавленные 1.10.4): JSON валиден,
+        // имена уникальны, мусор конвертации отсутствует, все .bin существуют.
+        let profiles: Vec<serde_json::Value> = serde_json::from_str(include_str!("../profiles_default.json"))
+            .expect("profiles_default.json обязан быть валидным JSON-массивом");
+        assert!(!profiles.is_empty(), "дефолтный набор профилей не пуст");
+
+        let names: Vec<&str> = profiles.iter().filter_map(|p| p["name"].as_str()).collect();
+        assert_eq!(names.len(), profiles.len(), "у каждого профиля есть имя");
+        let uniq: std::collections::HashSet<&&str> = names.iter().collect();
+        assert_eq!(uniq.len(), names.len(), "имена профилей уникальны: {:?}", names);
+
+        let bin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("bin");
+        for p in &profiles {
+            let name = p["name"].as_str().unwrap_or("?");
+            let args = p["args"].as_str().unwrap_or_else(|| panic!("{}: args — строка", name));
+            assert!(!args.is_empty(), "{}: args не пусты", name);
+            for bad in ["%", "^", "user.txt"] {
+                assert!(!args.contains(bad), "{}: остался мусор конвертации «{}»", name, bad);
+            }
+            for (idx, _) in args.match_indices(".bin") {
+                // Имя файла — от предыдущей кавычки/пробела/равно до конца «.bin».
+                let end = idx + ".bin".len();
+                let start = args[..end]
+                    .rsplit(|c: char| c == '"' || c == ' ' || c == '=')
+                    .next()
+                    .unwrap_or("");
+                let rel = start.trim_start_matches('/');
+                let rel = rel.strip_prefix("{BIN_DIR}/").unwrap_or(rel);
+                let path = bin_dir.join(rel);
+                assert!(path.exists(), "{}: файл {} отсутствует в bin/", name, start);
+            }
+        }
+    }
+
+    #[test]
+    fn read_profiles_merges_new_defaults_by_name() {
+        // Merge-миграция read_profiles (появилась с профилями 1.10.4):
+        // существующий profiles.json не трогается, недостающие дефолты
+        // дописываются в конец, повторный вызов ничего не добавляет.
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK");
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("время системное")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dpi_gui_profiles_merge_{}", unique));
+        std::fs::create_dir_all(&dir).expect("создание временной папки");
+
+        let defaults: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../profiles_default.json")).expect("дефолтный JSON");
+        let default_names: Vec<&str> = defaults.iter().filter_map(|p| p["name"].as_str()).collect();
+
+        // Имитация старой установки: первый дефолт «пережил» юзерские правки,
+        // остальные дефолты отсутствуют + один сугубо юзерский профиль.
+        let mut old_file = vec![defaults[0].clone()];
+        old_file.push(serde_json::json!({
+            "name": "Мой собственный профиль",
+            "args": "--hostlist=\"C:/my/list.txt\" --dpi-desync=fake,split2"
+        }));
+        std::fs::write(
+            dir.join("profiles.json"),
+            serde_json::to_string_pretty(&old_file).expect("сериализация старого файла"),
+        )
+        .expect("запись profiles.json");
+
+        std::env::set_var("DPI_GUI_APP_DIR", &dir);
+        let merged = read_profiles().expect("read_profiles без ошибок");
+        std::env::remove_var("DPI_GUI_APP_DIR");
+
+        // 1) Существующие профили не тронуты и идут первыми.
+        assert_eq!(&merged[0], &defaults[0], "существующий дефолт не изменён");
+        assert_eq!(merged[1]["name"], "Мой собственный профиль", "юзерский профиль на месте");
+        assert_eq!(
+            merged[1]["args"], "--hostlist=\"C:/my/list.txt\" --dpi-desync=fake,split2",
+            "юзерские args не переписаны"
+        );
+        // 2) Все недостающие дефолты дописаны в конец в порядке дефолтного файла.
+        assert_eq!(merged.len(), defaults.len() + 1, "добавлены все недостающие дефолты");
+        for (i, d) in defaults.iter().skip(1).enumerate() {
+            assert_eq!(&merged[2 + i], d, "дефолт «{}» дописан как есть", d["name"]);
+        }
+        // 3) Повторный вызов идемпотентен (дублей нет) и файл остаётся валидным.
+        std::env::set_var("DPI_GUI_APP_DIR", &dir);
+        let merged2 = read_profiles().expect("повторный read_profiles без ошибок");
+        std::env::remove_var("DPI_GUI_APP_DIR");
+        assert_eq!(merged2.len(), merged.len(), "повторный вызов не дублирует дефолты");
+        assert_eq!(merged2, merged, "повторный вызов ничего не меняет");
+        let reread: Vec<serde_json::Value> = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("profiles.json")).expect("чтение файла после миграции"),
+        )
+        .expect("profiles.json остаётся валидным JSON");
+        assert_eq!(reread, merged, "файл совпадает с результатом merge");
+        assert!(default_names.contains(&"1.10.4 - General (ALT12)"), "новый профиль в дефолтах");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -32,6 +32,11 @@ use crate::site_solution::SiteSolution;
 pub const EXTERNAL_WAIT: Duration = Duration::from_secs(180);
 /// Период опроса worker-цикла (очередь мала, гонять condvar нечего).
 const POLL: Duration = Duration::from_millis(200);
+/// Жёсткий дедлайн анализа одного домена (инцидент 03.11.26: заклинившая
+/// проба держала running=true навсегда, фича «висела намертво»). Дедлайн
+/// покрывает полный конвейер analyze_url (Chrome-этап ~30с + IPSCAN до
+/// ~2 мин + восстановление обхода) с запасом.
+const ANALYSIS_DEADLINE: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // Событие прогресса для UI: статусы в строках «Ошибок сети».
@@ -167,7 +172,32 @@ fn worker(app: AppHandle) {
                 let label = display_domain_of(&url);
                 emit_progress(&app, &label, "running", None, None);
                 app_log(&app, format!("[Анализ] анализ {}...", label));
-                let outcome = analyze_catch(&app, &url);
+                // Анализ живёт в своём потоке, worker ждёт только до дедлайна
+                // (иначе один заклинивший probe() держал бы очередь навсегда —
+                // инцидент 03.11.26). Поток-зомби НЕ join-ится.
+                let outcome = match run_manual_with_deadline(&app, &url) {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        // Дедлайн/обрыв потока: честный Err, очередь свободна,
+                        // обход восстанавливаем ИЗВНЕ окна (Guard ранить нельзя:
+                        // зомби-поток свой Drop не вызовет).
+                        app_log(&app, format!("[Анализ] {e}"));
+                        let _ = respond.send(Err(e.clone()));
+                        emit_progress(&app, &label, "failed", None, Some(e));
+                        if let Some(note) = crate::bypass_toggle::emergency_restore(&app) {
+                            app_log(&app, note);
+                        }
+                        finish_job();
+                        app_log(
+                            &app,
+                            format!(
+                                "[Анализ] очередь освобождена (джоб {} сброшен по дедлайну)",
+                                label
+                            ),
+                        );
+                        continue;
+                    }
+                };
                 // Ответ ждёт команда run_domain_analysis; событие обновит и
                 // бейдж в «Ошибках сети», если этот домен там есть.
                 let _ = respond.send(outcome.clone());
@@ -227,6 +257,47 @@ fn analyze_catch(app: &AppHandle, url: &str) -> Result<DomainAnalysisOutcome, St
         .unwrap_or_else(|p| Err(format!("внутренняя паника анализа: {}", panic_msg(p))))
 }
 
+/// Запуск ручного анализа в ОТДЕЛЬНОМ потоке с жёстким дедлайном ожидания
+/// ([`ANALYSIS_DEADLINE`]). Ok(outcome) — анализ закончился сам; Err —
+/// дедлайн/обрыв канала: поток-зомби остаётся жить (join был бы вечен),
+/// а caller обязан вызвать `finish_job()` + `emergency_restore`.
+fn run_manual_with_deadline(
+    app: &AppHandle,
+    url: &str,
+) -> Result<Result<DomainAnalysisOutcome, String>, String> {
+    let (tx, rx) = mpsc::channel::<Result<DomainAnalysisOutcome, String>>();
+    let app_thread = app.clone();
+    let url_thread = url.to_string();
+    let spawned = std::thread::Builder::new()
+        .name(format!("analysis-manual-{}", display_domain_of(url)))
+        .spawn(move || {
+            let out = analyze_catch(&app_thread, &url_thread);
+            let _ = tx.send(out);
+        });
+    let handle = spawned.map_err(|e| format!("поток анализа не запущен: {}", e))?;
+    match rx.recv_timeout(ANALYSIS_DEADLINE) {
+        Ok(outcome) => Ok(outcome),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // ибо убивать поток нельзя (Rust не умеет безопасно) — join
+            // пропускаем сознательно, зомби-поток останется висеть.
+            Err(format!(
+                "анализ не уложился в дедлайн {} сек; поток анализа брошен, обход восстанавливается",
+                ANALYSIS_DEADLINE.as_secs()
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            // Поток умер, не послав ответ. handle.join() здесь безопасен:
+            // раз канала нет — поток уже ЗАВЕРШИЛСЯ (не заклинил).
+            let panic_note = handle
+                .join()
+                .err()
+                .map(|_| "поток паниковал")
+                .unwrap_or("поток завершился без ответа");
+            Err(format!("поток анализа прервался: {}", panic_note))
+        }
+    }
+}
+
 /// Человекочитаемый ярлык джоба: нормализованный хост введённого адреса
 /// (для сверки с бейджами в «Ошибках сети»), IP-цель — как есть.
 fn display_domain_of(input: &str) -> String {
@@ -242,6 +313,8 @@ fn display_domain_of(input: &str) -> String {
 
 /// Ручной анализ: джоб в очередь, ответ — через канал, пока worker занят
 /// (например, дожимает массовый прогон) — команда честно ждёт своей очереди.
+/// Потолок ожидания — ANALYSIS_DEADLINE + запас: зависший воркер не держит
+/// команду навсегда, приходит честный Err (инцидент 03.11.26).
 pub async fn enqueue_manual(app: AppHandle, url: String) -> Result<DomainAnalysisOutcome, String> {
     let (tx, rx) = mpsc::channel();
     {
@@ -250,7 +323,13 @@ pub async fn enqueue_manual(app: AppHandle, url: String) -> Result<DomainAnalysi
     }
     ensure_worker(&app);
     tauri::async_runtime::spawn_blocking(move || {
-        rx.recv().unwrap_or_else(|_| Err("очередь анализа не ответила: воркер завершился".into()))
+        rx.recv_timeout(ANALYSIS_DEADLINE + Duration::from_secs(60))
+            .unwrap_or_else(|_| {
+                Err(format!(
+                    "очередь анализа не ответила за {} сек (вероятно, очередь занята долгим массовым анализом) — повторите попытку",
+                    (ANALYSIS_DEADLINE + Duration::from_secs(60)).as_secs()
+                ))
+            })
     })
     .await
     .unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))

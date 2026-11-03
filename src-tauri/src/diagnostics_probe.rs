@@ -96,14 +96,18 @@ where
     T: Send + 'static,
 {
     let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
+    // Дроп JoinHandle отсоединяет поток — это и есть поведение «зомби доучится сам».
+    thread::spawn(move || {
         let r = f();
         let _ = tx.send(r);
     });
     match rx.recv_timeout(Duration::from_millis(ms)) {
         Ok(r) => Some(r),
         Err(_) => {
-            let _ = handle.join();
+            // Поток-зомби НЕ join-им: join ждал бы завершения заклинившей
+            // операции вечно, и дедлайн был бы фиктивным (тот самый сценарий
+            // зависания «Анализа сайта»). Отсоединённый поток доучится сам:
+            // send в закрытый канал молча провалится, поток завершится.
             None
         }
     }
@@ -1121,6 +1125,30 @@ pub fn normalize_host(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_with_timeout_deadline_contract() {
+        // Контракт SSOT-обёртки (инцидент зависания «Анализа сайта»): если
+        // операция не вернулась за дедлайн — возвращаем None, не дожидаясь её. Раньше на таймауте звался handle.join(), и обёртка
+        // ждала заклинившую операцию вечно, делая дедлайн фиктивным.
+        let t0 = std::time::Instant::now();
+        let result = run_with_timeout(
+            || {
+                // Имитация заклинившей операции (зомби-поток доучится сам).
+                thread::sleep(Duration::from_secs(30));
+                7i32
+            },
+            300,
+        );
+        assert!(result.is_none(), "зависшая операция обязана вернуть None");
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "возврат по дедлайну (300 мс), а не по завершению операции (30 с); прошло {:?}",
+            t0.elapsed()
+        );
+        // Обычная быстрая операция проходит насквозь со своим результатом.
+        assert_eq!(run_with_timeout(|| 2 + 2, 2000), Some(4));
+    }
 
     #[test]
     fn dns_errors() {

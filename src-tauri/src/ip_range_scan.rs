@@ -22,7 +22,7 @@ use reqwest::blocking::Client;
 use reqwest::header::ACCEPT;
 use tauri::AppHandle;
 
-use crate::diagnostics_probe::{classify_reqwest_err, HttpResult};
+use crate::diagnostics_probe::{classify_reqwest_err, run_with_timeout, HttpResult};
 use crate::ip_probe::app_log;
 
 /// «Родных» адресов домена достаточно проверить по первым нескольким.
@@ -33,6 +33,11 @@ const PER_CIDR: usize = 4;
 const CHUNK: usize = 12;
 /// Таймаут одной HTTP-пробы (IP закреплён).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+/// Внешний дедлайн этапа `ClientBuilder::build()` внутри probe(). У reqwest
+/// blocking build запускает runtime-поток и ждёт его БЕЗ внутреннего дедлайна
+/// (инцидент 03.11.26: воркер анализа заклинил в probe() второй итерации) —
+/// поэтому построчный этап дополнительно страхуется снаружи.
+const BUILD_TIMEOUT: Duration = Duration::from_secs(3);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// Штатный бюджет скана диапазонов.
 const SCAN_BUDGET: Duration = Duration::from_secs(90);
@@ -378,18 +383,20 @@ fn resolve_neutral(host: &str) -> Result<(Vec<IpAddr>, String), String> {
 
 // --- HTTP-проба с телом ---------------------------------------------------
 
-/// HTTPS-проба с SNI/Host = домен, IP закреплён (DNS в пробе не участвует).
-/// БерTalking первые ~512 байт тела для классификации 403.
-fn probe(host: &str, ip: IpAddr) -> HttpOutcome {
-    let url = format!("https://{host}/");
-    let client = match Client::builder()
+/// Создание reqwest-клиента пробы (IP закреплён через `.resolve`). Вынесено,
+/// чтобы этап build обёртываться в run_with_timeout отдельно от send: у build
+/// внутреннего дедлайна нет совсем.
+fn build_probe_client(host: &str, ip: IpAddr) -> Result<Client, String> {
+    Client::builder()
         .resolve(host, std::net::SocketAddr::new(ip, 443))
         .timeout(PROBE_TIMEOUT)
         .build()
-    {
-        Ok(c) => c,
-        Err(e) => return HttpOutcome::Other(format!("клиент[{ip}]: {e}")),
-    };
+        .map_err(|e| format!("клиент[{ip}]: {e}"))
+}
+
+/// send+чтение тела пробы (этап с внутренним total-таймаутом PROBE_TIMEOUT).
+fn send_probe(client: &Client, host: &str) -> HttpOutcome {
+    let url = format!("https://{host}/");
     match client.get(&url).send() {
         Ok(resp) => {
             let status = resp.status().as_u16();
@@ -433,6 +440,78 @@ fn probe(host: &str, ip: IpAddr) -> HttpOutcome {
     }
 }
 
+/// Проба без внешних логов (используется параллельным сканом).
+fn probe(host: &str, ip: IpAddr) -> HttpOutcome {
+    match build_probe_client(host, ip) {
+        Ok(c) => send_probe(&c, host),
+        Err(e) => HttpOutcome::Other(e),
+    }
+}
+
+/// Проба родного IP с внешними дедлайнами на КАЖДЫЙ этап (build/send) и
+/// логом-дискриминатором. По инциденту 03.11.26 .timeout() reqwest'а не
+/// гарантирует возврат URL-вызова: build ждёт bootstrap runtime-потока без
+/// дедлайна, а внутренний таймер не прерывает заклинивший syscall уровне ОС.
+/// Здесь каждый этап ограничен извне SSOT-обёрткой
+/// `diagnostics_probe::run_with_timeout`: заклинивший поток оставляется
+/// зомби (это дешевле вечного зависания воркера), пробе возвращается
+/// честный Outcome.
+fn probe_with_app(app: &AppHandle, host: &str, ip: IpAddr) -> HttpOutcome {
+    // Этап 1: build (внутреннего дедлайна нет — внешний обязателен).
+    let t_build = Instant::now();
+    let h = host.to_string();
+    let stage_client =
+        run_with_timeout(move || build_probe_client(&h, ip), BUILD_TIMEOUT.as_millis() as u64);
+    let client = match stage_client {
+        Some(Ok(c)) => {
+            app_log(
+                app,
+                format!("[IPSCAN] клиент[{ip}]: build ok {} мс", t_build.elapsed().as_millis()),
+            );
+            c
+        }
+        Some(Err(e)) => {
+            let msg = format!("{e} (build {} мс)", t_build.elapsed().as_millis());
+            app_log(app, format!("[IPSCAN] клиент[{ip}]: build fail: {msg}"));
+            return HttpOutcome::Other(msg);
+        }
+        None => {
+            let msg = format!(
+                "клиент[{ip}]: build заклинил — внешний дедлайн {} мс, поток брошен",
+                BUILD_TIMEOUT.as_millis()
+            );
+            app_log(app, format!("[IPSCAN] {msg}"));
+            return HttpOutcome::Other(msg);
+        }
+    };
+
+    // Этап 2: send+чтение (внутренний total-таймаут PROBE_TIMEOUT, внешний —
+    // с запасом +2 c, чтобы внутренний успел сработать первым).
+    let stage_deadline = PROBE_TIMEOUT + Duration::from_secs(2);
+    let t_send = Instant::now();
+    let h = host.to_string();
+    match run_with_timeout(
+        move || send_probe(&client, &h),
+        stage_deadline.as_millis() as u64,
+    ) {
+        Some(o) => {
+            app_log(
+                app,
+                format!("[IPSCAN] клиент[{ip}]: send ok {} мс", t_send.elapsed().as_millis()),
+            );
+            o
+        }
+        None => {
+            let msg = format!(
+                "клиент[{ip}]: send заклинил — внешний дедлайн {} мс, поток брошен",
+                stage_deadline.as_millis()
+            );
+            app_log(app, format!("[IPSCAN] {msg}"));
+            HttpOutcome::Timeout
+        }
+    }
+}
+
 fn describe_outcome(o: &HttpOutcome) -> String {
     match o {
         HttpOutcome::Http { status, body_head, cf_mitigated } => {
@@ -464,13 +543,29 @@ pub fn block_diagnose(app: &AppHandle, host: &str) -> BlockScanReport {
     let t0 = Instant::now();
     app_log(app, format!("[IPSCAN] разбор блока для {host}..."));
 
-    let (native_ips, resolver_note) = match resolve_neutral(host) {
-        Ok(v) => v,
-        Err(e) => {
-            app_log(app, format!("[IPSCAN] резолв не удался: {e}"));
-            return BlockScanReport::NoPath {
-                why: format!("не удалось получить адреса домена: {e}"),
-            };
+    let (native_ips, resolver_note) = {
+        // Внешний дедлайн резолва: 2 DoH по FETCH_TIMEOUT + запас на системный
+        // фолбэк (иначе зависший DoH-вызов вечен прямо при старте разбора).
+        let resolver_ceiling = FETCH_TIMEOUT * 2 + Duration::from_secs(10);
+        let h = host.to_string();
+        match run_with_timeout(
+            move || resolve_neutral(&h),
+            resolver_ceiling.as_millis() as u64,
+        ) {
+            Some(Ok(res)) => res,
+            Some(Err(e)) => {
+                let why = format!("не удалось получить адреса домена: {e}");
+                app_log(app, format!("[IPSCAN] {why}"));
+                return BlockScanReport::NoPath { why };
+            }
+            None => {
+                let why = format!(
+                    "не удалось получить адреса домена: резолв не уложился во внешний дедлайн {} мс",
+                    resolver_ceiling.as_millis()
+                );
+                app_log(app, format!("[IPSCAN] {why}"));
+                return BlockScanReport::NoPath { why };
+            }
         }
     };
     app_log(
@@ -488,15 +583,18 @@ pub fn block_diagnose(app: &AppHandle, host: &str) -> BlockScanReport {
         ),
     );
 
-    // Проба родных IP.
+    // Проба родных IP. Каждый этап с внешним дедлайном (probe_with_app):
+    // заклинившая проба больше не стопорит весь анализ (инцидент 03.11.26).
     let mut outcomes: Vec<HttpOutcome> = Vec::new();
     // Честные описания всех непроизошедших HTTP-ответов (для итогового лога,
     // core §2.2): «чужой VIP» мы не имеем права называть, если ответов не было.
     let mut native_notes: Vec<String> = Vec::new();
     let mut last_err = String::from("без ответа");
     for ip in native_ips.iter().take(NATIVE_PROBE_LIMIT) {
-        let o = probe(host, *ip);
-        let note = describe_outcome(&o);
+        let t_ip = Instant::now();
+        let o = probe_with_app(app, host, *ip);
+        let note =
+            format!("{} ({} мс)", describe_outcome(&o), t_ip.elapsed().as_millis());
         if o.is_transport_dead() {
             last_err = note.clone();
             app_log(app, format!("[IPSCAN] родной {ip}: {note}"));
@@ -609,10 +707,31 @@ pub fn block_diagnose(app: &AppHandle, host: &str) -> BlockScanReport {
 /// Чистая граница: сначала принадлежность родных IP диапазонам CF,
 /// и только для CF-сайтов — сам скан.
 fn decide_range_scan(app: &AppHandle, host: &str, native_ips: &[IpAddr]) -> BlockScanReport {
-    let (cidr_text, source) = match fetch_cidrs() {
-        Ok(v) => v,
-        Err(e) => {
+    // Внешний дедлайн получения списка CIDR: 3 источника по FETCH_TIMEOUT
+    // (плюс build клиента) + запас; иначе зависший запрос к raw.githubusercontent
+    // держит разбор вечнее воркера (см. инцидент 03.11.26).
+    let fetch_ceiling = FETCH_TIMEOUT * 3 + Duration::from_secs(10);
+    let (cidr_text, source) = match run_with_timeout(fetch_cidrs, fetch_ceiling.as_millis() as u64) {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => {
             app_log(app, format!("[IPSCAN] список CIDR не получен: {e}"));
+            return BlockScanReport::RangesScanned(RangeScanOutcome {
+                ranges_source: Err(e),
+                pool_size: 0,
+                probed: 0,
+                alive_count: 0,
+                guest_refusal_count: 0,
+                waf_refusal_count: 0,
+                other_status_count: 0,
+                working: Vec::new(),
+            });
+        }
+        None => {
+            let e = format!(
+                "скачивание CIDR не уложилось во внешний дедлайн {} мс",
+                fetch_ceiling.as_millis()
+            );
+            app_log(app, format!("[IPSCAN] {e}"));
             return BlockScanReport::RangesScanned(RangeScanOutcome {
                 ranges_source: Err(e),
                 pool_size: 0,
@@ -673,6 +792,9 @@ fn scan_ranges(app: &AppHandle, host: &str, parsed: &[Cidr], ranges_count: usize
         working: Vec::new(),
     };
     let deadline = Instant::now() + SCAN_BUDGET;
+    // Внешний дедлайн одной пробы пула (send 6 с + запас на build/OS-клин;
+    // инцидент 03.11.26: проба без внешнего дедлайна заклинила воркер).
+    let probe_ceiling = (PROBE_TIMEOUT + Duration::from_secs(2)).as_millis() as u64;
     for chunk in pool.chunks(CHUNK) {
         if Instant::now() > deadline {
             app_log(
@@ -681,15 +803,53 @@ fn scan_ranges(app: &AppHandle, host: &str, parsed: &[Cidr], ranges_count: usize
             );
             break;
         }
-        let got: Vec<(IpAddr, HttpOutcome)> = std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for ip in chunk {
-                let ip = *ip;
-                let h = host.to_string();
-                handles.push(scope.spawn(move || (ip, probe(&h, ip))));
+        // Пачка параллельных проб с ОГРАНИЧЕННЫМ ожиданием: старый вариант
+        // (std::thread::scope + join) ждал зависший поток вечно. Теперь каждый
+        // поток шлёт результат в канал, а главный поток собирает пачку по
+        // одному recv_timeout со дедлайном чанка; неуспевшие пробы честно
+        // помечаются брошенными.
+        let (tx, rx) = std::sync::mpsc::channel::<(IpAddr, HttpOutcome)>();
+        let mut spawned = 0usize;
+        for ip in chunk {
+            let ip = *ip;
+            let h = host.to_string();
+            let tx = tx.clone();
+            spawned += 1;
+            std::thread::spawn(move || {
+                let out = run_with_timeout(move || probe(&h, ip), probe_ceiling);
+                let o = out.unwrap_or_else(|| {
+                    HttpOutcome::Other(
+                        "проба не уложилась во внешний дедлайн (поток брошен)".to_string(),
+                    )
+                });
+                let _ = tx.send((ip, o));
+            });
+        }
+        drop(tx); // не держим копию отправителя — канал закроется после всех проб
+        let chunk_deadline = deadline.min(Instant::now() + PROBE_TIMEOUT + Duration::from_secs(4));
+        let got: Vec<(IpAddr, HttpOutcome)> = {
+            let mut acc = Vec::with_capacity(spawned);
+            loop {
+                // Ждём результат или дедлайн чанка
+                let remaining = chunk_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match rx.recv_timeout(remaining) {
+                    Ok((ip, o)) => acc.push((ip, o)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
-            handles.into_iter().filter_map(|h| h.join().ok()).collect()
-        });
+            acc
+        };
+        if got.len() < spawned {
+            let abandoned = spawned - got.len();
+            app_log(
+                app,
+                format!("[IPSCAN] проб(ы) брошены по внешнему дедлайну чанка: {abandoned}"),
+            );
+        }
         for (ip, o) in got {
             res.probed += 1;
             match &o {
