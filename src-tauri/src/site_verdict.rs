@@ -557,8 +557,14 @@ fn collect_actions(verdict: Verdict, ctx: &CauseContext, d: &mut Diagnosis) {
         }
 
         Verdict::IpUnreachable => {
+            // Вердикт ставится, когда ответ не получен ни по одному адресу
+            // браузерного канала; наблюдаемый сбой — таймаут (RST — это отдельный
+            // вердикт IpReset). Утверждать «до сервера доходит RST» — ложь
+            // (кейс 05.11.26 web.telegram.org: пробы показали чистый таймаут).
             d.wont_help.push(
-                "Обход winws тут не поможет: до сервера доходит RST, ответ не возвращается."
+                "Обход winws тут не поможет: соединение по адресу, который использует браузер, \
+                 не проходит — ответа на TCP-подключение нет. TLS-рукопожатие не начинается, \
+                 десинкать нечего."
                     .to_string(),
             );
             d.wont_help.push(
@@ -1079,6 +1085,13 @@ fn clean_dns_site_opens_via_system_is_open() {
     fn unreachable_ip_says_bypass_wont_help() {
         let d = explain(Verdict::IpUnreachable, &ctx("example.com"));
         assert!(d.wont_help.iter().any(|a| a.contains("winws")), "{:?}", d.wont_help);
+        // IpUnreachable = ответа нет (таймаут); RST — отдельный вердикт IpReset.
+        // Текст не должен утверждать сброс, которого пробы не видели.
+        assert!(
+            !d.wont_help.iter().any(|a| a.contains("RST")),
+            "IpUnreachable не должен утверждать RST: {:?}",
+            d.wont_help
+        );
         assert!(
             !d.do_this.iter().any(|a| a.contains("hosts")),
             "hosts must not be advised for a dead IP: {:?}",

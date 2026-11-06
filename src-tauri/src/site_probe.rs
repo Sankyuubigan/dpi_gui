@@ -1050,6 +1050,10 @@ pub struct HostsPin {
     pub domain: String,
     pub ip: String,
     pub http: HttpResult,
+    /// Запись помечена «# DPI_GUI» (наша). Только такие умеет удалять
+    /// чистильщик `hosts::remove_hosts_entry`; ручные он не трогает —
+    /// от этого флага зависит честность «найденного решения».
+    pub dpi_gui: bool,
 }
 
 /// Сломана ли запись hosts для юзера: «сайт через запись не открывается».
@@ -1063,16 +1067,25 @@ pub fn hosts_pin_is_broken(http: &HttpResult) -> bool {
 /// Пробы закреплённых в hosts адресов домена (IP берутся из hosts-карты
 /// `hosts::load_hosts_map`). Проба та же, что у кнопки «В hosts + тест»
 /// ([`probe_https_by_ip`]): соединение по IP с SNI домена.
-pub fn probe_hosts_pins(host: &str, ips: &[String]) -> Vec<HostsPin> {
-    ips.iter()
+pub fn probe_hosts_pins(host: &str, ips: &[String]) -> Result<Vec<HostsPin>, String> {
+    // Метка «# DPI_GUI» решает, сможет ли чистильщик удалить запись: ручные
+    // строки он не трогает (hosts::remove_hosts_entry). Ошибка чтения hosts
+    // честно проваливается наверх, а не превращает все записи в «ручные».
+    let marked = crate::hosts::dpi_gui_mapped_ips(host)?;
+    Ok(ips.iter()
         .map(|ip| {
             let http = match ip.parse::<std::net::IpAddr>() {
                 Ok(addr) => probe_https_by_ip(host, addr),
                 Err(_) => HttpResult::Other(format!("«{}» — не похоже на IP-адрес", ip)),
             };
-            HostsPin { domain: host.to_string(), ip: ip.clone(), http }
+            HostsPin {
+                domain: host.to_string(),
+                ip: ip.clone(),
+                http,
+                dpi_gui: marked.contains(ip),
+            }
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]

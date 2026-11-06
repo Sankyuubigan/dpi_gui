@@ -361,7 +361,10 @@ fn hosts_pins_parallel(
         let h = h.clone();
         let ips = map.get(&h).cloned().unwrap_or_default();
         thread::spawn(move || {
-            let pins = site_probe::probe_hosts_pins(&h, &ips);
+            // hosts уже успешно прочитан выше (иначе пинов не было бы вовсе):
+            // сбой повторного чтения меток здесь практически невозможен, а пины
+            // без честного флага лучше опустить, чем выдумывать dpi_gui.
+            let pins = site_probe::probe_hosts_pins(&h, &ips).unwrap_or_default();
             let _ = tx.send((h, pins));
         });
     }

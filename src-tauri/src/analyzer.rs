@@ -535,7 +535,18 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         if ips.is_empty() {
             Vec::new()
         } else {
-            site_probe::probe_hosts_pins(&main_host, &ips)
+            // Метки DPI_GUI читаются отдельным проходом: ошибка — это НЕ «все
+            // записи ручные» (так решение соврало бы), а пропуск пинов с логом.
+            site_probe::probe_hosts_pins(&main_host, &ips).unwrap_or_else(|e| {
+                crate::events::app_log(
+                    app,
+                    format!(
+                        "[Анализ] метки DPI_GUI в hosts не прочитаны — закреплённые записи не проверены: {}",
+                        e
+                    ),
+                );
+                Vec::new()
+            })
         }
     };
     timings.push(("hosts_pins (пробы закреплённых адресов)", t_pins.elapsed()));

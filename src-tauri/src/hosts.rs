@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::IpAddr;
 use std::os::windows::process::CommandExt;
@@ -40,6 +40,52 @@ fn normalize_domain(domain: &str) -> Result<String, String> {
     Ok(d.trim_end_matches('.').to_string())
 }
 
+/// Пара имён для работы с hosts: сам домен и его www-вариант (для домена
+/// с префиксом www www-вариант совпадает с ним самим — дублей не создаётся).
+fn domain_with_www(domain: &str) -> (String, String) {
+    if domain.starts_with("www.") {
+        (domain.to_string(), domain.to_string())
+    } else {
+        (domain.to_string(), format!("www.{}", domain))
+    }
+}
+
+/// IP-адреса, которые домен (или его www-вариант) получает из строк hosts
+/// С меткой DPI_GUI. SSOT для вопроса «сможет ли чистильщик удалить запись»:
+/// `remove_hosts_entry` трогает только помеченные строки, ручные — нет
+/// (кейс 05.11.26 web.telegram.org: ручные записи чистильщик не удалял,
+/// а «найденное решение» обещало обратное).
+fn marked_ips_for_domain(lines: &[&str], domain: &str, www: &str) -> HashSet<String> {
+    let mut ips = HashSet::new();
+    for line in lines {
+        if !line.contains(MARKER) {
+            continue;
+        }
+        // Всё после `#` — комментарий; метка живёт в нём же (`IP domain # DPI_GUI`).
+        let t = line.split('#').next().unwrap_or("").trim();
+        let mut tokens = t.split_whitespace();
+        let Some(ip_tok) = tokens.next() else { continue };
+        let Ok(ip) = IpAddr::from_str(ip_tok) else { continue };
+        if tokens.any(|d| {
+            let d = d.trim_end_matches('.').to_lowercase();
+            d == domain || d == www
+        }) {
+            ips.insert(ip.to_string());
+        }
+    }
+    ips
+}
+
+/// Прочитать системный hosts и вернуть помеченные DPI_GUI адреса домена.
+/// Ошибка чтения отдаётся наверх: на этой функции строится честность
+/// «найденного решения», молчаливый дефолт «всё ручное» тут недопустим.
+pub fn dpi_gui_mapped_ips(domain: &str) -> Result<HashSet<String>, String> {
+    let (domain, www) = domain_with_www(&normalize_domain(domain)?);
+    let raw = read_hosts_raw()?;
+    let refs: Vec<&str> = raw.iter().map(|s| s.as_str()).collect();
+    Ok(marked_ips_for_domain(&refs, &domain, &www))
+}
+
 /// Чтение текущего содержимого hosts (сырые строки).
 fn read_hosts_raw() -> Result<Vec<String>, String> {
     fs::read_to_string(hosts_path())
@@ -63,12 +109,7 @@ fn ensure_backup() -> Result<(), String> {
 pub fn apply_hosts_entry(ip: &str, domain: &str) -> Result<String, String> {
     let parsed = IpAddr::from_str(ip.trim())
         .map_err(|_| format!("«{}» — не похоже на IP-адрес (нужен IPv4/IPv6)", ip))?;
-    let domain = normalize_domain(domain)?;
-    let www = if domain.starts_with("www.") {
-        domain.clone()
-    } else {
-        format!("www.{}", domain)
-    };
+    let (domain, www) = domain_with_www(&normalize_domain(domain)?);
 
     ensure_backup()?;
     let mut lines = read_hosts_raw()?;
@@ -92,12 +133,7 @@ pub fn apply_hosts_entry(ip: &str, domain: &str) -> Result<String, String> {
 
 /// Удаляет строки, которые приложение ПОМЕТИЛО DPI_GUI для этого домена.
 pub fn remove_hosts_entry(domain: &str) -> Result<String, String> {
-    let domain = normalize_domain(domain)?;
-    let www = if domain.starts_with("www.") {
-        domain.clone()
-    } else {
-        format!("www.{}", domain)
-    };
+    let (domain, www) = domain_with_www(&normalize_domain(domain)?);
 
     ensure_backup()?;
     let mut lines = read_hosts_raw()?;
@@ -201,6 +237,23 @@ fn flush_dns() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Помеченные DPI_GUI адреса домена: только строки с меткой, маппящие
+    /// домен или его www; ручные строки и чужие домены не попадают.
+    #[test]
+    fn marked_ips_distinguishes_marker_lines() {
+        let lines = [
+            "1.2.3.4 example.com",
+            "5.6.7.8 example.com # DPI_GUI",
+            "5.6.7.8 www.example.com # DPI_GUI",
+            "9.9.9.9 other.com # DPI_GUI",
+            "# DPI_GUI example.com",
+        ];
+        assert_eq!(
+            marked_ips_for_domain(&lines, "example.com", "www.example.com"),
+            HashSet::from(["5.6.7.8".to_string()])
+        );
+    }
 
     /// Базовый разбор: IP + домены, инлайновый комментарий-метка, дубль IP.
     #[test]

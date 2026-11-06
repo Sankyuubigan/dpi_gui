@@ -304,6 +304,9 @@ pub fn decide(meta: &ReportMeta, c: &Classification) -> SiteSolution {
 ///    рабочего адреса найти не удалось. В summary честно называется вердикт
 ///    DNS-пути: удаление записи возвращает браузер на DNS-путь, чьё состояние
 ///    описано в отчёте, — «починено и открыто» здесь не обещается.
+/// Ручная запись (без метки DPI_GUI) удалением не лечится — чистильщик трогает
+/// только свои строки: честный none с ручной инструкцией вместо ложного
+/// обещания автопочинки (кейс 05.11.26 web.telegram.org).
 fn hosts_pin_solution(meta: &ReportMeta, pin: &site_probe::HostsPin) -> SiteSolution {
     let host = pin.domain.clone();
     let replacement = meta.main_probe.as_ref().and_then(|probe| {
@@ -334,6 +337,29 @@ fn hosts_pin_solution(meta: &ReportMeta, pin: &site_probe::HostsPin) -> SiteSolu
             none_reason: None,
         },
         _ => {
+            // Чистильщик (hosts::remove_hosts_entry) удаляет только строки
+            // с меткой DPI_GUI. Ручную запись он не тронет — обещание
+            // «кнопка применит» было бы ложью (кейс 05.11.26 web.telegram.org:
+            // «Починить сайт» дважды ничего не удалила). Замена живым адресом
+            // (ветка выше) ручную запись перезаписывает — она остаётся доступной.
+            if !pin.dpi_gui {
+                return SiteSolution {
+                    found: false,
+                    actions: Vec::new(),
+                    summary: String::new(),
+                    none_reason: Some(format!(
+                        "мёртвая запись hosts ({} → {}) сделана вручную, без метки DPI_GUI — \
+                         приложение трогает только свои записи. Удалите строку «{} {}» из {} \
+                         вручную (блокнот от имени администратора) или замените живым адресом \
+                         («В hosts + тест»)",
+                        pin.ip,
+                        host,
+                        pin.ip,
+                        host,
+                        crate::hosts::hosts_path().display()
+                    )),
+                };
+            }
             let dns_note = match meta.main_probe.as_ref().map(|p| p.verdict) {
                 Some(v) => format!("путь по DNS после удаления: {}", v.verdict_name()),
                 None => "состояние DNS-пути — в отчёте".to_string(),
@@ -1347,6 +1373,17 @@ mod tests {
             domain: "example.com".to_string(),
             ip: ip.to_string(),
             http,
+            dpi_gui: true,
+        }
+    }
+
+    /// Ручная запись hosts (без метки DPI_GUI) — чистильщику недоступна.
+    fn pin_manual(ip: &str, http: HttpResult) -> crate::site_probe::HostsPin {
+        crate::site_probe::HostsPin {
+            domain: "example.com".to_string(),
+            ip: ip.to_string(),
+            http,
+            dpi_gui: false,
         }
     }
 
@@ -1411,6 +1448,21 @@ mod tests {
             s.actions
         );
         assert!(s.summary.contains("СБРОС СОЕДИНЕНИЯ"), "{}", s.summary);
+    }
+
+    /// Мёртвая РУЧНАЯ запись (без метки DPI_GUI): чистильщик её не удалит —
+    /// честный none с ручной инструкцией вместо ложного «кнопка применит»
+    /// (кейс 05.11.26 web.telegram.org).
+    #[test]
+    fn manual_dead_pin_gets_honest_none() {
+        let mut m = meta(probe(Verdict::IpUnreachable, Some(HttpResult::Timeout), None));
+        m.hosts_pins = vec![pin_manual("1.2.3.4", HttpResult::Timeout)];
+        let s = decide(&m, &empty_classification());
+        assert!(!s.found, "{:?}", s);
+        assert!(s.actions.is_empty(), "{:?}", s.actions);
+        let reason = s.none_reason.expect("none_reason обязана быть");
+        assert!(reason.contains("вручную"), "{}", reason);
+        assert!(reason.contains("1.2.3.4"), "{}", reason);
     }
 
     /// Живая запись hosts обычный ход решения не меняет (hosts не при чём).

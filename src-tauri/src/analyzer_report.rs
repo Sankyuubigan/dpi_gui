@@ -460,10 +460,19 @@ fn write_hosts_pins(log: &mut String, meta: &ReportMeta) {
                         pin.ip, note
                     ));
                 }
-                _ => {
+                _ if pin.dpi_gui => {
                     log.push_str(&format!(
                         "  ❌ {} — {} — запись ведёт на МЁРТВЫЙ адрес: домен будет падать, пока запись не убрать («Убрать» на вкладке «Починка сайтов») или не заменить живым\n",
                         pin.ip, note
+                    ));
+                }
+                _ => {
+                    // Ручная запись (без метки DPI_GUI): чистильщик её не тронет,
+                    // совет «Убрать»/«Починить сайт» был бы ложным обещанием
+                    // (кейс 05.11.26 web.telegram.org).
+                    log.push_str(&format!(
+                        "  ❌ {} — {} — запись ведёт на МЁРТВЫЙ адрес, и она РУЧНАЯ (без метки DPI_GUI): приложение её не удалит — уберите строку «{} {}» из hosts вручную (блокнот от администратора) или замените живым адресом («В hosts + тест»)\n",
+                        pin.ip, note, pin.ip, pin.domain
                     ));
                 }
             }
@@ -615,18 +624,23 @@ fn write_main_domain(log: &mut String, meta: &ReportMeta) {
             gateways
         ));
     }
+    // www-имя строится добавлением префикса и может не существовать вовсе
+    // (кейс 05.11.26: «www.web.telegram.org»). Пустой резолв — печатать
+    // нечего: «не резолвится — не отвечает» шум, а «Имя для доступа» на
+    // несуществующее имя — ложь.
     if let Some(wh) = &probe.www_host {
-        let www = if probe.www_ips.is_empty() {
-            "(не резолвится)".to_string()
-        } else {
-            probe.www_ips.join(", ")
-        };
-        let status = match &probe.www_url {
-            Some(u) => format!("ОТКРЫВАЕТСЯ: {}", u),
-            None => "не отвечает".to_string(),
-        };
-        log.push_str(&format!("  IP www (системный DNS):  {} — {}\n", www, status));
-        log.push_str(&format!("  Имя для доступа:        {}\n", wh));
+        if !probe.www_ips.is_empty() {
+            let status = match &probe.www_url {
+                Some(u) => format!("ОТКРЫВАЕТСЯ: {}", u),
+                None => "не отвечает".to_string(),
+            };
+            log.push_str(&format!(
+                "  IP www (системный DNS):  {} — {}\n",
+                probe.www_ips.join(", "),
+                status
+            ));
+            log.push_str(&format!("  Имя для доступа:        {}\n", wh));
+        }
     }
 
     log.push_str(&format!("  Соединение главного IP:    {}\n", probe.http_note));
