@@ -205,11 +205,19 @@ export default function App() {
   return (
     <div
       className="flex flex-col h-full bg-gray-50"
-      // ПКМ в программе отключена ВЕЗДЕ (по требованию UI): нативное контекстное
-      // меню webview только мешает. Исключение — строки «Ошибок сети» в
-      // ControlTab: их onContextMenu делает stopPropagation, так что этот
-      // обработчик для них не срабатывает и открывается наше ПКМ-меню.
-      onContextMenu={(e) => e.preventDefault()}
+      // ПКМ в программе отключена (по требованию UI): нативное контекстное меню
+      // webview только мешает. Исключения:
+      // 1) поля ввода (input/textarea/contenteditable) — событие НЕ гасим, чтобы
+      //    WebView2 показал своё нативное меню («Вставить/Копировать/Выделить
+      //    всё»): вставку из буфера выполняет сам WebView2, без JS-чтения буфера;
+      // 2) строки «Ошибок сети» в ControlTab — их onContextMenu делает
+      //    stopPropagation, так что этот обработчик для них не срабатывает и
+      //    открывается наше ПКМ-меню.
+      onContextMenu={(e) => {
+        const t = e.target;
+        if (t instanceof Element && t.closest("input, textarea, [contenteditable]")) return;
+        e.preventDefault();
+      }}
     >
       {/* Навигация */}
       <div className="flex border-b bg-white shadow-sm">
