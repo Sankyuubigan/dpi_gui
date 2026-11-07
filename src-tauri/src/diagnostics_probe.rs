@@ -131,7 +131,12 @@ pub fn check_admin() -> bool {
 
 /// Наличие winws.exe рядом с приложением.
 pub fn winws_present() -> bool {
-    process::get_bin_dir().join("winws.exe").exists()
+    // Предикат наличия: ошибка определения bin-папки = «не найден» (отчёт
+    // посоветует переустановку — верно при любой причине отказа). Точная
+    // причина ошибки дойдёт до отчёта через test_windivert.
+    process::get_bin_dir()
+        .map(|b| b.join("winws.exe").is_file())
+        .unwrap_or(false)
 }
 
 /// Проверка, что драйвер WinDivert реально загружается.
@@ -140,10 +145,11 @@ pub fn winws_present() -> bool {
 /// это и есть признак успешной загрузки драйвера.
 pub fn test_windivert(_app: &AppHandle) -> (bool, String) {
     let _ = process::stop_winws();
-    let bin = process::get_bin_dir().join("winws.exe");
-    if !bin.exists() {
-        return (false, "winws.exe не найден рядом с приложением".to_string());
-    }
+    let bin_dir = match process::get_bin_dir() {
+        Ok(b) => b,
+        Err(e) => return (false, e),
+    };
+    let bin = bin_dir.join("winws.exe");
 
     // Временный hostlist с мусорным доменом — фильтр ни к чему не применится,
     // но WinDivert всё равно должен открыться.
@@ -158,7 +164,7 @@ pub fn test_windivert(_app: &AppHandle) -> (bool, String) {
             "--dpi-desync=fake",
             "--dpi-desync-repeats=1",
         ])
-        .current_dir(process::get_bin_dir())
+        .current_dir(bin_dir)
         .creation_flags(CREATE_NO_WINDOW)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

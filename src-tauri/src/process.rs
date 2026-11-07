@@ -1,7 +1,7 @@
 use std::process::{Command, Stdio};
 use std::os::windows::process::CommandExt;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::io::{BufRead, BufReader};
 use std::thread;
 use sysinfo::System;
@@ -12,16 +12,43 @@ const WINWS_EXE: &str = "winws.exe";
 // Флаг для скрытия окна консоли в Windows
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-pub fn get_bin_dir() -> PathBuf {
-    // Ищем bin рядом с экзешником (релиз) или в текущей директории (дев)
-    if let Ok(mut path) = env::current_exe() {
-        path.pop(); // убираем .exe
-        path.push("bin");
-        if path.exists() {
-            return path;
+/// Потолок подъёма от папки exe вверх при поиске bin/: dev-раскладка
+/// target/debug/deps → корень проекта — 4 уровня, запас до 5.
+const BIN_SEARCH_MAX_UP: usize = 5;
+
+/// Поиск папки bin/ (обязательно с winws.exe внутри) от start_dir вверх
+/// по дереву. Релиз: bin рядом с exe (0 уровней). Dev/тесты: exe лежит в
+/// target/debug/deps, bin — в корне проекта. Кандидат без winws.exe не
+/// принимается: неполный bin/ — битая установка, а не рабочий бандл.
+/// Не нашли — Err с точной причиной: CWD-зависимый относительный фоллбек
+/// «bin» запрещён (мина «фейк не прочитан: os error 2», PRP 07.11.26).
+fn find_bin_dir_from(start_dir: &Path, max_up: usize) -> Result<PathBuf, String> {
+    let mut cur = start_dir.to_path_buf();
+    for _ in 0..=max_up {
+        let candidate = cur.join("bin");
+        if candidate.join(WINWS_EXE).is_file() {
+            return Ok(candidate);
+        }
+        if !cur.pop() {
+            break;
         }
     }
-    PathBuf::from("bin")
+    Err(format!(
+        "Папка bin/ (с {}) не найдена от {} вверх по дереву — установка сломана",
+        WINWS_EXE,
+        start_dir.display()
+    ))
+}
+
+/// Папка bin/ с winws.exe, WinDivert и фейк-блобами. Путь всегда абсолютный:
+/// от него строятся фейк-аргументы winws, hostlist-подстановки и CWD процесса.
+pub fn get_bin_dir() -> Result<PathBuf, String> {
+    let exe = env::current_exe()
+        .map_err(|e| format!("не определён путь к exe приложения: {}", e))?;
+    let exe_dir = exe
+        .parent()
+        .ok_or_else(|| format!("у exe нет родительской папки: {}", exe.display()))?;
+    find_bin_dir_from(exe_dir, BIN_SEARCH_MAX_UP)
 }
 
 /// Чистое ядро resolve_args без AppHandle: плейсхолдеры → пути, ipset-аргументы
@@ -89,7 +116,7 @@ fn resolve_args_core(
 fn resolve_args(app: &AppHandle, raw_args_template: &str, game_filter: bool, quiet: bool) -> Result<Vec<String>, String> {
     let app_dir = config::get_app_dir();
     let lists_dir = app_dir.join("lists").to_string_lossy().replace("\\", "/");
-    let bin_dir = get_bin_dir().to_string_lossy().replace("\\", "/");
+    let bin_dir = get_bin_dir()?.to_string_lossy().replace("\\", "/");
 
     let (final_args, skipped_args) = resolve_args_core(raw_args_template, game_filter, &lists_dir, &bin_dir)?;
 
@@ -105,11 +132,10 @@ fn resolve_args(app: &AppHandle, raw_args_template: &str, game_filter: bool, qui
 
 /// Собственно запуск winws с готовым списком аргументов.
 fn spawn_winws(app: &AppHandle, final_args: Vec<String>, quiet: bool) -> Result<String, String> {
-    let winws_path = get_bin_dir().join(WINWS_EXE);
-
-    if !winws_path.exists() {
-        return Err(format!("Файл не найден: {}", winws_path.display()));
-    }
+    // bin/ с winws.exe — единственный источник пути: find_bin_dir_from
+    // гарантирует наличие winws.exe, отдельная exists-проверка не нужна.
+    let bin_dir = get_bin_dir()?;
+    let winws_path = bin_dir.join(WINWS_EXE);
 
     // Убиваем старый процесс перед запуском нового
     let _ = stop_winws();
@@ -117,7 +143,7 @@ fn spawn_winws(app: &AppHandle, final_args: Vec<String>, quiet: bool) -> Result<
 
     let mut child = Command::new(&winws_path)
         .args(&final_args)
-        .current_dir(get_bin_dir())
+        .current_dir(bin_dir)
         .creation_flags(CREATE_NO_WINDOW) // Не показывать консоль!
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -424,5 +450,95 @@ mod tests {
             let joined = final_args.join("\u{1}");
             assert!(!joined.contains('{'), "{}: остались плейсхолдеры", name);
         }
+    }
+
+    #[test]
+    fn corpus_fake_bin_paths_are_absolute() {
+        // Контракт resolve_args_core (PRP 07.11.26): путь к каждому .bin-фейку
+        // после подстановки {BIN_DIR} обязан быть АБСОЛЮТНЫМ. Относительный
+        // путь делает запуск winws и монитор фейков зависимыми от CWD
+        // процесса (мина «фейк не прочитан: os error 2»).
+        let profiles = default_profiles();
+        for game_filter in [true, false] {
+            for p in &profiles {
+                let name = p["name"].as_str().unwrap_or("?");
+                let args = p["args"].as_str().expect("args строка");
+                let (final_args, _) =
+                    resolve_args_core(args, game_filter, "C:/fake/lists", "C:/fake/bin")
+                        .unwrap_or_else(|e| panic!("{} (gf={}): resolve упал: {}", name, game_filter, e));
+                for arg in &final_args {
+                    if !arg.contains(".bin") {
+                        continue;
+                    }
+                    let path = arg
+                        .split_once('=')
+                        .map(|(_, p)| p)
+                        .unwrap_or_else(|| panic!("{}: .bin-аргумент без «=путь»: {}", name, arg));
+                    assert!(!path.contains('{'), "{}: плейсхолдер не заменён: {}", name, arg);
+                    assert!(
+                        std::path::Path::new(path).is_absolute(),
+                        "{}: путь к фейку обязан быть абсолютным: {}",
+                        name,
+                        arg
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn get_bin_dir_returns_absolute_path() {
+        // PRP 07.11.26, шаги 2-3: get_bin_dir обязан вернуть абсолютный путь
+        // к bin/ (в cargo test exe лежит в target/debug/deps — поиск
+        // поднимается до корня проекта), а не тихий CWD-зависимый «bin».
+        let dir = get_bin_dir().expect("bin/ должен находиться в dev-раскладке");
+        assert!(
+            dir.is_absolute(),
+            "get_bin_dir обязан возвращать абсолютный путь, получил: {}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn find_bin_dir_finds_next_to_exe_and_up_the_tree() {
+        // Релиз-раскладка: bin/ рядом с «exe» (0 уровней подъёма).
+        let root = std::env::temp_dir().join(format!("dpi_gui_bindir_{}", std::process::id()));
+        let app_dir = root.join("app");
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&app_dir).expect("создание app/");
+        std::fs::create_dir_all(&bin_dir).expect("создание bin/");
+        std::fs::write(bin_dir.join(WINWS_EXE), b"stub").expect("заглушка winws.exe");
+
+        let found = find_bin_dir_from(&app_dir, BIN_SEARCH_MAX_UP).expect("bin найден рядом с exe");
+        assert_eq!(found, bin_dir, "релиз: bin/ берётся рядом с exe");
+        assert!(found.is_absolute(), "найденный путь абсолютный: {}", found.display());
+
+        // Dev-раскладка: target/debug/deps → bin/ в корне (3 уровня подъёма).
+        let deep = root.join("target").join("debug").join("deps");
+        std::fs::create_dir_all(&deep).expect("создание target/debug/deps");
+        let found = find_bin_dir_from(&deep, BIN_SEARCH_MAX_UP).expect("bin найден вверх по дереву");
+        assert_eq!(found, bin_dir, "dev: bin/ найден подъёмом до корня");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_bin_dir_without_winws_or_bin_is_honest_error() {
+        // Пустой корень и bin/ без winws.exe — обе раскладки битые:
+        // молчаливый относительный фоллбек запрещён, обязана быть ошибка.
+        let root = std::env::temp_dir().join(format!("dpi_gui_bindir_bad_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("app").join("bin")).expect("создание app/bin (пустой)");
+        let start = root.join("app");
+
+        let err = find_bin_dir_from(&start, BIN_SEARCH_MAX_UP)
+            .expect_err("bin/ без winws.exe обязан дать ошибку");
+        assert!(err.contains("bin/"), "причина называет bin/: {}", err);
+
+        std::fs::remove_dir_all(root.join("app")).expect("чистка пустой раскладки");
+        let err = find_bin_dir_from(&start, BIN_SEARCH_MAX_UP)
+            .expect_err("без bin/ вообще обязана быть ошибка");
+        assert!(err.contains("bin/"), "причина называет bin/: {}", err);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

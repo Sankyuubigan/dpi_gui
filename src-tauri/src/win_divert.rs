@@ -231,7 +231,7 @@ fn load_syms_from(dll_path: &Path) -> Result<Syms, String> {
 pub fn get_sniff_syms() -> Result<&'static Syms, String> {
     let mut guard = SYMS.lock().expect("SYMS mutex poisoned");
     if guard.is_none() {
-        let dll = crate::process::get_bin_dir().join("WinDivert.dll");
+        let dll = crate::process::get_bin_dir()?.join("WinDivert.dll");
         *guard = Some(load_syms_from(&dll));
     }
     match guard.as_ref().expect("заполнен выше") {

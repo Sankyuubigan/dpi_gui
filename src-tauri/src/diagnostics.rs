@@ -208,7 +208,7 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
     // 10. Генерация и проверка авто-профиля
     let app_dir = config::get_app_dir();
     let lists_dir = app_dir.join("lists").to_string_lossy().replace("\\", "/");
-    let bin_dir = process::get_bin_dir().to_string_lossy().replace("\\", "/");
+    let bin_dir = process::get_bin_dir()?.to_string_lossy().replace("\\", "/");
 
     let mut gen_name: Option<String> = None;
     let mut gen_args: Option<String> = None;

@@ -123,7 +123,7 @@ pub fn build_report(meta: &ReportMeta, c: &Classification) -> String {
     write_need_bypass(&mut log, meta, c);
 
     // === Домены, которые ЛОМАЕТ обход (в исключения) ===
-    write_bypass_breaks(&mut log, c);
+    write_bypass_breaks(&mut log, meta, c);
 
     // === Домены, недоступные при выключенном обходе (причина не установлена) ===
     write_broken(&mut log, meta, c);
@@ -880,7 +880,14 @@ fn write_need_bypass(log: &mut String, meta: &ReportMeta, c: &Classification) {
     // секции «УЖЕ ВНЕСЁННЫЕ В ОБХОД» (см. write_already_in_bypass).
     let (uncovered, _covered) = bypass_lists::split_bypass_candidates(&actionable, &meta.bypass_map);
     if uncovered.is_empty() {
-        log.push_str("  - (пусто) новых доменов для обхода не найдено\n");
+        // «(пусто)» честно, только если поиск реально шёл (обход ВКЛ, двухфазная
+        // классификация). При обходе ВЫКЛ classify_single need_bypass не
+        // заполняет — «не найдено» было бы ложью (§2.2).
+        if meta.bypass_on {
+            log.push_str("  - (пусто) новых доменов для обхода не найдено\n");
+        } else {
+            log.push_str("  - (не проверялось: сравнение «с обходом / без обхода» требует включённого профиля)\n");
+        }
     } else {
         let path = general_list_path();
         let mut parent_suggestions: Vec<String> = Vec::new();
@@ -921,10 +928,17 @@ fn write_need_bypass(log: &mut String, meta: &ReportMeta, c: &Classification) {
     log.push('\n');
 }
 
-fn write_bypass_breaks(log: &mut String, c: &Classification) {
+fn write_bypass_breaks(log: &mut String, meta: &ReportMeta, c: &Classification) {
     log.push_str("❌ ДОМЕНЫ, КОТОРЫЕ ЛОМАЕТ ОБХОД (добавьте в исключения):\n");
     if c.bypass_breaks.is_empty() {
-        log.push_str("  - (пусто) обход не ломает ни один домен\n");
+        // «(пусто)» честно, только если проба с обходом реально была (ВКЛ).
+        // При обходе ВЫКЛ сравнение не проводилось — утверждать «не ломает
+        // ни один домен» нельзя (§2.2).
+        if meta.bypass_on {
+            log.push_str("  - (пусто) обход не ломает ни один домен\n");
+        } else {
+            log.push_str("  - (не проверялось: обход был выключен — включите профиль и запустите анализ снова)\n");
+        }
     } else {
         let exclude_set = bypass_lists::load_exclude_domains();
         let mut parent_suggestions: Vec<String> = Vec::new();
@@ -1089,6 +1103,46 @@ mod tests {
             hosts_pins: Vec::new(),
             bypass_on_http: None,
         }
+    }
+
+    fn meta_off() -> ReportMeta {
+        let mut m = meta_with(www_only_probe());
+        m.bypass_on = false;
+        m
+    }
+
+    /// §2.2 (ложь недопустима): при обходе ВЫКЛ отчёт не имеет права утверждать
+    /// «обход не ломает ни один домен» / «новых доменов для обхода не найдено» —
+    /// сравнение с обходом не проводилось (classify_single не заполняет эти
+    /// корзины). Честный текст — «не проверялось».
+    #[test]
+    fn bypass_off_report_does_not_claim_unverified_bypass_checks() {
+        let log = build_report(&meta_off(), &empty_classification());
+        assert!(!log.contains("обход не ломает ни один домен"), "{}", log);
+        assert!(
+            !log.contains("новых доменов для обхода не найдено"),
+            "{}",
+            log
+        );
+        assert!(log.contains("не проверялось"), "{}", log);
+        assert!(log.contains("⚠️ Обход ВЫКЛЮЧЕН"), "{}", log);
+    }
+
+    /// Контракт при обходе ВКЛ сохраняется: там «(пусто)» = доказано двойной
+    /// пробой (сравнение «с обходом / без обхода» реально шло).
+    #[test]
+    fn bypass_on_report_keeps_empty_lines_when_baskets_empty() {
+        let log = build_report(&meta_with(www_only_probe()), &empty_classification());
+        assert!(
+            log.contains("(пусто) обход не ломает ни один домен"),
+            "{}",
+            log
+        );
+        assert!(
+            log.contains("(пусто) новых доменов для обхода не найдено"),
+            "{}",
+            log
+        );
     }
 
     /// Apex DNS points at a dead IP; the site answers only under `www`.

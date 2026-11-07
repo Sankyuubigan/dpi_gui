@@ -58,7 +58,10 @@ pub fn all_techniques() -> Vec<TechniqueSpec> {
 /// проверяем доступность сайта, останавливаем. Возвращает (прошла, деталь).
 pub fn test_technique(app: &AppHandle, spec: &TechniqueSpec, domain: &str, game_filter: bool) -> (bool, String) {
     let lists_dir = config::get_app_dir().join("lists");
-    let bin_dir = process::get_bin_dir();
+    let bin_dir = match process::get_bin_dir() {
+        Ok(b) => b,
+        Err(e) => return (false, e),
+    };
     let safe = spec.name.replace(|c: char| !c.is_alphanumeric(), "_");
     let hostlist_name = format!("diag-{}.txt", safe);
     let hostlist_path = lists_dir.join(&hostlist_name);

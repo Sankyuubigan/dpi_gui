@@ -328,7 +328,14 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
     // Проба #1: домены как есть (обход в текущем состоянии).
     let t_probe1 = std::time::Instant::now();
     let results_on = analyzer_probe::probe_all(&discovered);
-    timings.push(("probe_all #1 (с обходом)", t_probe1.elapsed()));
+    timings.push((
+        if bypass_on {
+            "probe_all #1 (с обходом)"
+        } else {
+            "probe_all #1 (без обхода)"
+        },
+        t_probe1.elapsed(),
+    ));
 
     // Собираем домены, оборвавшиеся с включённым обходом — их надо перепроверить БЕЗ обхода,
     // чтобы отличить «заблокирован сам» (в обход) от «обход его ломает» (в исключения).
