@@ -20,6 +20,7 @@ pub struct ProfileTestOutcome {
 fn verdict_from_http(r: &diagnostics_probe::HttpResult) -> (bool, String) {
     match r {
         diagnostics_probe::HttpResult::Ok(s) => (true, format!("УСПЕХ (HTTP {})", s)),
+        diagnostics_probe::HttpResult::Unverified => (true, "УСПЕХ по транспорту, но страница без видимого контента (JS-оболочка) — доступность после входа не подтверждена".to_string()),
         diagnostics_probe::HttpResult::BlockPage => (false, "Страница блокировки (подставил оператор)".to_string()),
         diagnostics_probe::HttpResult::Forbidden(s) => (false, format!("Отказ сервера HTTP {} (возможно, региональное ограничение — проверьте через VPN)", s)),
         diagnostics_probe::HttpResult::ServiceRestrict => (false, "Сервис вернул страницу с сообщением об ограничении (регион/доступность) — профиль не при чём, нужен VPN".to_string()),
@@ -79,7 +80,7 @@ pub fn test_single_profile(app: AppHandle, profile_name: &str, url: &str, game_f
             break;
         }
         let r = diagnostics_probe::http_classify_with(&target_url, 5);
-        if matches!(r, diagnostics_probe::HttpResult::Ok(_)) {
+        if matches!(r, diagnostics_probe::HttpResult::Ok(_) | diagnostics_probe::HttpResult::Unverified) {
             result = r;
             break;
         }

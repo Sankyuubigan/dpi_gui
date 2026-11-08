@@ -196,6 +196,29 @@ pub fn write_config(config: &serde_json::Value) -> Result<(), std::io::Error> {
     fs::write(path, serde_json::to_string_pretty(config).unwrap())
 }
 
+/// Источник кукисов для автозабора при старте (PRP 09.11.26): id браузера
+/// (cookie_browser) и/или путь папки User Data (cookie_dir). НЕ секреты —
+/// сами кукисы на диск не пишутся никогда, только память процесса.
+pub fn update_cookie_source(
+    browser: Option<String>,
+    dir: Option<String>,
+) -> Result<(), String> {
+    let mut config = read_config().unwrap_or(json!({}));
+    config["cookie_browser"] = json!(browser);
+    config["cookie_dir"] = json!(dir);
+    write_config(&config).map_err(|e| e.to_string())
+}
+
+/// Прочитать сохранённый источник автозабора: (браузер, папка).
+/// (None, None) — источник не сохранён (первый запуск после обновления).
+pub fn cookie_source() -> (Option<String>, Option<String>) {
+    let config = read_config().unwrap_or(json!({}));
+    (
+        config.get("cookie_browser").and_then(|v| v.as_str()).map(str::to_string),
+        config.get("cookie_dir").and_then(|v| v.as_str()).map(str::to_string),
+    )
+}
+
 pub fn read_profiles() -> Result<Vec<serde_json::Value>, std::io::Error> {
     let path = get_app_dir().join("profiles.json");
 
@@ -434,6 +457,40 @@ mod tests {
     /// Оба env-теста (ensure… и merge-миграция) крутят общий DPI_GUI_APP_DIR —
     /// без сериализации они гонялись бы за переменной окружения.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn cookie_source_roundtrip_replaces_and_clears() {
+        // Контракт источника автозабора (PRP 09.11.26): запись замещает
+        // прошлое значение, (None, None) очищает; ключи живут в config.json
+        // sandbox-папки (DPI_GUI_APP_DIR), а не в реальном AppData юзера.
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("время системное")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dpi_gui_cookie_src_{}", unique));
+        std::fs::create_dir_all(&dir).expect("sandbox-папка");
+        std::env::set_var("DPI_GUI_APP_DIR", &dir);
+
+        let r = (|| -> Result<(), String> {
+            update_cookie_source(Some("chrome".into()), None)?;
+            assert_eq!(cookie_source(), (Some("chrome".to_string()), None));
+            update_cookie_source(None, Some("C:\\браузеры\\Thorium\\User Data".into()))?;
+            assert_eq!(
+                cookie_source(),
+                (None, Some("C:\\браузеры\\Thorium\\User Data".to_string()))
+            );
+            update_cookie_source(Some("edge".into()), Some("C:\\x".into()))?;
+            assert_eq!(cookie_source(), (Some("edge".to_string()), Some("C:\\x".to_string())));
+            update_cookie_source(None, None)?;
+            assert_eq!(cookie_source(), (None, None));
+            Ok(())
+        })();
+
+        std::env::remove_var("DPI_GUI_APP_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+        r.expect("round-trip источника автозабора");
+    }
 
     #[test]
     fn profiles_default_json_valid_unique_and_bins_exist() {

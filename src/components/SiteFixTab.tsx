@@ -1,7 +1,8 @@
-import { useRef, useState, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Search, Globe, FileEdit, Trash2, Wrench, Square } from "lucide-react";
-import TestingLogPanel, { type LogEntry } from "./TestingLogPanel";
+import { listen } from "@tauri-apps/api/event";
+import { Search, Globe, FileEdit, Trash2, Wrench, Square, Cookie, FolderOpen } from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useTestingLog } from "./useTestingLog";
 import { OP_DNS_PICK, OP_SITE_ANALYSIS, runOp } from "../ops";
 import type { SiteSolution } from "../App";
@@ -9,9 +10,7 @@ import type { SiteSolution } from "../App";
 /// Вкладка «Починка сайтов»: анализ одного домена (с опциональным
 /// принудительным подбором DNS-адреса) и точечная правка hosts. Тесты
 /// профилей и диагностика живут на отдельной вкладке «Профили обхода».
-export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsTesting, solution, setSolution, activeOp, setActiveOp }: {
-  log: LogEntry[];
-  setLog: Dispatch<SetStateAction<LogEntry[]>>;
+export default function SiteFixTab({ url, setUrl, isTesting, setIsTesting, solution, setSolution, activeOp, setActiveOp }: {
   url: string;
   setUrl: Dispatch<SetStateAction<string>>;
   isTesting: boolean;
@@ -25,10 +24,52 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
   setActiveOp: Dispatch<SetStateAction<string | null>>;
 }) {
   const [hostsIp, setHostsIp] = useState("");
+
+  // Кукисы из браузера (PRP 08.11.26): rookie читает выбранную юзером
+  // программу; значения кукисов нигде не показываются (приватность).
+  const [cookieBrowsers, setCookieBrowsers] = useState<{ id: string; label: string }[]>([]);
+  const [cookieBrowser, setCookieBrowser] = useState("chrome");
+  const [cookieStatus, setCookieStatus] = useState<{ count: number; sources: string[]; last_browser?: string | null } | null>(null);
+  // Юзер выбирал браузер в этой сессии? Тогда автодефолт из config не применяем.
+  const cookieUserPickedRef = useRef(false);
+
+  // На mount: список браузеров для select (SSOT — BROWSERS в бэкенде) и
+  // текущий статус (кукисы переживают смену вкладок — хранятся в бэкенде).
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      let browsers: { id: string; label: string }[] = [];
+      try {
+        browsers = await invoke<{ id: string; label: string }[]>("cookies_browsers");
+        if (alive) setCookieBrowsers(browsers);
+      } catch {} // список статичен — ошибка не критична
+      try {
+        const st = await invoke<{ count: number; sources: string[]; last_browser?: string | null }>("cookies_status");
+        if (!alive) return;
+        setCookieStatus(st);
+        // Автодефолт select из сохранённого источника (PRP 09.11.26) —
+        // только пока юзер ещё не выбирал в этой сессии.
+        if (!cookieUserPickedRef.current && st.last_browser && browsers.some((b) => b.id === st.last_browser)) {
+          setCookieBrowser(st.last_browser);
+        }
+      } catch {}
+    })();
+    // Автозабор при старте: бэкенд эмитит cookies-updated по завершении —
+    // перечитываем статус, чип появится сам (даже если вкладка уже открыта).
+    const un = listen("cookies-updated", () => {
+      invoke<{ count: number; sources: string[] }>("cookies_status")
+        .then((st) => { if (alive) setCookieStatus(st); })
+        .catch(() => {});
+    });
+    return () => {
+      alive = false;
+      un.then((f) => f()).catch(() => {});
+    };
+  }, []);
   // «Стоп» нажат: Err-ответ бэкенда трактуем как ожидаемую остановку,
   // а не ошибку (сам цикл здесь фронт не крутит — рулит бэкенд).
   const stopRef = useRef(false);
-  const { appendEntry, appendLog } = useTestingLog(setLog);
+  const { appendEntry, appendLog } = useTestingLog();
 
   // Кнопка «Стоп»: сигнал бэкенду остановить операцию в ближайшей
   // контрольной точке (анализ — между фазами, подбор DNS — между фазами
@@ -47,10 +88,8 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
     setIsTesting(true);
     stopRef.current = false;
     setSolution(null); // старое решение к новому анализу неприменимо
-    setLog([
-      { text: `[Анализ] Запуск анализа для: ${url}...`, kind: "info" },
-      { text: "Идёт анализ: пробы соединения (с обходом/без), поиск кандидатов в списках (до ~30 сек)...", kind: "info" }
-    ]);
+    appendEntry(`[Анализ] Запуск анализа для: ${url}...`, "info");
+    appendEntry("Идёт анализ: пробы соединения (с обходом/без), поиск кандидатов в списках (до ~30 сек)...", "info");
 
     try {
       // Бэкенд возвращает { report, solution }: текст отчёта уже содержит
@@ -112,7 +151,10 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
       for (const e of out.entries) {
         const mark =
           e.kind === "gateway" ? "🛰 СВОИ ШЛЮЗЫ (ФРОНТИНГ)"
-            : e.kind === "resolves" ? "✅ РЕЗОЛВИТ ВЕРНО"
+            : e.kind === "resolves"
+              ? e.probe === "unverified" ? "⚪ РЕЗОЛВИТ (доступность не подтверждена)"
+                : e.probe === null ? "⚪ GeoDNS: свои адреса (консенсус невозможен, проба не выполнялась)"
+                  : "✅ РЕЗОЛВИТ ВЕРНО"
               : e.kind === "diverges" ? "⚠️ РАСХОДИТСЯ С ДРУГИМИ"
                 : "❌ МЁРТВ";
         const level =
@@ -137,6 +179,47 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
 
   const cleanHost = (raw: string) =>
     raw.trim().replace(/^https?:\/\//i, "").split("/")[0].split(":")[0];
+
+  // Кукисы из браузера (PRP 08.11.26): из выбранного юзером браузера забираем
+  // кукисы текущего домена в память бэкенда; SSOT-проба http_via_ip
+  // прикрепляет Cookie-заголовок к HTTPS-пробам автоматически (browser_cookies.rs).
+  const grabCookies = async (dir?: string) => {
+    const domain = cleanHost(url);
+    if (!domain) {
+      appendEntry("[Кукисы] Укажите домен в поле выше.", "fail");
+      return;
+    }
+    setIsTesting(true);
+    try {
+      const out = await invoke<{ count: number; sources: string[]; notes: string[] }>(
+        "grab_cookies",
+        { url: domain, browser: cookieBrowser, dir: dir ?? null }
+      );
+      for (const s of out.sources) appendEntry(`[Кукисы] ${s}`, "ok");
+      for (const n of out.notes) appendEntry(`[Кукисы] ${n}`, "fail");
+      if (out.count > 0) {
+        appendEntry(`[Кукисы] Пробы теперь идут с кукисами (${out.count} шт.)`, "ok");
+      }
+      const st = await invoke<{ count: number; sources: string[] }>("cookies_status");
+      setCookieStatus(st);
+    } catch (e: any) {
+      appendEntry(`[Кукисы] Ошибка захвата: ${e}`, "fail");
+    } finally {
+      setIsTesting(false);
+    }
+  };
+
+  // Кукисы из ЛЮБОГО Chromium-браузера: юзер указывает папку User Data —
+  // бэкенд сам найдёт ключ (Local State) и все кукис-базы (Default, Profile *).
+  const grabFromFolder = async () => {
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      title: "Укажи папку User Data браузера (например ...\\Thorium\\User Data)",
+    });
+    if (typeof picked !== "string" || !picked) return; // отмена
+    await grabCookies(picked);
+  };
 
   const applyHosts = async () => {
     const domain = cleanHost(url);
@@ -290,6 +373,51 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
               </button>
             )}
           </div>
+          {/* Кукисы из браузера: юзер выбирает браузер в select — из него
+              забираем кукисы текущего домена; пробы (SSOT http_via_ip) идут
+              с сессией юзера. Значения кукисов не показываем (приватность). */}
+          <div className="flex gap-2 items-center px-1">
+            <div className="relative shrink-0">
+              <Cookie size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" />
+              <select
+                value={cookieBrowser}
+                onChange={(e) => {
+                  cookieUserPickedRef.current = true;
+                  setCookieBrowser(e.target.value);
+                }}
+                className="appearance-none pl-9 pr-7 py-2 text-sm border border-gray-300 rounded-lg bg-white text-gray-700 focus:ring-2 focus:ring-emerald-500 outline-none"
+                title="Из какого браузера забрать кукисы: пробы пойдут с готовой сессией юзера"
+              >
+                {cookieBrowsers.map((b) => (
+                  <option key={b.id} value={b.id}>{b.label}</option>
+                ))}
+              </select>
+            </div>
+            <button
+              onClick={() => grabCookies()}
+              disabled={isTesting}
+              className="shrink-0 flex items-center justify-center gap-1.5 bg-sky-600 hover:bg-sky-700 disabled:bg-gray-400 text-white py-2 px-3 rounded-lg font-semibold text-sm transition"
+              title="Забрать кукисы текущего домена из выбранного браузера — пробы подбора DNS (и другие HTTPS-пробы) пойдут с готовой сессией юзера"
+            >
+              <Cookie size={16} /> Забрать кукисы
+            </button>
+            <button
+              onClick={grabFromFolder}
+              disabled={isTesting}
+              className="shrink-0 flex items-center justify-center gap-1.5 bg-gray-100 hover:bg-gray-200 border border-gray-300 text-gray-700 disabled:bg-gray-100 py-2 px-3 rounded-lg font-semibold text-sm transition"
+              title="Кукисы из ЛЮБОГО Chromium-браузера (Thorium, Яндекс и т.д.): укажи его папку User Data — ключ и все кукис-базы найдутся сами"
+            >
+              <FolderOpen size={16} /> Из папки…
+            </button>
+            {cookieStatus && cookieStatus.count > 0 && (
+              <span
+                className="shrink-0 flex items-center gap-1.5 bg-emerald-50 border border-emerald-200 text-emerald-700 px-3 py-2 rounded-lg font-semibold text-sm"
+                title={cookieStatus.sources.join("; ") || "Кукисы в памяти"}
+              >
+                <Cookie size={16} /> {cookieStatus.count} кукис в памяти
+              </span>
+            )}
+          </div>
           <p className="text-xs text-gray-500 px-1">
             Проверяет, через какой DNS-сервис сайт реально открывается (сквозная
             проба), и назовёт рабочий DNS для браузера (Secure DNS). Если дело не
@@ -327,8 +455,6 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
           </div>
         </div>
       </div>
-
-      <TestingLogPanel log={log} setLog={setLog} />
     </div>
   );
 }

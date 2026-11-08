@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-run-domain-analysis"
+description = "Enables the run_domain_analysis command without any pre-configured scope."
+commands.allow = ["run_domain_analysis"]
+
+[[permission]]
+identifier = "deny-run-domain-analysis"
+description = "Denies the run_domain_analysis command without any pre-configured scope."
+commands.deny = ["run_domain_analysis"]

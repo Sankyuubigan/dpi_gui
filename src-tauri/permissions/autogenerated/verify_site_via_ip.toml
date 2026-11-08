@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-verify-site-via-ip"
+description = "Enables the verify_site_via_ip command without any pre-configured scope."
+commands.allow = ["verify_site_via_ip"]
+
+[[permission]]
+identifier = "deny-verify-site-via-ip"
+description = "Denies the verify_site_via_ip command without any pre-configured scope."
+commands.deny = ["verify_site_via_ip"]

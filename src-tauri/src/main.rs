@@ -32,6 +32,8 @@ mod tls_sni;
 mod quic_sniff;
 mod list_index;
 mod dns_pick;
+mod browser;
+mod browser_cookies;
 mod process_owner;
 mod analysis_queue;
 mod mass_analysis;
@@ -44,7 +46,11 @@ fn init_app(app: AppHandle) -> Result<(), String> {
     // службу WinDivert) ДО первого check_status из фронтенда, чтобы индикатор
     // не показывал «ПРОЦЕСС АКТИВЕН» на мёртвом обходе.
     process::cleanup_stale_windivert(&app);
-    config::ensure_directories_and_files().map_err(|e| e.to_string())
+    config::ensure_directories_and_files().map_err(|e| e.to_string())?;
+    // Автозабор кукисов (PRP 09.11.26): фоновой задачей — старт приложения
+    // не ждёт чтения чужих кукис-баз; итог придёт событием cookies-updated.
+    tauri::async_runtime::spawn(browser_cookies::auto_grab_on_startup(app.clone()));
+    Ok(())
 }
 
 #[tauri::command]
@@ -110,10 +116,10 @@ fn cancel_operation(name: String) -> Result<(), String> {
 /// адреса Google (бесполезен для посессийного гео-блока), кто мёртв.
 /// Никаких проб страницы и очереди анализа — только DoH-опрос.
 #[tauri::command]
-async fn pick_dns(url: String) -> Result<dns_pick::DnsPickOutcome, String> {
+async fn pick_dns(app: AppHandle, url: String) -> Result<dns_pick::DnsPickOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
         cancel::reset(cancel::DNS_PICK);
-        dns_pick::run_pick(&url)
+        dns_pick::run_pick(Some(&app), &url)
     })
     .await
     .unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
@@ -232,6 +238,9 @@ fn verify_site_via_ip(host: String, ip: String) -> Result<String, String> {
         crate::diagnostics_probe::HttpResult::ServiceRestrict => {
             format!("⚠️ {} через {} — сайт отдался, но сервис сам сообщает об ограничении (регион источника): сеть здесь не при чём, нужен VPN", ip, host)
         }
+        crate::diagnostics_probe::HttpResult::Unverified => {
+            format!("⚪ {} через {} — сайт отдался, но страница без видимого контента (JS-оболочка): доступность после входа в аккаунт не подтверждена", ip, host)
+        }
         crate::diagnostics_probe::HttpResult::Rst => {
             format!("🚫 {} — HTTPS сброшен (RST). Блок по SNI/IP: подмена в hosts не поможет, нужен обход (winws).", ip)
         }
@@ -259,10 +268,19 @@ fn verify_site_via_ip(host: String, ip: String) -> Result<String, String> {
 }
 
 fn main() {
+    // Единый конвейер логов (08.11.26): краш-лог с первой миллисекунды,
+    // до старта Tauri. SSOT подключения — docs/README.md плагина logs.
+    tauri_plugin_logs::early_init("dpi_gui.log");
+    tauri_plugin_logs::early_log("INFO", "запуск DPI_GUI…");
+    // Лог уровня INFO (плагин ставит DEBUG): DEBUG-шум tao («NewEvents emitted…»
+    // на каждый redraw) захламлял вкладку «Логи». Наши строки — INFO и выше.
+    log::set_max_level(log::LevelFilter::Info);
     tauri::Builder::default()
+        .plugin(tauri_plugin_logs::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_about_updates::init())
         .invoke_handler(tauri::generate_handler![
             init_app,
@@ -284,13 +302,30 @@ fn main() {
             apply_hosts_entry,
             remove_hosts_entry,
             hosts_entries_for_domains,
-            verify_site_via_ip
+            verify_site_via_ip,
+            browser::browser_open,
+            browser::browser_close,
+            browser::browser_status,
+            browser::browser_set_bounds,
+            browser::browser_hide,
+            browser::browser_show,
+            browser::browser_apply_mapping,
+            browser::browser_apply_pick,
+            browser::browser_ctx_action,
+            browser::get_doh_services,
+            browser_cookies::cookies_browsers,
+            browser_cookies::grab_cookies,
+            browser_cookies::cookies_status
         ])
-        .on_window_event(|_window, event| {
+        .on_window_event(|window, event| {
             // При закрытии окна гасим обход и выгружаем драйвер WinDivert,
             // чтобы он не оставался в памяти и не блокировал файлы при обновлении.
+            // ТОЛЬКО label "main": это единственное окно (браузер — embedded
+            // webview того же окна, 08.11.26).
             if let tauri::WindowEvent::CloseRequested { .. } = event {
-                let _ = process::stop_winws();
+                if window.label() == "main" {
+                    let _ = process::stop_winws();
+                }
             }
         })
         .run(tauri::generate_context!())

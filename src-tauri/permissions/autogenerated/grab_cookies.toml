@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-grab-cookies"
+description = "Enables the grab_cookies command without any pre-configured scope."
+commands.allow = ["grab_cookies"]
+
+[[permission]]
+identifier = "deny-grab-cookies"
+description = "Denies the grab_cookies command without any pre-configured scope."
+commands.deny = ["grab_cookies"]

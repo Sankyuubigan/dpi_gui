@@ -285,6 +285,10 @@ pub fn http_result_note(r: &HttpResult) -> String {
             "страница отдалась, но сервис сообщает об ограничении доступа (регион источника)"
                 .to_string()
         }
+        HttpResult::Unverified => {
+            "страница без видимого контента (JS-оболочка) — доступность после входа не подтверждена"
+                .to_string()
+        }
         HttpResult::Other(m) => m.clone(),
     }
 }

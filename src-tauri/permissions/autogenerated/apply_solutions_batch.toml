@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-apply-solutions-batch"
+description = "Enables the apply_solutions_batch command without any pre-configured scope."
+commands.allow = ["apply_solutions_batch"]
+
+[[permission]]
+identifier = "deny-apply-solutions-batch"
+description = "Denies the apply_solutions_batch command without any pre-configured scope."
+commands.deny = ["apply_solutions_batch"]

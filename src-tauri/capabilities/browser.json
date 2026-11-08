@@ -1,0 +1,11 @@
+[
+  {
+    "identifier": "browser-cap",
+    "description": "Embedded webview вкладки «Браузер» (browser-tab, 08.11.26): core + открытие ссылки в системном браузере + единственная bridge-команда ПКМ для внешних страниц. Whitelist сознательно узкий: hosts-правки и настройки через мостик недоступны — внешняя страница не должна уметь менять состояние приложения.",
+    "webviews": ["browser-tab"],
+    "permissions": ["core:default", "shell:allow-open", "allow-browser-ctx-action"],
+    "remote": {
+      "urls": ["https://*:*", "http://*:*"]
+    }
+  }
+]

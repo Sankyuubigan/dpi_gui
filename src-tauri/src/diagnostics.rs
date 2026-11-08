@@ -67,9 +67,15 @@ fn test_profile_against(app: &AppHandle, name: &str, domain: &str, game_filter: 
             thread::sleep(Duration::from_secs(3));
             let r = diagnostics_probe::http_classify(&format!("https://{}/", domain));
             let _ = process::stop_winws();
-            let ok = matches!(r, diagnostics_probe::HttpResult::Ok(_));
+            let ok = matches!(
+                r,
+                diagnostics_probe::HttpResult::Ok(_) | diagnostics_probe::HttpResult::Unverified
+            );
             let detail = match r {
                 diagnostics_probe::HttpResult::Ok(s) => format!("OK ({})", s),
+                diagnostics_probe::HttpResult::Unverified => {
+                    "страница без видимого контента (JS-оболочка): транспорт прошёл, доступность после входа не подтверждена".to_string()
+                }
                 diagnostics_probe::HttpResult::BadCert => "SSL-сертификат невалиден (NET::ERR_CERT_*)".to_string(),
                 diagnostics_probe::HttpResult::Forbidden(s) => format!("Отказ сервера HTTP {} без признаков подмены (возможно, региональное ограничение)", s),
                 other => format!("{:?}", other),
@@ -260,7 +266,7 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
                 Ok(_) => {
                     thread::sleep(Duration::from_secs(3));
                     let r = diagnostics_probe::http_classify(&format!("https://{}/", domain));
-                    let ok = matches!(r, HttpResult::Ok(_));
+                    let ok = matches!(r, HttpResult::Ok(_) | HttpResult::Unverified);
                     let _ = process::stop_winws();
                     log(format!(
                         "[Диагностика] Проверка авто-профиля: {}",
@@ -302,7 +308,7 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
                         Ok(_) => {
                             thread::sleep(Duration::from_secs(3));
                             let r = diagnostics_probe::http_classify(&format!("https://{}/", domain));
-                            let ok = matches!(r, HttpResult::Ok(_));
+                            let ok = matches!(r, HttpResult::Ok(_) | HttpResult::Unverified);
                             let _ = process::stop_winws();
                             log(format!(
                                 "[Диагностика] Проверка клона: {}",

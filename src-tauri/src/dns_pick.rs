@@ -39,9 +39,13 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tauri::AppHandle;
+
+use crate::bypass_toggle::OffWindowGuard;
 use crate::cancel;
 use crate::config;
 use crate::diagnostics_probe::{self, is_stub_ip, DohAnswers, HttpResult};
+use crate::events::app_log;
 use crate::ip_target;
 use crate::site_probe::{probe_https_by_ip, substitution_note, tcp_scan_parallel};
 
@@ -71,6 +75,12 @@ pub enum ResolverKind {
 pub enum ProbeVerdict {
     /// Сайт открылся (HTTP 2xx/3xx без маркеров ограничения).
     Open,
+    /// Транспорт до сайта работает, но страница — JS-оболочка без видимого
+    /// контента: проба анонимная и не видит ограничений, отрисованных после
+    /// входа в аккаунт (кейс aistudio 08.11.26). Это «не подтверждено»,
+    /// а не «открывается» — вывод от отсутствия доказательств запрещён
+    /// (core rules §2.2).
+    Unverified,
     /// Отказ самого сайта: 403/451, блок-страница, «регион ограничен».
     /// У Cloudflare это в т.ч. ошибка 1009 — страну забанил владелец.
     SiteBlocked,
@@ -85,7 +95,7 @@ pub enum ProbeVerdict {
     GatewayDead,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DnsPickEntry {
     pub service: String,
@@ -97,16 +107,37 @@ pub struct DnsPickEntry {
     pub probe_note: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DnsPickOutcome {
     pub domain: String,
     pub entries: Vec<DnsPickEntry>,
     /// Итоговая строка — единый текст для лог-панели (SSOT).
     pub summary: String,
-    /// "ok" | "warn" | "fail" — уровень итога; фронт рендерит по нему,
+    /// "ok" | "warn" | "fail" — уровень итога; фронт рендер по нему,
     /// не снифая текст summary.
     pub verdict_level: String,
+}
+
+/// Последний результат подбора — SSOT для «Применить» во вкладке Браузер
+/// (PRP-3): команда принимает только force, outcome берёт отсюда, чтобы
+/// не протаскивать DnsPickOutcome через invoke (CommandArg не реализуется
+/// для сложных структур без Deserialize). Обновляется ТОЛЬКО при Some(app)
+/// — живой эталон-тест (app = None) не должен подменять продуктовый
+/// результат подбора.
+pub static LAST_PICK: std::sync::Mutex<Option<DnsPickOutcome>> = std::sync::Mutex::new(None);
+
+pub fn set_last_pick(o: DnsPickOutcome) {
+    if let Ok(mut g) = LAST_PICK.lock() {
+        *g = Some(o);
+    }
+}
+
+pub fn last_pick() -> Option<DnsPickOutcome> {
+    LAST_PICK
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|o| o.clone()))
 }
 
 /// Результат чистой классификации ответов: entries + что и как проверять.
@@ -357,13 +388,16 @@ pub fn pick_resolvers(answers: &DohAnswers) -> Classification {
 }
 
 /// Агрегат HTTP-проб одного сета: самая информативная проба решает
-/// (Open > отказ сайта > сломанный TLS > не отвечает). Чистая функция.
+/// (Open > отказ сайта > не подтверждено > сломанный TLS > не отвечает).
+/// Верифицированный отказ сайта важнее неопределённости: один IP даёт 403,
+/// другой — оболочку → сёт SiteBlocked, а не Unverified. Чистая функция.
 fn aggregate_site_set(results: &[(IpAddr, HttpResult)]) -> (ProbeVerdict, String) {
     let prio = |r: &HttpResult| match r {
         HttpResult::Ok(_) => 0,
         HttpResult::Forbidden(_) | HttpResult::BlockPage | HttpResult::ServiceRestrict => 1,
-        HttpResult::Rst | HttpResult::Tls | HttpResult::BadCert => 2,
-        _ => 3,
+        HttpResult::Unverified => 2,
+        HttpResult::Rst | HttpResult::Tls | HttpResult::BadCert => 3,
+        _ => 4,
     };
     let (ip, best) = results
         .iter()
@@ -374,6 +408,7 @@ fn aggregate_site_set(results: &[(IpAddr, HttpResult)]) -> (ProbeVerdict, String
         HttpResult::Forbidden(_) | HttpResult::BlockPage | HttpResult::ServiceRestrict => {
             ProbeVerdict::SiteBlocked
         }
+        HttpResult::Unverified => ProbeVerdict::Unverified,
         HttpResult::Rst | HttpResult::Tls | HttpResult::BadCert => ProbeVerdict::DpiBlocked,
         _ => ProbeVerdict::Unreachable,
     };
@@ -496,8 +531,8 @@ fn attach_probes(
 }
 
 /// Итоговая строка + уровень по приоритету честных исходов:
-/// открылся пробой > живой фронтинг-шлюз > отказ сайта (VPN) > DPI > ничего.
-/// Чистая функция — покрыта тестами.
+/// открылся пробой > живой фронтинг-шлюз > оболочка (не подтверждено) >
+/// отказ сайта (VPN) > DPI > ничего. Чистая функция — покрыта тестами.
 fn build_summary(host: &str, entries: &[DnsPickEntry]) -> (String, &'static str) {
     if let Some(e) = entries.iter().find(|e| e.probe == Some(ProbeVerdict::Open)) {
         return (
@@ -518,6 +553,21 @@ fn build_summary(host: &str, entries: &[DnsPickEntry]) -> (String, &'static str)
                 e.service, host, e.service
             ),
             "ok",
+        );
+    }
+    // Посессионный гео-блок (кейс aistudio 08.11.26): транспорт работает,
+    // но страница — JS-оболочка; анонимная проба доступность НЕ подтверждает.
+    // Слово «открывается» здесь запрещено (core rules §2.2).
+    if let Some(e) = entries
+        .iter()
+        .find(|e| e.probe == Some(ProbeVerdict::Unverified))
+    {
+        return (
+            format!(
+                "Резолвер {} отдаёт адреса {}, транспорт до сайта работает, но страница — JS-оболочка без видимого контента: анонимная проба доступность НЕ подтверждает. Если сайт ограничивает по региону после входа в аккаунт — смена DNS бессильна (нужен VPN или фронтинг-шлюз — строки 🛰); {}",
+                e.service, host, e.probe_note
+            ),
+            "warn",
         );
     }
     if let Some(e) = entries
@@ -568,13 +618,33 @@ fn build_summary(host: &str, entries: &[DnsPickEntry]) -> (String, &'static str)
 /// Запуск скрипта: домен из поля → перебор doh-services.txt → классификация
 /// → сквозные пробы адресов. Никаких угадываний по ownership IP: вердикт
 /// только по факту «сайт открывается через адреса резолвера».
-pub fn run_pick(url: &str) -> Result<DnsPickOutcome, String> {
+///
+/// `app = Some` (продуктовый путь): HTTP-пробы сайта идут в чистом окне
+/// (blocks.md §3 — с обходом проба видит только RST и приписывает DNS то,
+/// что чинит winws); живость DoH/шлюзов мерится С обходом (blocks.md §2),
+/// поэтому глушится обход только здесь. `app = None` — ТОЛЬКО живой
+/// эталон-тест: он мерит классификацию DoH-ответов, а не окно.
+pub fn run_pick(app: Option<&AppHandle>, url: &str) -> Result<DnsPickOutcome, String> {
     let host = match ip_target::parse_target(url) {
         ip_target::AnalysisTarget::Domain { host } => host,
         ip_target::AnalysisTarget::Ip { .. } => {
             return Err("нужен домен, а не IP-адрес: у IP-цели нет DNS-подмены".to_string())
         }
     };
+    // Честная видимость (PRP 08.11.26): если юзер забрал кукисы из браузера,
+    // пробы подбора идут с ними — сказать в логе ОДИН раз, не на каждый
+    // запрос (шум). Кукисы держатся в памяти (browser_cookies.rs).
+    if crate::browser_cookies::count_for(&host) > 0 {
+        if let Some(app) = app {
+            app_log(
+                app,
+                format!(
+                    "[Подбор DNS] Пробы идут с кукисами из браузера ({} шт.)",
+                    crate::browser_cookies::count_for(&host)
+                ),
+            );
+        }
+    }
     let read = config::read_doh_services();
     if !read.file_found {
         return Err(format!(
@@ -628,16 +698,39 @@ pub fn run_pick(url: &str) -> Result<DnsPickOutcome, String> {
         return Err("Подбор DNS остановлен пользователем".into());
     }
 
-    let (site, per_ip) = run_site_probes(&host, &class.site_sets);
+    // HTTP-пробы сайта — в чистом окне (blocks.md §3). OffWindowGuard
+    // восстанавливает обход даже при панике (Drop); факт restore — в лог.
+    let (site, per_ip) = match app {
+        Some(app) => {
+            app_log(
+                app,
+                "[Подбор DNS] HTTP-пробы идут в чистом окне: обход на время проб отключается и восстановится."
+                    .to_string(),
+            );
+            let guard = OffWindowGuard::open(app);
+            let res = run_site_probes(&host, &class.site_sets);
+            if let Some(note) = guard.close() {
+                app_log(app, format!("[Подбор DNS] {}", note));
+            }
+            res
+        }
+        None => run_site_probes(&host, &class.site_sets),
+    };
     let entries = attach_probes(class, &site, &per_ip, &gateways);
     let (summary, level) = build_summary(&host, &entries);
 
-    Ok(DnsPickOutcome {
+    let outcome = DnsPickOutcome {
         domain: host,
         entries,
         summary,
         verdict_level: level.to_string(),
-    })
+    };
+    // SSOT для «Применить» во вкладке Браузер (PRP-3): запоминаем только
+    // продуктовый запуск (Some(app)); эталон-тест None не трогает состояние.
+    if app.is_some() {
+        set_last_pick(outcome.clone());
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -823,7 +916,7 @@ mod tests {
         assert_eq!(c.site_sets[0].0, set_key(&[ip("104.16.24.14")]));
     }
 
-    /// Агрегат пробы сета: приоритет Open > отказ сайта > сломанный TLS > не отвечает.
+    /// Агрегат пробы сета: приоритет Open > отказ сайта > не подтверждено > сломанный TLS > не отвечает.
     #[test]
     fn aggregate_priorities() {
         let f = |rs: &[(IpAddr, HttpResult)]| aggregate_site_set(rs).0;
@@ -831,6 +924,17 @@ mod tests {
         assert_eq!(f(&[(ip("1.1.1.1"), HttpResult::Forbidden(403))]), ProbeVerdict::SiteBlocked);
         assert_eq!(f(&[(ip("1.1.1.1"), HttpResult::BlockPage)]), ProbeVerdict::SiteBlocked);
         assert_eq!(f(&[(ip("1.1.1.1"), HttpResult::ServiceRestrict)]), ProbeVerdict::SiteBlocked);
+        assert_eq!(f(&[(ip("1.1.1.1"), HttpResult::Unverified)]), ProbeVerdict::Unverified);
+        // Верифицированный отказ сайта важнее неопределённости (PRP-1 §3.2).
+        assert_eq!(
+            f(&[(ip("1.1.1.1"), HttpResult::Unverified), (ip("1.1.1.2"), HttpResult::Forbidden(403))]),
+            ProbeVerdict::SiteBlocked
+        );
+        // Оболочка информативнее DPI-сбоя: транспорт через адрес работает.
+        assert_eq!(
+            f(&[(ip("1.1.1.1"), HttpResult::Unverified), (ip("1.1.1.2"), HttpResult::Rst)]),
+            ProbeVerdict::Unverified
+        );
         assert_eq!(f(&[(ip("1.1.1.1"), HttpResult::Rst), (ip("1.1.1.2"), HttpResult::Timeout)]), ProbeVerdict::DpiBlocked);
         assert_eq!(f(&[(ip("1.1.1.1"), HttpResult::Timeout)]), ProbeVerdict::Unreachable);
         // Заметка несёт и текст, и адрес.
@@ -915,6 +1019,51 @@ mod tests {
         assert!(s.contains("DPI") && s.contains("winws"), "{}", s);
     }
 
+    /// Итог «страница — JS-оболочка» → warn БЕЗ слова «открывается»
+    /// (кейс aistudio 08.11.26: анонимная проба не подтверждает доступность).
+    #[test]
+    fn summary_unverified_is_warn_without_open_claim() {
+        let entries = vec![DnsPickEntry {
+            service: "dns.comss.one".into(),
+            resolved: vec!["142.250.65.100".into()],
+            kind: ResolverKind::Resolves,
+            note: "резолвит верно".into(),
+            probe: Some(ProbeVerdict::Unverified),
+            probe_note: "страница без видимого контента (JS-оболочка) — доступность после входа не подтверждена (142.250.65.100)".into(),
+        }];
+        let (s, level) = build_summary("aistudio.google.com", &entries);
+        assert_eq!(level, "warn");
+        assert!(!s.contains("открывается"), "ложь в итоге: {}", s);
+        assert!(s.contains("JS-оболочка") && s.contains("НЕ подтверждает"), "{}", s);
+    }
+
+    /// Порядок честных исходов: живой фронтинг-шлюз важнее оболочки
+    /// (кейс aistudio: итог — рекомендация eu.geohide.ru, не warn).
+    #[test]
+    fn summary_gateway_alive_outranks_unverified() {
+        let entries = vec![
+            DnsPickEntry {
+                service: "dns.comss.one".into(),
+                resolved: vec!["142.250.65.100".into()],
+                kind: ResolverKind::Resolves,
+                note: "резолвит верно".into(),
+                probe: Some(ProbeVerdict::Unverified),
+                probe_note: "оболочка".into(),
+            },
+            DnsPickEntry {
+                service: "eu.geohide.ru".into(),
+                resolved: vec!["5.175.161.40".into()],
+                kind: ResolverKind::Gateway,
+                note: "отдаёт собственные шлюзы".into(),
+                probe: Some(ProbeVerdict::GatewayAlive),
+                probe_note: "шлюз 5.175.161.40 отвечает на :443".into(),
+            },
+        ];
+        let (s, level) = build_summary("aistudio.google.com", &entries);
+        assert_eq!(level, "ok");
+        assert!(s.contains("eu.geohide.ru"), "{}", s);
+    }
+
     /// Нечего показать (все мёртвые) → fail c причинами.
     #[test]
     fn summary_nothing_is_fail() {
@@ -981,6 +1130,27 @@ mod tests {
         assert!(entries[0].probe_note.contains("из других сетов"), "{}", entries[0].probe_note);
     }
 
+    /// PRP-1 гейт: контентные сайты остаются Open — порог оболочки (200 байт
+    /// видимого текста) не должен задевать нормальные страницы (замер
+    /// 08.11.26: google.com=827, github.com=6800 видимых байт).
+    #[test]
+    #[ignore = "requires network"]
+    fn live_content_sites_remain_open() {
+        for url in ["https://google.com", "https://github.com"] {
+            let out = run_pick(None, url).expect("run_pick");
+            println!("ИТОГ ({}): {}", out.verdict_level, out.summary);
+            let opened = out
+                .entries
+                .iter()
+                .any(|e| e.probe == Some(ProbeVerdict::Open));
+            assert!(
+                opened,
+                "{}: ни одной пробы Open — порог оболочки задевает контентные сайты",
+                url
+            );
+        }
+    }
+
     /// Живой эталон классификации (ground truth юзера 28.10.26: браузер с
     /// eu.geohide.ru не редиректит, с прямыми адресами — редиректит).
     /// Запуск вручную при включённом обходе (docs/blocks.md §2):
@@ -988,7 +1158,7 @@ mod tests {
     #[test]
     #[ignore = "requires network + включённый обход (docs/blocks.md §2)"]
     fn live_pick_aistudio() {
-        let out = run_pick("https://aistudio.google.com").expect("run_pick");
+        let out = run_pick(None, "https://aistudio.google.com").expect("run_pick");
         for e in &out.entries {
             println!("[{:?} / {:?}] {}: {} | {}", e.kind, e.probe, e.service, e.note, e.probe_note);
         }
@@ -1000,9 +1170,27 @@ mod tests {
             .expect("eu.geohide.ru не в списке doh-services.txt");
         assert_eq!(geohide.kind, ResolverKind::Gateway, "эталон: geohide отдаёт свои шлюзы ({:?})", geohide);
         assert_eq!(geohide.probe, Some(ProbeVerdict::GatewayAlive), "шлюз geohide должен отвечать при включённом обходе");
+        // PRP-1 гейт: aistudio анонимно — JS-оболочка, честные резолверы НЕ
+        // могут иметь пробу Open («открывается») — это была главная ложь.
+        // Проверка НЕ зависит от GeoDNS-дрейфа: любой сервис с ответом.
+        for e in &out.entries {
+            assert_ne!(
+                e.probe,
+                Some(ProbeVerdict::Open),
+                "ложь PRP-1: {} с пробой Open («открывается») на JS-оболочке aistudio ({:?})",
+                e.service,
+                e
+            );
+        }
+        // Стабильный инвариант шлюзовых сервисов (gateway_owner — не зависит
+        // от дрейфа консенсуса). Kind (Resolves/Diverges) и исход пробы
+        // честных резолверов ЖИВОЙ ДРЕЙФУЕТ между прогонами (GeoDNS отдаёт
+        // разные сеты эджей; проба может честно дать Unreachable/Timeout на
+        // конкретном эдже), поэтому эталон НЕ фиксирует их ни kind, ни probe:
+        // единственный анти-ложь инвариант — НЕ Open (главная ложь PRP-1).
         for svc in ["dns.google", "cloudflare-dns.com", "dns.comss.one"] {
             if let Some(e) = out.entries.iter().find(|e| e.service == svc) {
-                assert_eq!(e.kind, ResolverKind::Resolves, "эталон: {} — честный резолвер ({:?})", svc, e);
+                assert_ne!(e.kind, ResolverKind::Dead, "эталон: {} живой, не Dead ({:?})", svc, e);
             }
         }
     }

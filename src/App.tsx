@@ -5,7 +5,9 @@ import ControlTab from "./components/ControlTab";
 import SettingsTab from "./components/SettingsTab";
 import ProfilesTab from "./components/ProfilesTab";
 import SiteFixTab from "./components/SiteFixTab";
-import type { LogEntry } from "./components/TestingLogPanel";
+import BrowserTab from "./components/BrowserTab";
+import LogsPanel from "./components/LogsPanel";
+import { logFront, onLogMessage, readLogTail, initFrontendErrorCapture } from "@my-tauri-plugins/plugin-logs";
 
 const MAX_LOG_LINES = 5000; // лог живёт ВСЮ сессию приложения (PRP §7.1)
 const MAX_SUSPICIONS = 200; // список подозрений — рабочая память (PRP §7.2)
@@ -59,7 +61,6 @@ export default function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [profiles, setProfiles] = useState<any[]>([]);
   const [config, setConfig] = useState<any>({ selected_profile: "", game_filter: false });
-  const [testingLog, setTestingLog] = useState<LogEntry[]>([]);
   const [testingUrl, setTestingUrl] = useState("youtube.com");
   const [testingIsTesting, setTestingIsTesting] = useState(false);
   // Какая долгая операция идёт прямо сейчас (имена — src/ops.ts). Одновременно
@@ -80,9 +81,11 @@ export default function App() {
   // Живёт в App — переживает смену вкладок.
   const [analysisMap, setAnalysisMap] = useState<Record<string, AnalysisStatus>>({});
 
+  // Единый конвейер (08.11.26): фронт-строки идут через плагин logs
+  // (logFront → лог-файл → событие logs:message → подписка ниже). Прямого
+  // setLogs здесь больше нет: всё в логе живёт в файле, панели и вкладке «Логи».
   const logMsg = (msg: string) => {
-    const time = new Date().toLocaleTimeString();
-    setLogs(prev => [...prev, `[${time}] ${msg}`].slice(-MAX_LOG_LINES));
+    logFront(msg);
   };
 
   // Слушатели бэкенд-событий: «log» (общий журнал) и «domain_discovery»
@@ -90,9 +93,25 @@ export default function App() {
   // по уже известному домену обновляет его строку (причина/ip/время/счётчик),
   // новых строк не создаёт (PRP §7.2).
   useEffect(() => {
-    const unLog = listen<string>("log", (event) => {
-      logMsg(event.payload);
-    });
+    // Единый конвейер логов плагина (08.11.26): панель подключается позже
+    // старта сессии, поэтому история добирается из файла (readLogTail), а
+    // живые строки приходят событием logs:message. Ошибки UI тоже в общий
+    // лог (initFrontendErrorCapture — один раз на старте приложения).
+    initFrontendErrorCapture();
+    let unLog: (() => void) | null = null;
+    readLogTail(5000)
+      .then((tail) => {
+        setLogs(tail.split("\n").filter((s) => s.trim().length > 0));
+        return onLogMessage((line) => {
+          setLogs((prev) => {
+            // Гонка «хвост файла ↔ подписка» может задвоить последнюю строку.
+            if (prev.length > 0 && prev[prev.length - 1] === line) return prev;
+            return [...prev, line].slice(-MAX_LOG_LINES);
+          });
+        });
+      })
+      .then((u) => { unLog = u ?? null; })
+      .catch((e) => logFront(`[Логи] ОШИБКА чтения истории лога: ${e}`));
     const unDiscovery = listen<any>("domain_discovery", (event) => {
       const ev = event.payload;
       const lists: string[] = ev.lists || [];
@@ -160,7 +179,7 @@ export default function App() {
     });
 
     return () => {
-      unLog.then(f => f());
+      if (unLog) unLog();
       unDiscovery.then(f => f());
       unAnalysis.then(f => f());
     };
@@ -176,10 +195,18 @@ export default function App() {
         const loadedProfiles: any[] = await invoke("get_profiles");
         setProfiles(loadedProfiles);
 
+        // Честный старт (инцидент 08.11.26 «исчезли профили»): молчаливая
+        // пустота недопустима — в общий лог идёт факт загрузки с числом
+        // профилей; при ошибке — её текст, а не пустой экран без причин.
+        logMsg(
+          `[Старт] Профили загружены: ${loadedProfiles.length} шт.; выбранный профиль: «${loadedConfig?.selected_profile || "—"}»`,
+        );
+
         // Проверяем, запущен ли процесс
         const status: boolean = await invoke("check_status");
         setIsRunning(status);
       } catch (e) {
+        logMsg(`[Старт] ОШИБКА инициализации: ${e} — конфиг и профили не загружены.`);
         console.error("Initialization error:", e);
       }
     }
@@ -238,6 +265,12 @@ export default function App() {
           Починка сайтов
         </button>
         <button
+          className={`px-4 py-3 font-semibold ${activeTab === "browser" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
+          onClick={() => setActiveTab("browser")}
+        >
+          Браузер
+        </button>
+        <button
           className={`px-4 py-3 font-semibold ${activeTab === "profiles" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
           onClick={() => setActiveTab("profiles")}
         >
@@ -249,6 +282,12 @@ export default function App() {
         >
           Настройки
         </button>
+        <button
+          className={`px-4 py-3 font-semibold ${activeTab === "logs" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
+          onClick={() => setActiveTab("logs")}
+        >
+          Логи
+        </button>
       </div>
 
       {/* Содержимое вкладок */}
@@ -259,7 +298,6 @@ export default function App() {
             profiles={profiles}
             config={config}
             saveConfig={saveConfig}
-            logs={logs}
             suspicions={suspicions}
             setSuspicions={setSuspicions}
             analysisMap={analysisMap}
@@ -269,8 +307,6 @@ export default function App() {
         )}
         {activeTab === "sitefix" && (
           <SiteFixTab
-            log={testingLog}
-            setLog={setTestingLog}
             url={testingUrl}
             setUrl={setTestingUrl}
             isTesting={testingIsTesting}
@@ -281,13 +317,12 @@ export default function App() {
             setActiveOp={setActiveOp}
           />
         )}
+        {activeTab === "browser" && <BrowserTab />}
         {activeTab === "profiles" && (
           <ProfilesTab
             profiles={profiles}
             setProfiles={setProfiles}
             config={config}
-            log={testingLog}
-            setLog={setTestingLog}
             url={testingUrl}
             setUrl={setTestingUrl}
             isTesting={testingIsTesting}
@@ -297,6 +332,11 @@ export default function App() {
           />
         )}
         {activeTab === "settings" && <SettingsTab />}
+        {activeTab === "logs" && (
+          <div className="h-full flex flex-col">
+            <LogsPanel lines={logs} onClear={() => setLogs([])} full />
+          </div>
+        )}
       </div>
     </div>
   );

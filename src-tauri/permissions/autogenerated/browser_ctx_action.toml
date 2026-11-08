@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-browser-ctx-action"
+description = "Enables the browser_ctx_action command without any pre-configured scope."
+commands.allow = ["browser_ctx_action"]
+
+[[permission]]
+identifier = "deny-browser-ctx-action"
+description = "Denies the browser_ctx_action command without any pre-configured scope."
+commands.deny = ["browser_ctx_action"]

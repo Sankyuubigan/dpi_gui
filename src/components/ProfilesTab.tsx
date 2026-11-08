@@ -1,19 +1,16 @@
 import { useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Activity, Stethoscope, Globe, FolderOpen, Square } from "lucide-react";
-import TestingLogPanel, { type LogEntry } from "./TestingLogPanel";
 import { useTestingLog } from "./useTestingLog";
 import { OP_DIAGNOSTICS, OP_PROFILE_TEST, runOp } from "../ops";
 
 /// Вкладка «Профили обхода»: всё, что касается профилей, в одном месте —
 /// открытие profiles.json, тест всех профилей по домену и диагностика
 /// с генерацией авто-профиля.
-export default function ProfilesTab({ profiles, setProfiles, config, log, setLog, url, setUrl, isTesting, setIsTesting, activeOp, setActiveOp }: {
+export default function ProfilesTab({ profiles, setProfiles, config, url, setUrl, isTesting, setIsTesting, activeOp, setActiveOp }: {
   profiles: any[];
   setProfiles: Dispatch<SetStateAction<any[]>>;
   config: any;
-  log: LogEntry[];
-  setLog: Dispatch<SetStateAction<LogEntry[]>>;
   url: string;
   setUrl: Dispatch<SetStateAction<string>>;
   isTesting: boolean;
@@ -28,7 +25,7 @@ export default function ProfilesTab({ profiles, setProfiles, config, log, setLog
   // «Стоп» нажат: рвёт фронт-цикл по профилям и помечает Err-ответы бэкенда
   // как ожидаемую остановку, а не ошибку.
   const stopRef = useRef(false);
-  const { appendEntry, appendLog } = useTestingLog(setLog);
+  const { appendEntry, appendLog } = useTestingLog();
 
   const openProfilesFile = async () => {
     try {
@@ -56,7 +53,7 @@ export default function ProfilesTab({ profiles, setProfiles, config, log, setLog
     stopRef.current = false;
     const total = profiles.length;
     setTestProgress({ total, done: 0, current: "..." });
-    setLog([{ text: `[Тест] Пинг сайта ${url} по всем профилям (всего ${total})...`, kind: "info" }]);
+    appendEntry(`[Тест] Пинг сайта ${url} по всем профилям (всего ${total})...`, "info");
     const startTime = Date.now();
     const flatUrl = url.replace(/^https?:\/\//, "").split("/")[0];
     const counts: Record<string, number> = {};
@@ -137,11 +134,9 @@ export default function ProfilesTab({ profiles, setProfiles, config, log, setLog
     setIsTesting(true);
     stopRef.current = false;
     setDiag(null);
-    setLog([
-      { text: `[Диагностика] Комплексная проверка соединения для: ${url}...`, kind: "info" },
-      { text: "Это займёт до ~1-2 минут: пробы DNS, WinDivert, connect, и прогон desync-техник.", kind: "info" },
-      { text: "Если какой-то инструмент не сработает — он будет пропущен, диагностика продолжится.", kind: "info" }
-    ]);
+    appendEntry(`[Диагностика] Комплексная проверка соединение для: ${url}...`, "info");
+    appendEntry("Это займёт до ~1-2 минут: пробы DNS, WinDivert, connect, и прогон desync-техник.", "info");
+    appendEntry("Если какой-то инструмент не сработает — он будет пропущен, диагностика продолжится.", "info");
 
     try {
       const report: any = await invoke("run_diagnostics", { url, gameFilter: config.game_filter });
@@ -309,7 +304,6 @@ export default function ProfilesTab({ profiles, setProfiles, config, log, setLog
         </div>
       )}
 
-      <TestingLogPanel log={log} setLog={setLog} />
     </div>
   );
 }

@@ -23,7 +23,7 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 use crate::analyzer_probe::Probe;
 use crate::diagnostics_probe::{HttpResult, tcp_connect};
@@ -34,8 +34,14 @@ use crate::process;
 /// устаканиваются перед фазой резолва (тяжёлые паузы живут в bypass_toggle).
 const PROBE_GAP: Duration = Duration::from_millis(200);
 
+/// Запись в единый конвейер логов (08.11.26): log::info! → плагин logs
+/// (exe-файл + кольцевой буфер + событие `logs:message` для UI). Прежнее
+/// событие "log" ушло — фронт слушает onLogMessage (logs:message).
+/// Сигнатура с AppHandle сохранена намеренно: 10 модулей-вызывающих
+/// не меняются, а параметр больше не нужен — логгер глобальный.
 pub fn app_log(app: &AppHandle, msg: impl Into<String>) {
-    let _ = app.emit("log", msg.into());
+    let _ = app;
+    log::info!("{}", msg.into());
 }
 
 /// Результат пробы TCP к ip:port.
@@ -106,6 +112,8 @@ pub fn http_result_to_probe(h: &HttpResult) -> Probe {
         // Страница с сообщением об ограничении тоже «живой ответ»: путь цел,
         // ограничивает сам сервис (как и Forbidden — вопрос сервера).
         HttpResult::ServiceRestrict => Probe::Ok,
+        // JS-оболочка — живой ответ поверх TLS: путь цел, IP настоящий.
+        HttpResult::Unverified => Probe::Ok,
         HttpResult::BadCert => Probe::Ok, // рукопожатие прошло — DPI не рвал канал
         HttpResult::Rst => Probe::Broken("соединение сброшено (RST)".to_string()),
         HttpResult::Tls => Probe::Broken("ошибка TLS-рукопожатия".to_string()),

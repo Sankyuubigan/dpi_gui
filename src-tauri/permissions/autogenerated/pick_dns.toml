@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pick-dns"
+description = "Enables the pick_dns command without any pre-configured scope."
+commands.allow = ["pick_dns"]
+
+[[permission]]
+identifier = "deny-pick-dns"
+description = "Denies the pick_dns command without any pre-configured scope."
+commands.deny = ["pick_dns"]

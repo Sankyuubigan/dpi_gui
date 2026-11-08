@@ -1,7 +1,7 @@
-import { useState, useEffect, useRef, type Dispatch, type SetStateAction, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { useState, useEffect, type Dispatch, type SetStateAction, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
-  Play, Square, Activity, Eye, Terminal, Trash2, Search, Copy,
+  Play, Square, Eye, Terminal, Trash2, Search, Copy,
   Loader2, CheckCircle2, XCircle, Clock3, Wrench,
 } from "lucide-react";
 import { reasonToHuman } from "./reasonText";
@@ -12,7 +12,6 @@ export default function ControlTab({
   profiles,
   config,
   saveConfig,
-  logs,
   suspicions,
   setSuspicions,
   analysisMap,
@@ -23,7 +22,6 @@ export default function ControlTab({
   profiles: any[];
   config: any;
   saveConfig: (c: any) => void;
-  logs: string[];
   suspicions: Suspicion[];
   setSuspicions: Dispatch<SetStateAction<Suspicion[]>>;
   /// Статусы анализа по доменам (события analysis_progress): бейдж в строке
@@ -33,7 +31,6 @@ export default function ControlTab({
   /// Перенести домен на вкладку «Починка сайтов» (подстановка в поле анализа).
   onFixDomain: (domain: string) => void;
 }) {
-  const logEndRef = useRef<HTMLDivElement>(null);
   // Выбранная позиция в списке ошибок (домен). null = ничего не выбрано.
   const [selectedDomain, setSelectedDomain] = useState<string | null>(null);
   // Идёт массовый анализ (локальная блокировка кнопки до ответа команды).
@@ -47,10 +44,6 @@ export default function ControlTab({
   // Проверка нужна, чтобы видеть сценарий «прописали IP в hosts, он умер —
   // домен падает»: анализ резолвит DNS мимо hosts, а браузер — по hosts.
   const [hostsMap, setHostsMap] = useState<Record<string, string[]>>({});
-
-  useEffect(() => {
-    logEndRef.current?.scrollIntoView({ behavior: "auto" });
-  }, [logs]);
 
   // Esc закрывает контекстное меню (клики мимо закрывает оверлей).
   useEffect(() => {
@@ -80,9 +73,6 @@ export default function ControlTab({
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [suspicions]);
-
-  // PRP §7.1: храним до 5000 строк в App, рендерим последние ~500 для скорости.
-  const visibleLogs = logs.slice(-500);
 
   // Очистка ТОЛЬКО выбранной позиции: удаляем её из списка ошибок, остальные
   // остаются. Если с того же домена снова придут ошибки — детектор добавит
@@ -550,16 +540,8 @@ export default function ControlTab({
         )}
       </div>
 
-      <div className="flex-1 bg-gray-900 rounded-xl p-4 flex flex-col min-h-[200px]">
-        <div className="flex items-center gap-2 text-gray-400 mb-2 border-b border-gray-700 pb-2">
-          <Activity size={16} /> <span className="text-sm font-semibold">Лог событий</span>
-        </div>
-        <div className="flex-1 overflow-y-auto text-green-400 font-mono text-sm break-all space-y-1">
-          {visibleLogs.length === 0 ? <span className="text-gray-600">Ожидание действий...</span> : null}
-          {visibleLogs.map((l, i) => <div key={i}>{l}</div>)}
-          <div ref={logEndRef} />
-        </div>
-      </div>
+      {/* Лог событий вынесен в общую LogsPanel (App.tsx, 08.11.26) — видна
+          под контентом на ВСЕХ вкладках, источник один: конвейер плагина logs. */}
 
       {/* Контекстное меню строки «Ошибок сети» (ПКМ): ЕДИНСТВЕННОЕ кастомное
           ПКМ-меню программы — во всех остальных местах, кроме полей ввода (там

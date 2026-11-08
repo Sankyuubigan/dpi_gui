@@ -9,6 +9,7 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "DPI GUI",
@@ -51,6 +52,10 @@
     },
     "about-updates": {
       "repo": "Sankyuubigan/dpi_gui"
+    },
+    "logs": {
+      "log_file_name": "dpi_gui.log",
+      "last_logs": true
     }
   }
 }

@@ -449,8 +449,18 @@ fn write_hosts_pins(log: &mut String, meta: &ReportMeta) {
     for pin in &meta.hosts_pins {
         let note = crate::site_verdict::http_result_note(&pin.http);
         if !site_probe::hosts_pin_is_broken(&pin.http) {
-            if let HttpResult::Ok(code) = &pin.http {
-                log.push_str(&format!("  ✅ {} — запись живая (HTTP {})\n", pin.ip, code));
+            match &pin.http {
+                HttpResult::Ok(code) => {
+                    log.push_str(&format!("  ✅ {} — запись живая (HTTP {})\n", pin.ip, code));
+                }
+                _ => {
+                    // Unverified (JS-оболочка): запись транспортно живая —
+                    // звать её мёртвой ложь, но и «живой на 100%» тоже.
+                    log.push_str(&format!(
+                        "  ⚪ {} — {} — запись транспортно живая, но страница без видимого контента: доступность после входа не подтверждена\n",
+                        pin.ip, note
+                    ));
+                }
             }
         } else {
             match &pin.http {
@@ -715,6 +725,12 @@ fn working_ip_line(probe: &site_probe::DomainProbe) -> String {
         Some(HttpResult::ServiceRestrict) => {
             format!(
                 "  IP с живым HTTP: {}{} (страница отдалась, но сервис сам сообщает об ограничении по региону — «открывается» лишь формально)\n",
+                ip, source
+            )
+        }
+        Some(HttpResult::Unverified) => {
+            format!(
+                "  IP с живым HTTP: {}{} (страница без видимого контента — JS-оболочка; доступность после входа в аккаунт не подтверждена)\n",
                 ip, source
             )
         }

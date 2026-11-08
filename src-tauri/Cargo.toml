@@ -9,10 +9,17 @@ edition = "2021"
 tauri-build = { version = "2.0.0", features = [] }
 
 [dependencies]
-tauri = { version = "2.0.0", features = [] }
+# "unstable" — Window::add_child (embedded webview вкладки «Браузер», 08.11.26)
+tauri = { version = "2.0.0", features = ["unstable"] }
 tauri-plugin-shell = "2.0.0"
 tauri-plugin-updater = { version = "2", default-features = false, features = ["native-tls", "zip"] }
 tauri-plugin-process = "2"
+# Диалог выбора папки User Data — «Кукисы из папки…» (08.11.26)
+tauri-plugin-dialog = "2"
+# Единый конвейер логов (08.11.26): log::Log → exe-файл + событие logs:message
+# для общей лог-области на всех вкладках; SSOT подключения — docs/README.md плагина.
+tauri-plugin-logs = { path = "../../my-tauri-plugins/tauri-plugin-logs" }
+log = "0.4"
 # Модуль «О приложении / Обновления»: история релизов GitHub + откат (общий репозиторий my-tauri-plugins).
 tauri-plugin-about-updates = { path = "../../my-tauri-plugins/tauri-plugin-about-updates" }
 serde = { version = "1.0", features = ["derive"] }
@@ -30,3 +37,6 @@ sha2 = "0.10"
 hkdf = "0.12"
 aes = "0.8"
 aes-gcm = "0.10"
+# Кукисы из браузера для честных проб (PRP 08.11.26): rookie 0.5.6 —
+# Chrome/Edge/Firefox и др.; браузер выбирает юзер в UI.
+rookie = "0.5.6"

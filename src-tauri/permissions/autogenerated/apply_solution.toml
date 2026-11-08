@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-apply-solution"
+description = "Enables the apply_solution command without any pre-configured scope."
+commands.allow = ["apply_solution"]
+
+[[permission]]
+identifier = "deny-apply-solution"
+description = "Denies the apply_solution command without any pre-configured scope."
+commands.deny = ["apply_solution"]

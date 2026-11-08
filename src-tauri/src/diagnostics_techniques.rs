@@ -94,9 +94,10 @@ pub fn test_technique(app: &AppHandle, spec: &TechniqueSpec, domain: &str, game_
     let _ = process::stop_winws();
     thread::sleep(Duration::from_millis(800));
 
-    let passed = matches!(res, HttpResult::Ok(_));
+    let passed = matches!(res, HttpResult::Ok(_) | HttpResult::Unverified);
     let detail = match res {
         HttpResult::Ok(s) => format!("OK ({})", s),
+        HttpResult::Unverified => "страница без видимого контента (JS-оболочка): транспорт desync-техникой прошёл, доступность после входа не подтверждена".to_string(),
         HttpResult::BadCert => "SSL-сертификат невалиден — desync-техника здесь не поможет".to_string(),
         HttpResult::Forbidden(s) => format!("Отказ сервера HTTP {} без признаков подмены (возможно, региональное ограничение — desync тут не поможет)", s),
         HttpResult::ServiceRestrict => "Сервис отдал страницу с сообщением об ограничении (регион) — desync тут не поможет".to_string(),

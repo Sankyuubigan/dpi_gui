@@ -107,7 +107,7 @@ fn dedup_ips(addrs: impl Iterator<Item = IpAddr>) -> Vec<String> {
 
 /// Регистрируемый домен: последние две метки (`example.co.uk` схлопывается
 /// частично, но для сравнения «свой домен vs чужой» этого достаточно).
-fn registrable_domain(host: &str) -> String {
+pub(crate) fn registrable_domain(host: &str) -> String {
     let labels: Vec<&str> = host.trim_end_matches('.').split('.').collect();
     if labels.len() <= 2 {
         return host.to_ascii_lowercase();
@@ -208,6 +208,9 @@ fn served_over_valid_cert(r: &HttpResult) -> bool {
             | HttpResult::Forbidden(_)
             | HttpResult::BlockPage
             | HttpResult::ServiceRestrict
+            // Unverified — тоже живой ответ поверх валидного сертификата
+            // (JS-оболочка): адрес принадлежит настоящему эджу сайта.
+            | HttpResult::Unverified
     )
 }
 
@@ -398,6 +401,69 @@ fn probe_alive_over_http80(host: &str, ips: &[String]) -> bool {
     false
 }
 
+/// Порог видимого текста (байт UTF-8), ниже которого живая 2xx/3xx-страница
+/// считается JS-оболочкой → `HttpResult::Unverified`. Замер 08.11.26 ДО
+/// прогона: welcome-оболочка aistudio = 36, google.com = 827, github.com =
+/// 6800. Пересмотр порога — отдельная задача; подгонка после живых прогонов
+/// запрещена (core rules §1.11).
+const UNVERIFIED_MIN_VISIBLE: usize = 200;
+
+/// Длина видимого текста страницы (байты UTF-8): содержимое `<script>` и
+/// `<style>` вырезается вместе с блоками, теги вырезаются, whitespace не
+/// считается. Детектор намеренно грубый и общий: у SPA-оболочки видимого
+/// текста — десятки байт, у контентной страницы — сотни и больше (запас
+/// до порога ≥4x). Регистронезависимость тегов обеспечена входным
+/// lowercase'ом (`http_via_ip` режет детекторы по одному lowercase-телу).
+fn visible_text_len(page: &str) -> usize {
+    let low = page.to_lowercase();
+    let mut visible = 0usize;
+    let mut in_tag = false;
+    let mut in_script = false;
+    let mut in_style = false;
+    let mut i = 0usize;
+    while i < low.len() {
+        let rest = &low[i..];
+        // Открывающие блоки: содержимое до закрывающего тега не видно.
+        if !in_tag && rest.starts_with("<script") {
+            in_script = true;
+            in_tag = true;
+            i += 7;
+            continue;
+        }
+        if !in_tag && rest.starts_with("<style") {
+            in_style = true;
+            in_tag = true;
+            i += 6;
+            continue;
+        }
+        // Закрывающие теги блоков: сами теги тоже не видимый текст.
+        if rest.starts_with("</script") {
+            in_script = false;
+            in_tag = true;
+            i += 8;
+            continue;
+        }
+        if rest.starts_with("</style") {
+            in_style = false;
+            in_tag = true;
+            i += 7;
+            continue;
+        }
+        // i всегда на границе символа: старт границей, шаг — len_utf8.
+        let ch = low[i..].chars().next().unwrap_or('\u{fffd}');
+        i += ch.len_utf8();
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag && !in_script && !in_style && !ch.is_whitespace() => {
+                visible += ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    visible
+}
+
 /// HTTPS-запрос к конкретному адресу: адрес подставляется на уровне сокета,
 /// имя домена остаётся в SNI и в проверке сертификата. Публично и с явным
 /// портом: используется также IP-режимом анализа (ip_probe SNI-эксперимент) —
@@ -416,7 +482,13 @@ pub fn http_via_ip(host: &str, ip: IpAddr, port: u16) -> HttpResult {
         Ok(c) => c,
         Err(e) => return HttpResult::Other(format!("не удалось создать клиент: {}", e)),
     };
-    match client.get(&url).send() {
+    let mut req = client.get(&url);
+    // Кукисы из браузера (PRP 08.11.26): пробы идут с сессией юзера —
+    // сайты за логином перестают выглядеть «заблокированными без причины».
+    if let Some(cookie) = crate::browser_cookies::cookies_header_for(host) {
+        req = req.header(reqwest::header::COOKIE, cookie);
+    }
+    match req.send() {
         Ok(resp) => {
             let status = resp.status().as_u16();
             // Голый 403/451 — отказ самого сервера (часто гео-блок),
@@ -425,7 +497,8 @@ pub fn http_via_ip(host: &str, ip: IpAddr, port: u16) -> HttpResult {
                 return HttpResult::Forbidden(status);
             }
             if (200..=399).contains(&status) {
-                let low = resp.text().unwrap_or_default().to_lowercase();
+                let body = resp.text().unwrap_or_default();
+                let low = body.to_lowercase();
                 if body_looks_like_blockpage(&low) {
                     HttpResult::BlockPage
                 } else if body_looks_region_restricted(&low) {
@@ -433,6 +506,12 @@ pub fn http_via_ip(host: &str, ip: IpAddr, port: u16) -> HttpResult {
                     // (регион источника). Сеть в порядке — вердикт «открыт»
                     // тут был бы ложью (кейс AI-студий).
                     HttpResult::ServiceRestrict
+                } else if visible_text_len(&low) < UNVERIFIED_MIN_VISIBLE {
+                    // Живая страница без видимого контента: JS-оболочка SPA.
+                    // Ограничение AI-студий рисуется после входа в аккаунт —
+                    // анонимная проба его не видит; «открыт» здесь — вывод от
+                    // отсутствия доказательств (кейс aistudio 08.11.26).
+                    HttpResult::Unverified
                 } else {
                     HttpResult::Ok(status)
                 }
@@ -492,11 +571,14 @@ fn probe_host_at(host: &str, ips: &[String]) -> ProbeOutcome {
             }
             "Success" => {
                 let r = http_via_ip(host, *ip, 443);
-                if let HttpResult::Ok(code) = r {
+                // Unverified — Open-эквивалент по транспорту (анализ-путь):
+                // адрес реально отдаёт живую страницу, но доступность после
+                // входа не подтверждена — заметка скажет об этом честно.
+                if matches!(r, HttpResult::Ok(_) | HttpResult::Unverified) {
                     return ProbeOutcome {
                         tcp_ok: true,
                         ip: Some(ip.to_string()),
-                        note: format!("HTTPS через {}: HTTP {}", ip, code),
+                        note: format!("HTTPS через {}: {}", ip, substitution_note(&r)),
                         http: Some(r),
                         any_reset,
                     };
@@ -984,7 +1066,9 @@ fn summarize_substitution(
     let mut last_note = String::new();
     for (n, ip) in live.iter().copied().enumerate() {
         let http = http_via_ip(host, ip, 443);
-        if matches!(http, HttpResult::Ok(_)) {
+        // Unverified — Open-эквивалент по транспорту (анализ-путь): подмена
+        // DNS сработала, но страница — оболочка (заметка substitution_note).
+        if matches!(http, HttpResult::Ok(_) | HttpResult::Unverified) {
             let mut note = format!("HTTPS через {}: {}", ip, substitution_note(&http));
             if n > 0 {
                 note.push_str(&format!(" (перебрано адресов: {})", n + 1));
@@ -1018,6 +1102,10 @@ pub fn substitution_note(r: &HttpResult) -> String {
         HttpResult::Forbidden(code) => format!("отказ сервера HTTP {}", code),
         HttpResult::ServiceRestrict => {
             "страница отдалась, но сервис сообщает об ограничении (регион)".to_string()
+        }
+        HttpResult::Unverified => {
+            "страница без видимого контента (JS-оболочка) — доступность после входа не подтверждена"
+                .to_string()
         }
         HttpResult::Tls => "TLS сломан".to_string(),
         HttpResult::BadCert => "SSL-сертификат невалиден".to_string(),
@@ -1061,7 +1149,10 @@ pub struct HostsPin {
 /// HTTP — запись не работает (RST/таймаут — адрес мёртв; отказ/страница
 /// блокировки — адрес жив, но сайт через него не открыть).
 pub fn hosts_pin_is_broken(http: &HttpResult) -> bool {
-    !matches!(http, HttpResult::Ok(_))
+    // Unverified — транспортно живая запись (Open-эквивалент): адрес отвечает
+    // живой страницей, но доступность после входа не подтверждена. Считать
+    // её «МЁРТВОЙ» — ложь в отчёте о закреплениях.
+    !matches!(http, HttpResult::Ok(_) | HttpResult::Unverified)
 }
 
 /// Пробы закреплённых в hosts адресов домена (IP берутся из hosts-карты
@@ -1091,6 +1182,38 @@ pub fn probe_hosts_pins(host: &str, ips: &[String]) -> Result<Vec<HostsPin>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Детектор JS-оболочки: у SPA-оболочки видимого текста — десятки байт,
+    /// у контентной страницы — сотни и больше (порог UNVERIFIED_MIN_VISIBLE;
+    /// замер 08.11.26: aistudio=36, google=827, github=6800).
+    #[test]
+    fn visible_text_len_distinguishes_shell_from_content() {
+        // Контентная страница: весь текст вне тегов виден.
+        let content = format!(
+            "<html><body><p>Добро пожаловать на наш сайт — {}</p></body></html>",
+            "т".repeat(300)
+        );
+        assert!(visible_text_len(&content) >= UNVERIFIED_MIN_VISIBLE);
+        // SPA-оболочка: десятки килобайт JS/CSS, видимого текста почти нет.
+        let shell = format!(
+            "<html><head><script>var x=\"{}\";</script><style>body{{color:red}}</style></head><body><div id=\"root\"></div><script>boot();</script></body></html>",
+            "a".repeat(60000)
+        );
+        assert!(visible_text_len(&shell) < UNVERIFIED_MIN_VISIBLE);
+        // Содержимое script/style не считается даже в кириллице.
+        let cyr = format!("<script>/* {} */</script>", "я".repeat(500));
+        assert_eq!(visible_text_len(&cyr), 0);
+    }
+
+    /// Регистр тегов не важен (lowercase делает детектор), кириллица в
+    /// видимом тексте считается по байтам UTF-8: «Привет, мир!» = 20 байт.
+    #[test]
+    fn visible_text_len_handles_case_and_cyrillic() {
+        let page = "<SCRIPT>var x=1;</SCRIPT><P>Привет, мир!</P>";
+        let len = visible_text_len(page);
+        assert!(len > 0 && len < 30, "visible={}", len);
+        assert_eq!(visible_text_len(""), 0);
+    }
 
     #[test]
     fn registrable_domain_ignores_www_and_case() {

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-stop-bypass"
+description = "Enables the stop_bypass command without any pre-configured scope."
+commands.allow = ["stop_bypass"]
+
+[[permission]]
+identifier = "deny-stop-bypass"
+description = "Denies the stop_bypass command without any pre-configured scope."
+commands.deny = ["stop_bypass"]

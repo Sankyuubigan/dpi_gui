@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-hosts-entries-for-domains"
+description = "Enables the hosts_entries_for_domains command without any pre-configured scope."
+commands.allow = ["hosts_entries_for_domains"]
+
+[[permission]]
+identifier = "deny-hosts-entries-for-domains"
+description = "Denies the hosts_entries_for_domains command without any pre-configured scope."
+commands.deny = ["hosts_entries_for_domains"]
