@@ -39,6 +39,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::cancel;
 use crate::config;
 use crate::diagnostics_probe::{self, is_stub_ip, DohAnswers, HttpResult};
 use crate::ip_target;
@@ -601,6 +602,12 @@ pub fn run_pick(url: &str) -> Result<DnsPickOutcome, String> {
         ));
     }
 
+    // Контрольная точка «Стоп»: перебор DoH-сервисов — самая долгая фаза.
+    // winws здесь не рулится, финализации не требуется — честный Err.
+    if cancel::is_cancelled(cancel::DNS_PICK) {
+        return Err("Подбор DNS остановлен пользователем".into());
+    }
+
     let class = pick_resolvers(&answers);
 
     // Шлюзовые сеты — только TCP-живость (HTTP-проба шлюза лжёт 200-м).
@@ -615,6 +622,11 @@ pub fn run_pick(url: &str) -> Result<DnsPickOutcome, String> {
         .iter()
         .map(|(k, ips)| (k.clone(), gateway_tcp_probe(ips)))
         .collect();
+
+    // Контрольная точка после TCP-проб шлюзов, перед HTTP-пробами сайта.
+    if cancel::is_cancelled(cancel::DNS_PICK) {
+        return Err("Подбор DNS остановлен пользователем".into());
+    }
 
     let (site, per_ip) = run_site_probes(&host, &class.site_sets);
     let entries = attach_probes(class, &site, &per_ip, &gateways);

@@ -1,13 +1,14 @@
-import { useState, type Dispatch, type SetStateAction } from "react";
+import { useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Activity, Stethoscope, Globe, FolderOpen } from "lucide-react";
+import { Activity, Stethoscope, Globe, FolderOpen, Square } from "lucide-react";
 import TestingLogPanel, { type LogEntry } from "./TestingLogPanel";
 import { useTestingLog } from "./useTestingLog";
+import { OP_DIAGNOSTICS, OP_PROFILE_TEST, runOp } from "../ops";
 
 /// Вкладка «Профили обхода»: всё, что касается профилей, в одном месте —
 /// открытие profiles.json, тест всех профилей по домену и диагностика
 /// с генерацией авто-профиля.
-export default function ProfilesTab({ profiles, setProfiles, config, log, setLog, url, setUrl, isTesting, setIsTesting }: {
+export default function ProfilesTab({ profiles, setProfiles, config, log, setLog, url, setUrl, isTesting, setIsTesting, activeOp, setActiveOp }: {
   profiles: any[];
   setProfiles: Dispatch<SetStateAction<any[]>>;
   config: any;
@@ -17,9 +18,16 @@ export default function ProfilesTab({ profiles, setProfiles, config, log, setLog
   setUrl: Dispatch<SetStateAction<string>>;
   isTesting: boolean;
   setIsTesting: Dispatch<SetStateAction<boolean>>;
+  /// Имя идущей долгой операции (src/ops.ts); кнопка «Стоп» рендерится,
+  /// когда оно совпадает с операцией этой вкладки.
+  activeOp: string | null;
+  setActiveOp: Dispatch<SetStateAction<string | null>>;
 }) {
   const [diag, setDiag] = useState<any>(null);
   const [testProgress, setTestProgress] = useState<{ total: number; done: number; current: string } | null>(null);
+  // «Стоп» нажат: рвёт фронт-цикл по профилям и помечает Err-ответы бэкенда
+  // как ожидаемую остановку, а не ошибку.
+  const stopRef = useRef(false);
   const { appendEntry, appendLog } = useTestingLog(setLog);
 
   const openProfilesFile = async () => {
@@ -30,9 +38,22 @@ export default function ProfilesTab({ profiles, setProfiles, config, log, setLog
     }
   };
 
+  // Кнопка «Стоп»: фронт-флаг (мгновенно рвёт цикл по профилям после
+  // текущего) + сигнал бэкенду (текущая операция завершится в ближайшей
+  // контрольной точке: тест профиля вернёт вердикт «Отменено», диагностика — Err).
+  const stopCurrentOp = async () => {
+    if (!activeOp) return;
+    stopRef.current = true;
+    appendEntry("[Стоп] Останавливаю — операция завершится в ближайшей контрольной точке...", "warn");
+    try {
+      await invoke("cancel_operation", { name: activeOp });
+    } catch { /* сигнал отмены не важнее операции: ошибку игнорируем */ }
+  };
+
   const runProfileTest = async () => {
     if (!url) return;
     setIsTesting(true);
+    stopRef.current = false;
     const total = profiles.length;
     setTestProgress({ total, done: 0, current: "..." });
     setLog([{ text: `[Тест] Пинг сайта ${url} по всем профилям (всего ${total})...`, kind: "info" }]);
@@ -77,22 +98,31 @@ export default function ProfilesTab({ profiles, setProfiles, config, log, setLog
           counts["Ошибка теста"] = (counts["Ошибка теста"] ?? 0) + 1;
           failures.push({ name: String(p.name ?? ""), verdict: "Ошибка теста" });
         }
+
+        // «Стоп»: честная остановка — текущий профиль уже отчитался
+        // (обычно вердиктом «Отменено»), следующие не запускаем.
+        if (stopRef.current) {
+          appendLog(`=== ТЕСТИРОВАНИЕ ОСТАНОВЛЕНО (пройдено ${i + 1} из ${total}) ===`);
+          break;
+        }
       }
-      setTestProgress({ total, done: total, current: "" });
-      const totalSecs = ((Date.now() - startTime) / 1000).toFixed(0);
-      appendLog(`=== ТЕСТИРОВАНИЕ ЗАВЕРШЕНО (${totalSecs}с) ===`);
-      const summary = Object.entries(counts).map(([k, v]) => `${k}: ${v}`).join(" · ");
-      appendLog(`Итог: ${summary}`);
-      if (successes.length > 0) {
-        appendEntry(`Успешные профили: ${successes.join(", ")}`, "ok");
-      } else {
-        appendEntry("Успешных профилей нет", "fail");
-      }
-      if (failures.length > 0) {
-        appendEntry(
-          `Неудачные профили: ${failures.map((f) => `${f.name} (${f.verdict})`).join(", ")}`,
-          "fail"
-        );
+      if (!stopRef.current) {
+        setTestProgress({ total, done: total, current: "" });
+        const totalSecs = ((Date.now() - startTime) / 1000).toFixed(0);
+        appendLog(`=== ТЕСТИРОВАНИЕ ЗАВЕРШЕНО (${totalSecs}с) ===`);
+        const summary = Object.entries(counts).map(([k, v]) => `${k}: ${v}`).join(" · ");
+        appendLog(`Итог: ${summary}`);
+        if (successes.length > 0) {
+          appendEntry(`Успешные профили: ${successes.join(", ")}`, "ok");
+        } else {
+          appendEntry("Успешных профилей нет", "fail");
+        }
+        if (failures.length > 0) {
+          appendEntry(
+            `Неудачные профили: ${failures.map((f) => `${f.name} (${f.verdict})`).join(", ")}`,
+            "fail"
+          );
+        }
       }
     } catch (e: any) {
       appendLog(`[Ошибка]: ${e}`);
@@ -105,6 +135,7 @@ export default function ProfilesTab({ profiles, setProfiles, config, log, setLog
   const runDiagnostics = async () => {
     if (!url) return;
     setIsTesting(true);
+    stopRef.current = false;
     setDiag(null);
     setLog([
       { text: `[Диагностика] Комплексная проверка соединения для: ${url}...`, kind: "info" },
@@ -123,7 +154,11 @@ export default function ProfilesTab({ profiles, setProfiles, config, log, setLog
         setProfiles(loaded);
       } catch { /* ignore */ }
     } catch (e: any) {
-      appendLog(`[Ошибка диагностики]: ${e}`);
+      if (stopRef.current) {
+        appendEntry("[Диагностика] Остановлена пользователем.", "warn");
+      } else {
+        appendLog(`[Ошибка диагностики]: ${e}`);
+      }
     } finally {
       setIsTesting(false);
     }
@@ -153,19 +188,37 @@ export default function ProfilesTab({ profiles, setProfiles, config, log, setLog
 
         <div className="flex gap-3">
           <button
-            onClick={runProfileTest}
+            onClick={() => runOp(setActiveOp, OP_PROFILE_TEST, runProfileTest)}
             disabled={isTesting}
             className="flex-1 flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-400 text-white py-2 rounded-lg font-bold transition"
           >
             <Activity size={18} /> Тест профилей
           </button>
+          {activeOp === OP_PROFILE_TEST && isTesting && (
+            <button
+              onClick={stopCurrentOp}
+              title="Остановить тест профилей: текущий профиль завершится с вердиктом «Отменено», остальные будут пропущены"
+              className="shrink-0 flex items-center justify-center gap-1.5 border-2 border-rose-300 text-rose-600 hover:bg-rose-50 px-3 py-2 rounded-lg font-bold transition"
+            >
+              <Square size={16} /> Стоп
+            </button>
+          )}
           <button
-            onClick={runDiagnostics}
+            onClick={() => runOp(setActiveOp, OP_DIAGNOSTICS, runDiagnostics)}
             disabled={isTesting}
             className="flex-1 flex items-center justify-center gap-2 bg-rose-600 hover:bg-rose-700 disabled:bg-gray-400 text-white py-2 rounded-lg font-bold transition"
           >
             <Stethoscope size={18} /> Диагностика + авто-профиль
           </button>
+          {activeOp === OP_DIAGNOSTICS && isTesting && (
+            <button
+              onClick={stopCurrentOp}
+              title="Остановить диагностику: завершится в ближайшей контрольной точке (между техниками/пробами)"
+              className="shrink-0 flex items-center justify-center gap-1.5 border-2 border-rose-300 text-rose-600 hover:bg-rose-50 px-3 py-2 rounded-lg font-bold transition"
+            >
+              <Square size={16} /> Стоп
+            </button>
+          )}
           <button
             onClick={openProfilesFile}
             className="shrink-0 p-2 border border-gray-300 rounded-lg hover:bg-gray-100 transition"

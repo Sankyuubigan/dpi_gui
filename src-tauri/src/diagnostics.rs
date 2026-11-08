@@ -2,7 +2,7 @@ use std::thread;
 use std::time::Duration;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
-use crate::{config, process};
+use crate::{cancel, config, process};
 use crate::diagnostics_probe::{self, DnsInfo, HttpResult};
 use crate::diagnostics_techniques::{self, TechniqueSpec};
 use crate::diagnostics_report;
@@ -46,6 +46,18 @@ fn try_catch<T>(label: &str, app: &AppHandle, f: impl FnOnce() -> T) -> Option<T
             None
         }
     }
+}
+
+/// Контрольная точка отмены (кнопка «Стоп», флаг diagnostics). Диагностика
+/// глушит обход на старте, поэтому при остановке обязана вернуть систему в то
+/// же состояние (stop_winws — тот же жест, что и штатный финал) и честно
+/// отчитаться ошибкой: фронт покажет «остановлена пользователем».
+fn ensure_active() -> Result<(), String> {
+    if cancel::is_cancelled(cancel::DIAGNOSTICS) {
+        let _ = process::stop_winws();
+        return Err("Диагностика остановлена пользователем".into());
+    }
+    Ok(())
 }
 
 /// Проверка конкретного профиля (по имени) против тестового домена.
@@ -107,6 +119,7 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
         if windivert_ok { "OK" } else { "FAIL" },
         windivert_detail
     ));
+    ensure_active()?;
 
     // 4. DNS (системный + публичные)
     let dns: DnsInfo = try_catch("dns", &app, || diagnostics_probe::dns_multi(&domain)).unwrap_or_else(DnsInfo::new);
@@ -118,6 +131,7 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
         if dns.err.is_empty() { String::new() } else { format!("\nОшибка: {}", dns.err) }
     );
     log(format!("[Диагностика] DNS:\n{}", dns_summary));
+    ensure_active()?;
 
     // Выбираем IP для connect/UDP-проб (публичный DNS надёжнее при цензуре)
     let target_ip = dns
@@ -152,6 +166,7 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
         None => "no-ip".to_string(),
     };
     log(format!("[Диагностика] QUIC/UDP 443: {}", quic));
+    ensure_active()?;
 
     // 9. Прогон desync-техник (каждая изолированно)
     let techniques: Vec<TechniqueSpec> = diagnostics_techniques::all_techniques();
@@ -159,6 +174,9 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
     let mut passed: Vec<String> = Vec::new();
 
     for spec in &techniques {
+        // «Стоп» на границе техник: внутри test_technique не лезем (одна
+        // техника — секунды, это честная задержка отмены).
+        ensure_active()?;
         log(format!("[Диагностика] -> Тест техники: {}", spec.name));
         let (p, d) = try_catch("technique", &app, || {
             diagnostics_techniques::test_technique(&app, spec, &domain, game_filter)
@@ -188,6 +206,7 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
         if pname.is_empty() || pname.starts_with("Авто-профиль") {
             continue;
         }
+        ensure_active()?;
         log(format!("[Диагностика] -> Тест существующего профиля: {}", pname));
         let (ok, detail) = try_catch("existing_profile", &app, || {
             test_profile_against(&app, &pname, &domain, game_filter)
@@ -206,6 +225,7 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
     }
 
     // 10. Генерация и проверка авто-профиля
+    ensure_active()?;
     let app_dir = config::get_app_dir();
     let lists_dir = app_dir.join("lists").to_string_lossy().replace("\\", "/");
     let bin_dir = process::get_bin_dir()?.to_string_lossy().replace("\\", "/");
@@ -234,6 +254,7 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
         // Проверяем сохранённый профиль по факту
         let _ = process::stop_winws();
         thread::sleep(Duration::from_millis(500));
+        ensure_active()?;
         verified = try_catch("verify_profile", &app, || {
             match process::start_winws_custom_quiet(app.clone(), &args, game_filter) {
                 Ok(_) => {
@@ -275,6 +296,7 @@ pub fn run_diagnostics(app: AppHandle, blocked_url: String, game_filter: bool) -
                 }
                 let _ = process::stop_winws();
                 thread::sleep(Duration::from_millis(500));
+                ensure_active()?;
                 verified = try_catch("verify_clone", &app, || {
                     match process::start_winws_custom_quiet(app.clone(), &cargs, game_filter) {
                         Ok(_) => {

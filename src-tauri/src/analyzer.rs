@@ -14,6 +14,7 @@ use crate::analyzer_probe::{self, Probe};
 use crate::analyzer_report::{self, ReportMeta};
 use crate::bypass_lists;
 use crate::bypass_toggle;
+use crate::cancel;
 use crate::ip_probe;
 use crate::analyzer_ip_report;
 use crate::ip_target;
@@ -133,6 +134,17 @@ pub struct DomainAnalysisOutcome {
     /// причина, почему решения нет). Данные и текст блока «ИТОГ АНАЛИЗА» —
     /// один источник (site_solution).
     pub solution: site_solution::SiteSolution,
+}
+
+/// Контрольная точка кнопки «Стоп» анализа (флаг site_analysis, cancel.rs).
+/// Ранний Err безопасен: в off-window фазе обход восстановит
+/// OffWindowGuard::Drop, worker пошлёт честный «failed» и фронту, и бейджу
+/// «Ошибок сети».
+fn ensure_active() -> Result<(), String> {
+    if cancel::is_cancelled(cancel::SITE_ANALYSIS) {
+        return Err("Анализ остановлен пользователем".into());
+    }
+    Ok(())
 }
 
 pub fn analyze_url(app: &AppHandle, url: &str) -> Result<DomainAnalysisOutcome, String> {
@@ -311,6 +323,10 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
     }
     timings.push(("chrome: загрузка страницы (network idle)", t_chrome.elapsed()));
 
+    // Контрольная точка «Стоп» — ПЕРВАЯ возможная: строго после остановки
+    // потока скрытия окон (ранний выход до этого оставил бы его крутиться).
+    ensure_active()?;
+
     let discovered: Vec<String> = {
         let mut v: Vec<String> = discovered_domains.lock().unwrap().iter().cloned().collect();
         v.sort();
@@ -346,6 +362,10 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
             _ => None,
         })
         .collect();
+
+    // Контрольная точка после probe_all #1: до окна «обход выключен» —
+    // ранний Err здесь обход ещё не трогал (winws в исходном состоянии).
+    ensure_active()?;
 
     let mut bypass_toggled = false;
     let mut restore_note: Option<String> = None;
@@ -399,6 +419,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         // DoH-ответы грузятся ОДИН раз и расходуются и на пробу домена,
         // и на проверку «подмены DNS» (раньше resolve_doh_all вызывался
         // дважды — лишний проход с дедлайном 9 с).
+        ensure_active()?;
         let t_probe = std::time::Instant::now();
         let main_doh_answers = site_probe::resolve_doh_answers(&main_host);
         let main_probe = site_probe::probe_domain_with_doh(&main_host, &main_doh_answers);
@@ -436,6 +457,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         // к родным IP не работает — скан CIDR-диапазонов с поиском рабочего IP.
         // Условие совпадает с блоком подмены DNS: сайт открывается или найдено
         // рабочее имя (WwwOnly) — разбирать нечего.
+        ensure_active()?;
         let t_block = std::time::Instant::now();
         let block_scan = if main_probe.verdict.site_broken()
             && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
@@ -452,6 +474,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         // их TCP-пробы тоже не должны идти через активный обход.
         // Домены проверяются параллельно: последовательный .map тянул до
         // 9 с дедлайна DoH на каждый (до 45 с на пятерку).
+        ensure_active()?;
         let t_dnsfail = std::time::Instant::now();
         let dns_fail_sub = dns_fail_sub_parallel(&classification.dns_fail, 5);
         timings.push(("dns_fail_sub (фоновые DoH-проверки)", t_dnsfail.elapsed()));
@@ -471,6 +494,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         // DoH-адресу, как ходит браузер юзера. GeoBlocked/ServiceRestricted
         // пропускаем: отказ сайта уже виден в чистом окне, отчёт печатает его
         // без контрольной пробы.
+        ensure_active()?;
         let t_ctrl = std::time::Instant::now();
         let bypass_on_http = if main_probe.verdict.site_broken()
             && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
@@ -490,6 +514,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
             analyzer_probe::classify_single(results_on, &browser_failed_set);
 
         // DoH-ответы грузятся ОДИН раз (см. ветку обхода выше).
+        ensure_active()?;
         let t_probe = std::time::Instant::now();
         let main_doh_answers = site_probe::resolve_doh_answers(&main_host);
         let main_probe = site_probe::probe_domain_with_doh(&main_host, &main_doh_answers);
@@ -501,6 +526,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         } else {
             Vec::new()
         };
+        ensure_active()?;
         let t_block = std::time::Instant::now();
         let block_scan = if main_probe.verdict.site_broken()
             && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
@@ -511,6 +537,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         };
         timings.push(("block_diagnose (CIDR-скан)", t_block.elapsed()));
 
+        ensure_active()?;
         let t_dnsfail = std::time::Instant::now();
         let dns_fail_sub = dns_fail_sub_parallel(&classification.dns_fail, 5);
         timings.push(("dns_fail_sub (фоновые DoH-проверки)", t_dnsfail.elapsed()));
@@ -526,6 +553,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
     // IP — он умер, а анализ резолвит мимо hosts, браузер — по hosts). Пробы
     // закреплённых адресов — в рабочем состоянии обхода (окно уже закрыто),
     // как по ним ходит браузер юзера.
+    ensure_active()?;
     let t_pins = std::time::Instant::now();
     let hosts_pins = {
         let map = match crate::hosts::load_hosts_map() {

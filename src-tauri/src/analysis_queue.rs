@@ -25,6 +25,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::analyzer::{self, DomainAnalysisOutcome};
+use crate::cancel;
 use crate::events::app_log;
 use crate::site_solution::SiteSolution;
 
@@ -169,6 +170,15 @@ fn worker(app: AppHandle) {
 
         match job {
             Job::Manual { url, respond } => {
+                // «Стоп» мог сработать в окне между постановкой в очередь и
+                // стартом (drain не застал джоб — он уже взят): не стартуем
+                // отменённый анализ. finish_job обязателен — pop_next уже
+                // выставил running.
+                if cancel::is_cancelled(cancel::SITE_ANALYSIS) {
+                    let _ = respond.send(Err("анализ отменён пользователем".into()));
+                    finish_job();
+                    continue;
+                }
                 let label = display_domain_of(&url);
                 emit_progress(&app, &label, "running", None, None);
                 app_log(&app, format!("[Анализ] анализ {}...", label));
@@ -316,6 +326,11 @@ fn display_domain_of(input: &str) -> String {
 /// Потолок ожидания — ANALYSIS_DEADLINE + запас: зависший воркер не держит
 /// команду навсегда, приходит честный Err (инцидент 03.11.26).
 pub async fn enqueue_manual(app: AppHandle, url: String) -> Result<DomainAnalysisOutcome, String> {
+    // Новая операция сбрасывает флаг прошлой отмены: «Стоп» действует только
+    // на операцию, запущенную в этот момент (операции эксклюзивны на фронте
+    // через общий isTesting, так что наезд запуска на неотвеченную отмену
+    // невозможен: кнопки заблокированы, пока предыдущий анализ не ответит).
+    cancel::reset(cancel::SITE_ANALYSIS);
     let (tx, rx) = mpsc::channel();
     {
         let mut st = state().lock().expect("analysis queue poisoned");
@@ -333,6 +348,31 @@ pub async fn enqueue_manual(app: AppHandle, url: String) -> Result<DomainAnalysi
     })
     .await
     .unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
+}
+
+/// Кнопка «Стоп» анализа сайта: снять все ЖДУЩИЕ manual-джобы очереди, каждому
+/// — честный Err (фронт разблокируется мгновенно). Идущий анализ гасится
+/// отдельно — контрольными точками в analyzer::analyze_domain по флагу
+/// site_analysis (ранний Err там безопасен: OffWindowGuard::Drop вернёт обход).
+/// Mass/Apply не трогаются: у них свои жизненные циклы, «Стоп» на вкладке
+/// «Починка сайтов» отменяет только анализ сайта.
+pub fn cancel_manual_queued() {
+    let drained: Vec<mpsc::Sender<Result<DomainAnalysisOutcome, String>>> = {
+        let mut st = state().lock().expect("analysis queue poisoned");
+        let mut kept = VecDeque::with_capacity(st.queue.len());
+        let mut drained = Vec::new();
+        while let Some(job) = st.queue.pop_front() {
+            match job {
+                Job::Manual { respond, .. } => drained.push(respond),
+                other => kept.push_back(other),
+            }
+        }
+        st.queue = kept;
+        drained
+    };
+    for respond in drained {
+        let _ = respond.send(Err("анализ отменён пользователем".into()));
+    }
 }
 
 /// Массовый анализ: вся пачка в одном окне без обхода; сводка — через канал.

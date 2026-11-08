@@ -1,14 +1,15 @@
-import { useState, type Dispatch, type SetStateAction } from "react";
+import { useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Search, Globe, FileEdit, Trash2, Wrench } from "lucide-react";
+import { Search, Globe, FileEdit, Trash2, Wrench, Square } from "lucide-react";
 import TestingLogPanel, { type LogEntry } from "./TestingLogPanel";
 import { useTestingLog } from "./useTestingLog";
+import { OP_DNS_PICK, OP_SITE_ANALYSIS, runOp } from "../ops";
 import type { SiteSolution } from "../App";
 
 /// Вкладка «Починка сайтов»: анализ одного домена (с опциональным
 /// принудительным подбором DNS-адреса) и точечная правка hosts. Тесты
 /// профилей и диагностика живут на отдельной вкладке «Профили обхода».
-export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsTesting, solution, setSolution }: {
+export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsTesting, solution, setSolution, activeOp, setActiveOp }: {
   log: LogEntry[];
   setLog: Dispatch<SetStateAction<LogEntry[]>>;
   url: string;
@@ -18,13 +19,33 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
   /// Решение последнего анализа (null — анализ ещё не запускался).
   solution: SiteSolution | null;
   setSolution: Dispatch<SetStateAction<SiteSolution | null>>;
+  /// Имя идущей долгой операции (src/ops.ts); кнопка «Стоп» рендерится,
+  /// когда оно совпадает с операцией этой вкладки.
+  activeOp: string | null;
+  setActiveOp: Dispatch<SetStateAction<string | null>>;
 }) {
   const [hostsIp, setHostsIp] = useState("");
+  // «Стоп» нажат: Err-ответ бэкенда трактуем как ожидаемую остановку,
+  // а не ошибку (сам цикл здесь фронт не крутит — рулит бэкенд).
+  const stopRef = useRef(false);
   const { appendEntry, appendLog } = useTestingLog(setLog);
+
+  // Кнопка «Стоп»: сигнал бэкенду остановить операцию в ближайшей
+  // контрольной точке (анализ — между фазами, подбор DNS — между фазами
+  // перебора; ждущие в очереди джобы анализа снимаются сразу).
+  const stopCurrentOp = async () => {
+    if (!activeOp) return;
+    stopRef.current = true;
+    appendEntry("[Стоп] Останавливаю — операция завершится в ближайшей контрольной точке...", "warn");
+    try {
+      await invoke("cancel_operation", { name: activeOp });
+    } catch { /* сигнал отмены не важнее операции: ошибку игнорируем */ }
+  };
 
   const runDeepAnalysis = async () => {
     if (!url) return;
     setIsTesting(true);
+    stopRef.current = false;
     setSolution(null); // старое решение к новому анализу неприменимо
     setLog([
       { text: `[Анализ] Запуск анализа для: ${url}...`, kind: "info" },
@@ -38,7 +59,11 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
       appendLog(outcome.report);
       setSolution(outcome.solution ?? null);
     } catch (e: any) {
-      appendLog(`[Ошибка анализа]: ${e}`);
+      if (stopRef.current) {
+        appendEntry("[Анализ] Остановлен пользователем.", "warn");
+      } else {
+        appendEntry(`[Ошибка анализа]: ${e}`, "fail");
+      }
     } finally {
       setIsTesting(false);
     }
@@ -75,6 +100,7 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
       return;
     }
     setIsTesting(true);
+    stopRef.current = false;
     appendEntry(`[Подбор DNS] Перебор списка DoH-сервисов для ${domain}...`, "info");
     try {
       const out = await invoke<{
@@ -99,7 +125,11 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
       }
       appendEntry(`[Подбор DNS] ${out.summary}`, out.verdictLevel);
     } catch (e: any) {
-      appendEntry(`[Подбор DNS] Ошибка: ${e}`, "fail");
+      if (stopRef.current) {
+        appendEntry("[Подбор DNS] Остановлен пользователем.", "warn");
+      } else {
+        appendEntry(`[Подбор DNS] Ошибка: ${e}`, "fail");
+      }
     } finally {
       setIsTesting(false);
     }
@@ -190,12 +220,21 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
         <div className="flex flex-col gap-3">
           <div className="flex gap-3">
             <button
-              onClick={runDeepAnalysis}
+              onClick={() => runOp(setActiveOp, OP_SITE_ANALYSIS, runDeepAnalysis)}
               disabled={isTesting}
               className="flex-1 flex items-center justify-center gap-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-400 text-white py-2 rounded-lg font-bold transition"
             >
               <Search size={18} /> Анализ сайта / IP
             </button>
+            {activeOp === OP_SITE_ANALYSIS && isTesting && (
+              <button
+                onClick={stopCurrentOp}
+                title="Остановить анализ: завершится в ближайшей контрольной точке (между фазами проб), обход будет восстановлен"
+                className="shrink-0 flex items-center justify-center gap-1.5 border-2 border-rose-300 text-rose-600 hover:bg-rose-50 px-3 py-2 rounded-lg font-bold transition"
+              >
+                <Square size={16} /> Стоп
+              </button>
+            )}
           </div>
 
           {/* Кнопка «Починить сайт»: активна ТОЛЬКО когда анализ нашёл решение.
@@ -232,14 +271,25 @@ export default function SiteFixTab({ log, setLog, url, setUrl, isTesting, setIsT
             сайт через эти адреса. Кейс сессий-геоблоков (aistudio) покрыт
             универсально: шлюзы сервиса = фронтинг-кандидат. */}
         <div className="flex flex-col gap-2 mt-4 border-t border-gray-100 pt-4">
-          <button
-            onClick={runDnsPick}
-            disabled={isTesting}
-            className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-400 text-white py-2 rounded-lg font-bold transition"
-            title="Перебирает весь список DoH-сервисов (doh-services.txt), классифицирует ответы (свои шлюзы / резолвит верно / расходится с другими / мёртв) и проверяет сквозной HTTPS-пробой, открывается ли сайт через эти адреса. Результат — имя DNS для включения в браузере (Secure DNS)."
-          >
-            <Globe size={18} /> Подбор DNS для обхода геоблока
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={() => runOp(setActiveOp, OP_DNS_PICK, runDnsPick)}
+              disabled={isTesting}
+              className="flex-1 flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-400 text-white py-2 rounded-lg font-bold transition"
+              title="Перебирает весь список DoH-сервисов (doh-services.txt), классифицирует ответы (свои шлюзы / резолвит верно / расходится с другими / мёртв) и проверяет сквозной HTTPS-пробой, открывается ли сайт через эти адреса. Результат — имя DNS для включения в браузере (Secure DNS)."
+            >
+              <Globe size={18} /> Подбор DNS для обхода геоблока
+            </button>
+            {activeOp === OP_DNS_PICK && isTesting && (
+              <button
+                onClick={stopCurrentOp}
+                title="Остановить подбор DNS: завершится в ближайшей контрольной точке перебора"
+                className="shrink-0 flex items-center justify-center gap-1.5 border-2 border-rose-300 text-rose-600 hover:bg-rose-50 px-3 py-2 rounded-lg font-bold transition"
+              >
+                <Square size={16} /> Стоп
+              </button>
+            )}
+          </div>
           <p className="text-xs text-gray-500 px-1">
             Проверяет, через какой DNS-сервис сайт реально открывается (сквозная
             проба), и назовёт рабочий DNS для браузера (Secure DNS). Если дело не

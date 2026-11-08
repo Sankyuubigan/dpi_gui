@@ -1,4 +1,4 @@
-use crate::{process, diagnostics_probe};
+use crate::{cancel, process, diagnostics_probe};
 use std::thread;
 use std::time::{Duration, Instant};
 use serde::Serialize;
@@ -36,6 +36,21 @@ pub fn test_single_profile(app: AppHandle, profile_name: &str, url: &str, game_f
     let started = Instant::now();
     let target_url = if !url.starts_with("http") { format!("https://{}", url) } else { url.to_string() };
 
+    // Честный вердикт отмены (ok=false, отдельный от обычных неудач): фронт
+    // пишет его в лог как результат и рвёт цикл по оставшимся профилям.
+    let cancelled = |detail: &str| ProfileTestOutcome {
+        name: profile_name.to_string(),
+        ok: false,
+        verdict: "Отменено".to_string(),
+        detail: detail.to_string(),
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    };
+
+    // Контрольная точка до старта winws: отмена до прогрева — мгновенная.
+    if cancel::is_cancelled(cancel::PROFILE_TEST) {
+        return Ok(cancelled("остановлено до запуска профиля"));
+    }
+
     if let Err(e) = process::start_winws_quiet(app.clone(), profile_name, game_filter) {
         return Ok(ProfileTestOutcome {
             name: profile_name.to_string(),
@@ -46,13 +61,23 @@ pub fn test_single_profile(app: AppHandle, profile_name: &str, url: &str, game_f
         });
     }
 
-    // Даем WinDivert время на перехват трафика
-    thread::sleep(Duration::from_secs(2));
+    // Даем WinDivert время на перехват трафика. Сон кусочками с проверкой
+    // флага: тест рулит winws, «Стоп» не должен ждать лишних секунд.
+    for _ in 0..8 {
+        if cancel::is_cancelled(cancel::PROFILE_TEST) {
+            let _ = process::stop_winws();
+            return Ok(cancelled("остановлено во время прогрева WinDivert"));
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 
     // Десинк-профили часто пробивают только со второй/третьей попытки
     // (первый коннект съедается DPI, winws пересылает модифицированные пакеты).
     let mut result: diagnostics_probe::HttpResult = diagnostics_probe::HttpResult::Timeout;
     for attempt in 1..=2 {
+        if cancel::is_cancelled(cancel::PROFILE_TEST) {
+            break;
+        }
         let r = diagnostics_probe::http_classify_with(&target_url, 5);
         if matches!(r, diagnostics_probe::HttpResult::Ok(_)) {
             result = r;
@@ -60,11 +85,22 @@ pub fn test_single_profile(app: AppHandle, profile_name: &str, url: &str, game_f
         }
         result = r;
         if attempt == 1 {
-            thread::sleep(Duration::from_millis(800));
+            for _ in 0..4 {
+                if cancel::is_cancelled(cancel::PROFILE_TEST) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
         }
     }
 
+    // Финализация обязательна: тест сам поднимал winws — отменённый тест не
+    // оставляет обход висеть. Факт отмены фиксируем ДО глушения.
+    let was_cancelled = cancel::is_cancelled(cancel::PROFILE_TEST);
     let _ = process::stop_winws();
+    if was_cancelled {
+        return Ok(cancelled("остановлено во время пробы"));
+    }
     thread::sleep(Duration::from_secs(1));
 
     let (ok, verdict) = verdict_from_http(&result);

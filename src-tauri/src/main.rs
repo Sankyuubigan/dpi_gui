@@ -18,6 +18,7 @@ mod site_solution;
 mod site_verdict;
 mod testing;
 mod bypass_lists;
+mod cancel;
 mod diagnostics;
 mod diagnostics_probe;
 mod diagnostics_techniques;
@@ -89,6 +90,20 @@ async fn run_domain_analysis(app: AppHandle, url: String) -> Result<analyzer::Do
     analysis_queue::enqueue_manual(app, url).await
 }
 
+/// Кнопка «Стоп»: запрос отмены долгой операции по имени (константы cancel::*,
+/// парные фронтовые — src/ops.ts). Для анализа, помимо флага (его подхватывают
+/// контрольные точки analyzer::analyze_domain), снимаются ждущие manual-джобы
+/// очереди — иначе отменённый запрос продолжил бы ждать своей очереди и
+/// ответил бы фронту много позже нажатия.
+#[tauri::command]
+fn cancel_operation(name: String) -> Result<(), String> {
+    cancel::cancel(&name);
+    if name == cancel::SITE_ANALYSIS {
+        analysis_queue::cancel_manual_queued();
+    }
+    Ok(())
+}
+
 /// Скрипт подбора рабочего DNS (отдельная кнопка «Подбор рабочего DNS»):
 /// перебирает doh-services.txt, резолвит домен через каждый сервис и
 /// классифицирует ответы — кто проксирует (рабочий DNS), кто отдаёт прямые
@@ -96,9 +111,12 @@ async fn run_domain_analysis(app: AppHandle, url: String) -> Result<analyzer::Do
 /// Никаких проб страницы и очереди анализа — только DoH-опрос.
 #[tauri::command]
 async fn pick_dns(url: String) -> Result<dns_pick::DnsPickOutcome, String> {
-    tauri::async_runtime::spawn_blocking(move || dns_pick::run_pick(&url))
-        .await
-        .unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
+    tauri::async_runtime::spawn_blocking(move || {
+        cancel::reset(cancel::DNS_PICK);
+        dns_pick::run_pick(&url)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
 }
 
 /// Массовый анализ списка «Ошибки сети»: вся пачка в ОДНОМ окне без обхода
@@ -131,6 +149,7 @@ async fn test_profile(app: AppHandle, profile_name: String, url: String, game_fi
     tauri::async_runtime::spawn_blocking(move || {
         // Тест профиля сам стартует/глушит winws: очередь анализа на это
         // время ставится на паузу (иначе авто-анализ перемешал бы окна).
+        cancel::reset(cancel::PROFILE_TEST);
         let _guard = analysis_queue::begin_external()?;
         testing::test_single_profile(app, &profile_name, &url, game_filter)
     }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
@@ -140,6 +159,7 @@ async fn test_profile(app: AppHandle, profile_name: String, url: String, game_fi
 async fn run_diagnostics(app: AppHandle, url: String, game_filter: bool) -> Result<diagnostics::DiagnosticsReport, String> {
     tauri::async_runtime::spawn_blocking(move || {
         // Диагностика сама рулит обходом — пауза очереди анализа на её время.
+        cancel::reset(cancel::DIAGNOSTICS);
         let _guard = analysis_queue::begin_external()?;
         diagnostics::run_diagnostics(app, url, game_filter)
     }).await.unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
@@ -254,6 +274,7 @@ fn main() {
             stop_bypass,
             check_status,
             run_domain_analysis,
+            cancel_operation,
             run_mass_analysis,
             pick_dns,
             apply_solution,

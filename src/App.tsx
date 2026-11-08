@@ -62,6 +62,10 @@ export default function App() {
   const [testingLog, setTestingLog] = useState<LogEntry[]>([]);
   const [testingUrl, setTestingUrl] = useState("youtube.com");
   const [testingIsTesting, setTestingIsTesting] = useState(false);
+  // Какая долгая операция идёт прямо сейчас (имена — src/ops.ts). Одновременно
+  // одна: isTesting глобален. Нужно вкладкам, чтобы показать кнопку «Стоп»
+  // ровно у запущенной операции; жизнь activeOp — в runOp (ops.ts).
+  const [activeOp, setActiveOp] = useState<string | null>(null);
   // Решение последнего анализа (кнопка «Починить сайт»). null = анализа ещё
   // не было / решение неприменимо. Живёт здесь же, чтобы переживать смену вкладки.
   const [siteSolution, setSiteSolution] = useState<SiteSolution | null>(null);
@@ -273,6 +277,8 @@ export default function App() {
             setIsTesting={setTestingIsTesting}
             solution={siteSolution}
             setSolution={setSiteSolution}
+            activeOp={activeOp}
+            setActiveOp={setActiveOp}
           />
         )}
         {activeTab === "profiles" && (
@@ -286,6 +292,8 @@ export default function App() {
             setUrl={setTestingUrl}
             isTesting={testingIsTesting}
             setIsTesting={setTestingIsTesting}
+            activeOp={activeOp}
+            setActiveOp={setActiveOp}
           />
         )}
         {activeTab === "settings" && <SettingsTab />}
