@@ -18,6 +18,7 @@ use crate::cancel;
 use crate::ip_probe;
 use crate::analyzer_ip_report;
 use crate::ip_target;
+use crate::probe_budget::StageBudget;
 use crate::site_probe;
 use crate::site_solution;
 
@@ -174,14 +175,13 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<DomainAnalysisOutcome, 
     }
 }
 
-fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<DomainAnalysisOutcome, String> {
-    let target_url = ip_target::target_url_of(url);
-
-    // Тайминги этапов: пользователь видит, где анализ проводит время,
-    // а мы — где его стоит ускорять (логирование до/после оптимизаций).
-    let mut timings: Vec<(&'static str, std::time::Duration)> = Vec::new();
-    let t_total = std::time::Instant::now();
-
+/// Chrome-этап анализа: открыть страницу в headless-браузере, собрать все
+/// домены, которые сайт реально запрашивает (CDN, API, скрипты, шрифты), и
+/// домены, упавшие прямо в браузере. Вынесен целиком в отдельную функцию,
+/// чтобы жить в собственном потоке под жёстким бюджетом (см. analyze_domain):
+/// в прогонах 09.11.26 браузер не отдавал НИ ОДНОГО сетевого события и мог
+/// блокировать ~35 с на navigate_to, съедая весь анализ.
+fn analyze_chrome_stage(target_url: String) -> Result<(Vec<String>, HashSet<String>), String> {
     // Используем НОВЫЙ headless-режим (--headless=new). В отличие от старого
     // --headless, в новом режиме Chrome не спавнит отдельные консольные дочерние
     // процессы (renderer/GPU/crashpad), поэтому чёрное консольное окно вообще
@@ -286,7 +286,6 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
 
     let _ = tab.navigate_to(&target_url);
 
-    let t_chrome = std::time::Instant::now();
     // Универсальное ожидание по «network idle»: ждём, пока новые запросы перестанут
     // появляться (окно тишины IDLE_WINDOW), с общим потолком MAX_WAIT. Это ловит
     // поздние домены SPA / lazy-load / редиректов для любого сайта, а не фиксированные 15 с.
@@ -321,18 +320,56 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         hide_stop.store(true, Ordering::Relaxed);
         let _ = hide_handle.join();
     }
-    timings.push(("chrome: загрузка страницы (network idle)", t_chrome.elapsed()));
 
-    // Контрольная точка «Стоп» — ПЕРВАЯ возможная: строго после остановки
-    // потока скрытия окон (ранний выход до этого оставил бы его крутиться).
+    let mut discovered: Vec<String> =
+        discovered_domains.lock().unwrap().iter().cloned().collect();
+    discovered.sort();
+    let browser_failed_set: HashSet<String> =
+        browser_failed.lock().unwrap().iter().cloned().collect();
+    Ok((discovered, browser_failed_set))
+}
+
+fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<DomainAnalysisOutcome, String> {
+    let target_url = ip_target::target_url_of(url);
+
+    // Тайминги этапов: пользователь видит, где анализ проводит время,
+    // а мы — где его стоит ускорять (логирование до/после оптимизаций).
+    let mut timings: Vec<(&'static str, std::time::Duration)> = Vec::new();
+    let t_total = std::time::Instant::now();
+
+    // Chrome-этап — под жёстким бюджетом: запуск/навигация/idle-ожидание
+    // живут в отдельном потоке, результат ждём recv_timeout. Таймаут →
+    // продолжаем с пустым списком (домены вкладки не собраны — это честно
+    // отражено в отчёте как пустой discovered); брошенный поток сам дошлёт
+    // idle-ожидание и умрёт вместе с Browser. 10 с хватает с запасом: старт
+    // Chrome ~3-5 с + выход idle-цикла по MIN_WAIT 4 с, когда событий нет.
+    const CHROME_BUDGET: Duration = Duration::from_secs(10);
+    let t_chrome = std::time::Instant::now();
+    let (chrome_tx, chrome_rx) = std::sync::mpsc::channel();
+    let chrome_target = target_url.clone();
+    thread::spawn(move || {
+        let _ = chrome_tx.send(analyze_chrome_stage(chrome_target));
+    });
+    let (discovered, browser_failed_set) = match chrome_rx.recv_timeout(CHROME_BUDGET) {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return Err(e), // Chrome не запустился — честная ошибка анализа
+        Err(_) => {
+            crate::events::app_log(
+                app,
+                format!(
+                    "[Анализ] браузер не уложился в {} с — этап пропущен, домены вкладки не собраны",
+                    CHROME_BUDGET.as_secs()
+                ),
+            );
+            (Vec::new(), HashSet::new())
+        }
+    };
+    // Метка в теминге держится вразумительной с константой CHROME_BUDGET выше.
+    timings.push(("chrome: загрузка страницы (бюджет 10 с)", t_chrome.elapsed()));
+
+    // Контрольная точка «Стоп» — сразу после Chrome-этапа.
     ensure_active()?;
 
-    let discovered: Vec<String> = {
-        let mut v: Vec<String> = discovered_domains.lock().unwrap().iter().cloned().collect();
-        v.sort();
-        v
-    };
-    let browser_failed_set: HashSet<String> = browser_failed.lock().unwrap().iter().cloned().collect();
     let had_browser_failures = !browser_failed_set.is_empty();
 
     // === Этап проверки доступности ===
@@ -369,6 +406,19 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
 
     let mut bypass_toggled = false;
     let mut restore_note: Option<String> = None;
+
+    // Общий бюджет чистого окна на ВСЕ фактовые пробы (обе ветки ниже):
+    // раньше переборы DoH-сервисов и IP жили своими внутренними таймаутами и
+    // на сайтах с тихим дропом TLS горели 300+ с (инцидент 09.11.26). Бюджет
+    // кончился → пробы останавливаются, отчёт строится из собранного с
+    // честными пометками «не проверено: не хватило бюджета». Кнопка «Стоп»
+    // останавливает переборы немедленно (без ожидания контрольной точки).
+    // 20 с — с прицелом на худший случай всего анализа ≤ ~40 с: Chrome ≤10 +
+    // окно 20 (+ перерасход одного этапа ≤9 с по его внутреннему дедлайну) +
+    // восстановление обхода ~2 + контроль с обходом ≤6.
+    const WINDOW_BUDGET: Duration = Duration::from_secs(20);
+    let window_budget =
+        StageBudget::new_with_cancel(WINDOW_BUDGET, || cancel::is_cancelled(cancel::SITE_ANALYSIS));
 
     // === Окно «обход выключен» ===
     // Все фактовые пробы (диагностика главного домена, подмена DNS, разбор блока)
@@ -422,7 +472,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         ensure_active()?;
         let t_probe = std::time::Instant::now();
         let main_doh_answers = site_probe::resolve_doh_answers(&main_host);
-        let main_probe = site_probe::probe_domain_with_doh(&main_host, &main_doh_answers);
+        let main_probe = site_probe::probe_domain_with_doh(&main_host, &main_doh_answers, window_budget);
         timings.push(("probe_domain (диагностика главного домена)", t_probe.elapsed()));
 
         // Арбитраж (кейс eu.aptabase.com): если сайт доказанно открывается без
@@ -447,7 +497,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         let main_dns_sub = if main_probe.verdict.site_broken()
             && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
         {
-            site_probe::dns_substitutions_from(&main_host, &main_doh_answers, true)
+            site_probe::dns_substitutions_from(&main_host, &main_doh_answers, true, window_budget)
         } else {
             Vec::new()
         };
@@ -462,7 +512,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         let block_scan = if main_probe.verdict.site_broken()
             && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
         {
-            Some(crate::ip_range_scan::block_diagnose(app, &main_host))
+            Some(crate::ip_range_scan::block_diagnose(app, &main_host, window_budget))
         } else {
             None
         };
@@ -476,7 +526,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         // 9 с дедлайна DoH на каждый (до 45 с на пятерку).
         ensure_active()?;
         let t_dnsfail = std::time::Instant::now();
-        let dns_fail_sub = dns_fail_sub_parallel(&classification.dns_fail, 5);
+        let dns_fail_sub = dns_fail_sub_parallel(&classification.dns_fail, 5, window_budget);
         timings.push(("dns_fail_sub (фоновые DoH-проверки)", t_dnsfail.elapsed()));
 
         timings.push((
@@ -517,12 +567,12 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         ensure_active()?;
         let t_probe = std::time::Instant::now();
         let main_doh_answers = site_probe::resolve_doh_answers(&main_host);
-        let main_probe = site_probe::probe_domain_with_doh(&main_host, &main_doh_answers);
+        let main_probe = site_probe::probe_domain_with_doh(&main_host, &main_doh_answers, window_budget);
         timings.push(("probe_domain (диагностика главного домена)", t_probe.elapsed()));
         let main_dns_sub = if main_probe.verdict.site_broken()
             && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
         {
-            site_probe::dns_substitutions_from(&main_host, &main_doh_answers, true)
+            site_probe::dns_substitutions_from(&main_host, &main_doh_answers, true, window_budget)
         } else {
             Vec::new()
         };
@@ -531,7 +581,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         let block_scan = if main_probe.verdict.site_broken()
             && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
         {
-            Some(crate::ip_range_scan::block_diagnose(app, &main_host))
+            Some(crate::ip_range_scan::block_diagnose(app, &main_host, window_budget))
         } else {
             None
         };
@@ -539,7 +589,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
 
         ensure_active()?;
         let t_dnsfail = std::time::Instant::now();
-        let dns_fail_sub = dns_fail_sub_parallel(&classification.dns_fail, 5);
+        let dns_fail_sub = dns_fail_sub_parallel(&classification.dns_fail, 5, window_budget);
         timings.push(("dns_fail_sub (фоновые DoH-проверки)", t_dnsfail.elapsed()));
 
         (classification, Some(main_probe), main_dns_sub, dns_fail_sub, block_scan, None)
@@ -617,10 +667,12 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
 
 /// Подмена DNS для доменов из списка «не резолвится» (до `limit`): проверка
 /// параллельна — последовательный `.map` тянул дедлайн DoH (~9 с) на каждый
-/// домен (до 45 с на пятерку). Порядок результатов — исходный.
+/// домен (до 45 с на пятерку). Порядок результатов — исходный. Неуспевшие
+/// по бюджету/отмене домены опускаются (их подмена и так не проверена).
 pub(crate) fn dns_fail_sub_parallel(
     hosts: &[String],
     limit: usize,
+    budget: StageBudget,
 ) -> Vec<(String, Vec<site_probe::DnsSubstitution>)> {
     use std::sync::mpsc;
     let targets: Vec<String> = hosts.iter().take(limit).cloned().collect();
@@ -633,16 +685,25 @@ pub(crate) fn dns_fail_sub_parallel(
         let tx = tx.clone();
         let h = h.clone();
         std::thread::spawn(move || {
-            let subs = site_probe::check_dns_substitution(&h, false);
+            let subs = site_probe::check_dns_substitution(&h, false, budget);
             let _ = tx.send((idx, (h, subs)));
         });
     }
     drop(tx);
     let mut slots: Vec<Option<(String, Vec<site_probe::DnsSubstitution>)>> =
         (0..targets.len()).map(|_| None).collect();
+    let deadline = std::time::Instant::now() + budget.left();
     for _ in 0..targets.len() {
-        if let Ok((idx, item)) = rx.recv() {
-            slots[idx] = Some(item);
+        if budget.stopped() {
+            break;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match rx.recv_timeout(deadline - now) {
+            Ok((idx, item)) => slots[idx] = Some(item),
+            Err(_) => break,
         }
     }
     slots.into_iter().flatten().collect()

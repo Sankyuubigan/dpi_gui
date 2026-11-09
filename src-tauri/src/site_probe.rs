@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 
@@ -15,6 +15,7 @@ use crate::diagnostics_probe::{
     body_looks_like_blockpage, body_looks_region_restricted, classify_reqwest_err, dns_multi,
     is_stub_ip, resolve_doh_all, tcp_connect, DnsInfo, DohAnswers, HttpResult,
 };
+use crate::probe_budget::StageBudget;
 use crate::site_verdict::{
     classify, explain, hosts_lines, http_result_note, refine_with_isp_redirect, CauseContext,
     ProbeFacts, Verdict,
@@ -548,7 +549,7 @@ impl ProbeOutcome {
 /// Пробует TCP:443 по списку адресов и делает HTTPS-запрос по каждому
 /// ответившему — до первого открывшего сайт. Адреса-заглушки (0.0.0.0 и т.п.)
 /// пропускаются до счётчика `MAX_IPS`: пробовать их — ложь в отчёте.
-fn probe_host_at(host: &str, ips: &[String]) -> ProbeOutcome {
+fn probe_host_at(host: &str, ips: &[String], budget: StageBudget) -> ProbeOutcome {
     let mut tcp_only: Option<(String, HttpResult)> = None;
     let mut any_reset = false;
 
@@ -560,34 +561,39 @@ fn probe_host_at(host: &str, ips: &[String]) -> ProbeOutcome {
         .take(MAX_IPS)
         .collect();
 
-    // TCP-пробы параллельно: последовательный скан мёртвых адресов съедал
-    // до 3.5 с на каждый (worst ~10 с на канал). HTTP-пробы — по-прежнему
-    // последовательно до первого Ok: порядок «первого рабочего IP» сохранён.
+    // TCP- и HTTP-пробы — параллельно: раньше HTTP шёл по одному IP (до 3 ×
+    // 6 с на канал; сайт с дропом TLS горел полные 6 с на каждый адрес —
+    // инцидент 09.11.26). Порядок выбора «первого рабочего IP» сохранён.
     let tcp = tcp_scan_parallel(&candidates);
-    for (ip, res) in candidates.iter().zip(tcp.iter()) {
-        match res.as_str() {
-            "RST/REFUSED" => {
-                any_reset = true;
-            }
-            "Success" => {
-                let r = http_via_ip(host, *ip, 443);
-                // Unverified — Open-эквивалент по транспорту (анализ-путь):
-                // адрес реально отдаёт живую страницу, но доступность после
-                // входа не подтверждена — заметка скажет об этом честно.
-                if matches!(r, HttpResult::Ok(_) | HttpResult::Unverified) {
-                    return ProbeOutcome {
-                        tcp_ok: true,
-                        ip: Some(ip.to_string()),
-                        note: format!("HTTPS через {}: {}", ip, substitution_note(&r)),
-                        http: Some(r),
-                        any_reset,
-                    };
-                }
-                if tcp_only.is_none() {
-                    tcp_only = Some((ip.to_string(), r));
-                }
-            }
-            _ => {}
+    for res in tcp.iter() {
+        if res == "RST/REFUSED" {
+            any_reset = true;
+        }
+    }
+    let success: Vec<IpAddr> = candidates
+        .iter()
+        .copied()
+        .zip(tcp.iter())
+        .filter(|(_, res)| res.as_str() == "Success")
+        .map(|(ip, _)| ip)
+        .collect();
+    let http_slots = http_probe_slots_parallel(host, &success, budget);
+    for (ip, slot) in success.iter().copied().zip(http_slots) {
+        // Unverified — Open-эквивалент по транспорту (анализ-путь): адрес
+        // реально отдаёт живую страницу, но доступность после входа не
+        // подтверждена — заметка скажет об этом честно.
+        let Some(r) = slot else { continue }; // бюджет кончился — адрес не проверен
+        if matches!(r, HttpResult::Ok(_) | HttpResult::Unverified) {
+            return ProbeOutcome {
+                tcp_ok: true,
+                ip: Some(ip.to_string()),
+                note: format!("HTTPS через {}: {}", ip, substitution_note(&r)),
+                http: Some(r),
+                any_reset,
+            };
+        }
+        if tcp_only.is_none() {
+            tcp_only = Some((ip.to_string(), r));
         }
     }
 
@@ -632,6 +638,45 @@ pub fn tcp_scan_parallel(ips: &[IpAddr]) -> Vec<String> {
         .collect()
 }
 
+/// Параллельные HTTPS-пробы по списку адресов: поток на адрес, сбор по
+/// recv_timeout с дедлайном из бюджета. Результат в порядке входных адресов;
+/// неуспевшие (исчерпан бюджет / нажата «Стоп») — `None`. Висящие потоки не
+/// join-им (прецедент `run_with_timeout`): клиент ограничен 6-секундным
+/// таймаутом и завершится сам, без следа в отчёте.
+fn http_probe_slots_parallel(
+    host: &str,
+    ips: &[IpAddr],
+    budget: StageBudget,
+) -> Vec<Option<HttpResult>> {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel::<(usize, HttpResult)>();
+    for (idx, ip) in ips.iter().enumerate() {
+        let tx = tx.clone();
+        let host = host.to_string();
+        let ip = *ip;
+        std::thread::spawn(move || {
+            let _ = tx.send((idx, http_via_ip(&host, ip, 443)));
+        });
+    }
+    drop(tx);
+    let mut slots: Vec<Option<HttpResult>> = (0..ips.len()).map(|_| None).collect();
+    let deadline = Instant::now() + budget.left();
+    for _ in 0..ips.len() {
+        if budget.stopped() {
+            break;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match rx.recv_timeout(deadline - now) {
+            Ok((idx, res)) => slots[idx] = Some(res),
+            Err(_) => break,
+        }
+    }
+    slots
+}
+
 /// Обёртка для интеграционных тестов: одна DoH-загрузка + проба. В проде не
 /// используется — `analyzer.rs` зовёт `resolve_doh_answers` + `probe_domain_with_doh`
 /// ради SSOT одной загрузки, поэтому функция живёт только под cfg(test)
@@ -639,7 +684,7 @@ pub fn tcp_scan_parallel(ips: &[IpAddr]) -> Vec<String> {
 #[cfg(test)]
 pub fn probe_domain(host: &str) -> DomainProbe {
     let doh_answers = resolve_doh_all(host);
-    probe_domain_with_doh(host, &doh_answers)
+    probe_domain_with_doh(host, &doh_answers, StageBudget::new(Duration::from_secs(60)))
 }
 
 /// Единая точка загрузки DoH-ответов для анализа (дверь модуля): одна
@@ -651,7 +696,14 @@ pub fn resolve_doh_answers(host: &str) -> DohAnswers {
 /// Вариант [`probe_domain`] с уже загруженными DoH-ответами: одна загрузка
 /// на анализ расходуется и на пробу домена, и на «подмену DNS» (SSOT,
 /// минус лишний DoH-проход с его 9-секундным дедлайном).
-pub fn probe_domain_with_doh(host: &str, doh_answers: &DohAnswers) -> DomainProbe {
+///
+/// `budget` — остаток общего бюджета чистого окна: по исчерпанию переборы
+/// IP прекращаются, непроверенное помечается честно (см. [`StageBudget`]).
+pub fn probe_domain_with_doh(
+    host: &str,
+    doh_answers: &DohAnswers,
+    budget: StageBudget,
+) -> DomainProbe {
     let dns = dns_multi(host);
 
     // Адреса из защищённого канала. Это единственный источник проверенных
@@ -681,14 +733,14 @@ pub fn probe_domain_with_doh(host: &str, doh_answers: &DohAnswers) -> DomainProb
     let doh_ip_services = doh_answers.services_map(&doh_ips);
 
     // Проба по адресам из системного DNS.
-    let sys_probe = probe_host_at(host, &primary_ips);
+    let sys_probe = probe_host_at(host, &primary_ips, budget);
 
     // Проба по адресам из DoH. Именно она ломает ложный вывод «сертификат не
     // совпал»: на подменённом адресе лежит чужой сервер, на проверенном — сайт.
     let doh_probe = if doh_ips.is_empty() {
         ProbeOutcome::dead("DoH не вернул адресов, отличных от системного DNS".to_string())
     } else {
-        probe_host_at(host, &doh_ips)
+        probe_host_at(host, &doh_ips, budget)
     };
 
     // GeoDNS-арбитраж «пересечений нет» (кейс cdn-zcode.z.ai 28.10.26):
@@ -705,7 +757,7 @@ pub fn probe_domain_with_doh(host: &str, doh_answers: &DohAnswers) -> DomainProb
     } else {
         let www_dns = dns_multi(&www_host);
         let ips = dedup_ips(www_dns.system.iter().copied());
-        let w = probe_host_at(&www_host, &ips);
+        let w = probe_host_at(&www_host, &ips, budget);
         let ok = matches!(w.http, Some(HttpResult::Ok(_)));
         (ips, ok.then(|| format!("https://{}/", www_host)), ok)
     };
@@ -948,62 +1000,175 @@ pub fn bypass_on_control_probe(
 ///
 /// * `probe_http` — делать ли полную HTTPS-пробу первого рабочего IP
 ///   (для главного домена да/для долгого перебора — нет).
-pub fn check_dns_substitution(host: &str, probe_http: bool) -> Vec<DnsSubstitution> {
+pub fn check_dns_substitution(
+    host: &str,
+    probe_http: bool,
+    budget: StageBudget,
+) -> Vec<DnsSubstitution> {
     let answers = resolve_doh_all(host);
-    dns_substitutions_from(host, &answers, probe_http)
+    dns_substitutions_from(host, &answers, probe_http, budget)
 }
 
-/// Разбор «подмены DNS» от уже загруженных DoH-ответов: чистая функция без
-/// сети. Переиспользуется с пробой главного домена (одна загрузка на анализ).
+/// Разбор «подмены DNS» от уже загруженных DoH-ответов. Сервисы разбираются
+/// ПАРАЛЛЕЛЬНО (поток на сервис): последовательный перебор на сайтах с дропом
+/// TLS жёг 6 с × IP на каждый сервис — до 300+ с суммарно (инцидент 09.11.26).
+/// Порядок результатов — исходный порядок `answers.answers`; сервисы, не
+/// уложившиеся в бюджет, получают честную пометку «не проверено».
 pub fn dns_substitutions_from(
     host: &str,
     answers: &DohAnswers,
     probe_http: bool,
+    budget: StageBudget,
 ) -> Vec<DnsSubstitution> {
-    let mut out = Vec::new();
-    for a in &answers.answers {
-        // Собственный адрес сервиса (SNI-прокси) — не решение: проба через него
-        // может дать 200, а сайт в браузере по нему не откроется.
-        let only_gateway = !a.ips.is_empty()
-            && a.ips.iter().all(|ip| answers.gateway_owner(ip).is_some());
-        if only_gateway {
-            out.push(DnsSubstitution {
-                service: a.service.clone(),
-                resolved: vec![],
-                working_ip: None,
-                http_note: format!(
-                    "сервис отдал собственный адрес-шлюз ({}) — это не адрес сайта",
-                    a.ips
-                        .iter()
-                        .take(3)
-                        .map(|i| i.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                http_ok: false,
-            });
-            continue;
-        }
-        let real_ips: Vec<IpAddr> = a
-            .ips
-            .iter()
-            .copied()
-            .filter(|ip| answers.gateway_owner(ip).is_none())
-            .collect();
-        out.push(summarize_substitution(host, &a.service, &real_ips, a.error.clone(), probe_http));
+    use std::sync::mpsc;
+
+    enum Job {
+        /// Собственный адрес сервиса (SNI-прокси) — не решение: проба через
+        /// него может дать 200, а сайт в браузере по нему не откроется.
+        /// Чистый вердикт без сети, считается сразу.
+        Gateway(DnsSubstitution),
+        Real {
+            service: String,
+            real_ips: Vec<IpAddr>,
+            error: Option<String>,
+        },
     }
-    out
+
+    let jobs: Vec<Job> = answers
+        .answers
+        .iter()
+        .map(|a| {
+            let only_gateway = !a.ips.is_empty()
+                && a.ips.iter().all(|ip| answers.gateway_owner(ip).is_some());
+            if only_gateway {
+                Job::Gateway(DnsSubstitution {
+                    service: a.service.clone(),
+                    resolved: vec![],
+                    working_ip: None,
+                    http_note: format!(
+                        "сервис отдал собственный адрес-шлюз ({}) — это не адрес сайта",
+                        a.ips
+                            .iter()
+                            .take(3)
+                            .map(|i| i.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    http_ok: false,
+                })
+            } else {
+                let real_ips: Vec<IpAddr> = a
+                    .ips
+                    .iter()
+                    .copied()
+                    .filter(|ip| answers.gateway_owner(ip).is_none())
+                    .collect();
+                Job::Real {
+                    service: a.service.clone(),
+                    real_ips,
+                    error: a.error.clone(),
+                }
+            }
+        })
+        .collect();
+
+    if budget.stopped() || jobs.is_empty() {
+        // Бюджета нет: каждому «настоящему» сервису — честная пометка
+        // (шлюз-only вердикты чистые, они не сетевые).
+        return jobs
+            .into_iter()
+            .map(|job| match job {
+                Job::Gateway(sub) => sub,
+                Job::Real { service, real_ips, .. } => DnsSubstitution {
+                    service,
+                    resolved: real_ips
+                        .iter()
+                        .filter(|ip| !is_stub_ip(ip))
+                        .take(4)
+                        .map(|i| i.to_string())
+                        .collect(),
+                    working_ip: None,
+                    http_note: "не проверено: не хватило бюджета окна".to_string(),
+                    http_ok: false,
+                },
+            })
+            .collect();
+    }
+
+    let (tx, rx) = mpsc::channel::<(usize, DnsSubstitution)>();
+    let mut spawns = 0usize;
+    for (idx, job) in jobs.iter().enumerate() {
+        let Job::Real {
+            service,
+            real_ips,
+            error,
+        } = job
+        else {
+            continue;
+        };
+        let tx = tx.clone();
+        let host = host.to_string();
+        let service = service.clone();
+        let real_ips = real_ips.clone();
+        let error = error.clone();
+        let budget = budget; // Copy
+        spawns += 1;
+        std::thread::spawn(move || {
+            let sub = summarize_substitution(&host, &service, &real_ips, error, probe_http, budget);
+            let _ = tx.send((idx, sub));
+        });
+    }
+    drop(tx);
+
+    let mut slots: Vec<Option<DnsSubstitution>> = (0..jobs.len()).map(|_| None).collect();
+    let deadline = Instant::now() + budget.left();
+    for _ in 0..spawns {
+        if budget.stopped() {
+            break;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match rx.recv_timeout(deadline - now) {
+            Ok((idx, sub)) => slots[idx] = Some(sub),
+            Err(_) => break,
+        }
+    }
+
+    jobs.into_iter()
+        .zip(slots)
+        .map(|(job, slot)| match slot {
+            Some(sub) => sub,
+            None => match job {
+                Job::Gateway(sub) => sub,
+                Job::Real { service, real_ips, .. } => DnsSubstitution {
+                    service,
+                    resolved: real_ips
+                        .iter()
+                        .filter(|ip| !is_stub_ip(ip))
+                        .take(4)
+                        .map(|i| i.to_string())
+                        .collect(),
+                    working_ip: None,
+                    http_note: "не проверено: не хватило бюджета окна".to_string(),
+                    http_ok: false,
+                },
+            },
+        })
+        .collect()
 }
 
-/// Сведение одного DoH-ответа в строку отчёта. Чистая функция относительно
-/// сети: те же входные данные дают тот же текст, поэтому её можно покрыть
-/// юнит-тестами без обращения к сети.
+/// Сведение одного DoH-ответа в строку отчёта. TCP-скан и HTTPS-пробы живых
+/// адресов — параллельные (порядок «первого рабочего» — исходный); по
+/// исчерпанию бюджета непроверенные адреса честно пропускаются.
 fn summarize_substitution(
     host: &str,
     service: &str,
     ips: &[IpAddr],
     error: Option<String>,
     probe_http: bool,
+    budget: StageBudget,
 ) -> DnsSubstitution {
     if let Some(e) = error {
         return DnsSubstitution {
@@ -1021,11 +1186,10 @@ fn summarize_substitution(
         .take(4)
         .map(|i| i.to_string())
         .collect();
-    // TCP-живые адреса (без заглушек): HTTPS пробуем по КАЖДОМУ до первого
-    // открывшего сайт. Раньше проверялся только первый TCP-ответивший —
-    // и если им оказывалась заглушка/битый IP, отчёт врал «не помогла»,
-    // хотя следующий адрес сайт открывал (кейс openrouter.ai).
-    // TCP-скан параллельный, порядок живых адресов — исходный.
+    // TCP-живые адреса (без заглушек): HTTPS пробуем по КАЖДОМУ, а не только
+    // по первому TCP-ответившему — там могла быть заглушка/битый IP, и отчёт
+    // врал «не помогла», хотя следующий адрес сайт открывал (кейс
+    // openrouter.ai). TCP-скан и HTTPS — параллельные.
     let candidates: Vec<IpAddr> = ips
         .iter()
         .filter(|ip| !is_stub_ip(ip))
@@ -1033,12 +1197,13 @@ fn summarize_substitution(
         .copied()
         .collect();
     let tcp = tcp_scan_parallel(&candidates);
-    let mut live: Vec<IpAddr> = Vec::new();
-    for (ip, res) in candidates.iter().zip(tcp.iter()) {
-        if res == "Success" {
-            live.push(*ip);
-        }
-    }
+    let live: Vec<IpAddr> = candidates
+        .iter()
+        .copied()
+        .zip(tcp.iter())
+        .filter(|(_, res)| res.as_str() == "Success")
+        .map(|(ip, _)| ip)
+        .collect();
 
     let Some(first) = live.first().copied() else {
         return DnsSubstitution {
@@ -1063,32 +1228,36 @@ fn summarize_substitution(
         };
     }
 
+    let http_slots = http_probe_slots_parallel(host, &live, budget);
     let mut last_note = String::new();
-    for (n, ip) in live.iter().copied().enumerate() {
-        let http = http_via_ip(host, ip, 443);
+    for (ip, slot) in live.iter().copied().zip(http_slots) {
         // Unverified — Open-эквивалент по транспорту (анализ-путь): подмена
         // DNS сработала, но страница — оболочка (заметка substitution_note).
+        let Some(http) = slot else { continue }; // бюджет кончился — адрес не проверен
         if matches!(http, HttpResult::Ok(_) | HttpResult::Unverified) {
-            let mut note = format!("HTTPS через {}: {}", ip, substitution_note(&http));
-            if n > 0 {
-                note.push_str(&format!(" (перебрано адресов: {})", n + 1));
-            }
             return DnsSubstitution {
                 service: service.to_string(),
                 resolved: display,
                 working_ip: Some(ip.to_string()),
-                http_note: note,
+                http_note: format!("HTTPS через {}: {}", ip, substitution_note(&http)),
                 http_ok: true,
             };
         }
-        last_note = format!("HTTPS через {}: {}", ip, substitution_note(&http));
+        if last_note.is_empty() {
+            last_note = format!("HTTPS через {}: {}", ip, substitution_note(&http));
+        }
     }
 
     DnsSubstitution {
         service: service.to_string(),
         resolved: display,
         working_ip: Some(first.to_string()),
-        http_note: last_note,
+        http_note: if last_note.is_empty() {
+            // Все HTTPS-пробы не уложились в бюджет — не выдаём пустоту за факт.
+            "HTTPS не проверен: не хватило бюджета окна".to_string()
+        } else {
+            last_note
+        },
         http_ok: false,
     }
 }
@@ -1182,6 +1351,81 @@ pub fn probe_hosts_pins(host: &str, ips: &[String]) -> Result<Vec<HostsPin>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Параллельный разбор подмены DNS сохраняет исходный порядок сервисов
+    /// (поток на сервис, сбор по индексам) — инцидент 09.11.26.
+    #[test]
+    fn dns_substitutions_from_keeps_service_order() {
+        let answers = DohAnswers {
+            answers: vec![
+                crate::diagnostics_probe::DohAnswer {
+                    service: "aaa-first.test".into(),
+                    ips: vec!["127.0.0.1".parse().unwrap()],
+                    error: None,
+                },
+                crate::diagnostics_probe::DohAnswer {
+                    service: "bbb-second.test".into(),
+                    ips: vec!["127.0.0.2".parse().unwrap()],
+                    error: None,
+                },
+                crate::diagnostics_probe::DohAnswer {
+                    service: "ccc-third.test".into(),
+                    error: Some("таймаут".into()),
+                    ips: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        let subs = dns_substitutions_from(
+            "example.test",
+            &answers,
+            false,
+            StageBudget::new(Duration::from_secs(60)),
+        );
+        let names: Vec<&str> = subs.iter().map(|s| s.service.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["aaa-first.test", "bbb-second.test", "ccc-third.test"]
+        );
+    }
+
+    /// Исчерпанный бюджет: «настоящие» сервисы получают честную пометку
+    /// «не проверено», а чистый шлюз-only вердикт (он не сетевой) сохраняется.
+    #[test]
+    fn dns_substitutions_from_marks_budget_exhausted() {
+        let gw_ip: IpAddr = "203.0.113.1".parse().unwrap();
+        let answers = DohAnswers {
+            answers: vec![
+                crate::diagnostics_probe::DohAnswer {
+                    service: "gateway.test".into(),
+                    ips: vec![gw_ip],
+                    error: None,
+                },
+                crate::diagnostics_probe::DohAnswer {
+                    service: "real.test".into(),
+                    ips: vec!["203.0.113.10".parse().unwrap()],
+                    error: None,
+                },
+            ],
+            own_ips: vec![("gateway.test".to_string(), vec![gw_ip])],
+            ..Default::default()
+        };
+        // Бюджет, исчерпанный ДО старта разбора.
+        let dead = StageBudget::new(Duration::ZERO);
+        assert!(dead.stopped());
+        let subs = dns_substitutions_from("example.test", &answers, true, dead);
+
+        assert_eq!(subs.len(), 2);
+        // Шлюз-only: чистый вердикт без сети остаётся.
+        assert_eq!(subs[0].service, "gateway.test");
+        assert!(subs[0].http_note.contains("адрес-шлюз"));
+        // Настоящий сервис: никакой выдумки — только честная пометка.
+        assert_eq!(subs[1].service, "real.test");
+        assert_eq!(subs[1].working_ip, None);
+        assert!(!subs[1].http_ok);
+        assert!(subs[1].http_note.contains("не проверено"));
+        assert!(subs[1].http_note.contains("бюджета"));
+    }
 
     /// Детектор JS-оболочки: у SPA-оболочки видимого текста — десятки байт,
     /// у контентной страницы — сотни и больше (порог UNVERIFIED_MIN_VISIBLE;

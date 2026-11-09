@@ -37,6 +37,7 @@ mod browser_cookies;
 mod process_owner;
 mod analysis_queue;
 mod mass_analysis;
+mod probe_budget;
 
 use tauri::AppHandle;
 
@@ -282,6 +283,15 @@ fn main() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_about_updates::init())
+        // Лог уровня INFO — ПОСЛЕ инициализации плагинов: tauri-plugin-logs при
+        // init() сам ставит глобальный уровень DEBUG, и ранний
+        // set_max_level(Info) в main() перекрывался — вкладка «Логи» тонула в
+        // DEBUG-каше rustls/headless_chrome/tao (инцидент 09.11.26). Наши
+        // строки — INFO и выше.
+        .setup(|_app| {
+            log::set_max_level(log::LevelFilter::Info);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             init_app,
             get_config,

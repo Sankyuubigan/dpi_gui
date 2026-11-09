@@ -24,6 +24,7 @@ use tauri::AppHandle;
 
 use crate::diagnostics_probe::{classify_reqwest_err, run_with_timeout, HttpResult};
 use crate::ip_probe::app_log;
+use crate::probe_budget::StageBudget;
 
 /// «Родных» адресов домена достаточно проверить по первым нескольким.
 const NATIVE_PROBE_LIMIT: usize = 3;
@@ -596,7 +597,16 @@ fn describe_outcome(o: &HttpOutcome) -> String {
 
 /// Разбор блока главного домена: нейтральный DoH → пробы родных IP → вердикт.
 /// Скан CIDR-диапазонов запускается только если транспорт к родным IP умер.
-pub fn block_diagnose(app: &AppHandle, host: &str) -> BlockScanReport {
+///
+/// `budget` — остаток общего бюджета чистого окна анализа: скану достаётся
+/// `min(остаток, SCAN_BUDGET)`, по исчерпанию часть пула честно помечается
+/// непроверенной.
+pub fn block_diagnose(app: &AppHandle, host: &str, budget: StageBudget) -> BlockScanReport {
+    if budget.stopped() {
+        return BlockScanReport::NoPath {
+            why: "не проверено: не хватило бюджета окна".to_string(),
+        };
+    }
     let t0 = Instant::now();
     app_log(app, format!("[IPSCAN] разбор блока для {host}..."));
 
@@ -669,7 +679,7 @@ pub fn block_diagnose(app: &AppHandle, host: &str) -> BlockScanReport {
                 "[IPSCAN] родные IP не отвечают ({last_err}) — проверяю принадлежность Cloudflare"
             ),
         );
-        return decide_range_scan(app, host, &native_ips);
+        return decide_range_scan(app, host, &native_ips, budget);
     }
 
     let mut working: Option<u16> = None;
@@ -749,7 +759,7 @@ pub fn block_diagnose(app: &AppHandle, host: &str) -> BlockScanReport {
                 ),
             );
         }
-        return decide_range_scan(app, host, &native_ips);
+        return decide_range_scan(app, host, &native_ips, budget);
     }
     BlockScanReport::NoPath { why: "не удалось классифицировать ответ родных IP".to_string() }
 }
@@ -764,7 +774,12 @@ pub fn block_diagnose(app: &AppHandle, host: &str) -> BlockScanReport {
 /// диапазонов CF, для всех остальных — СОБСТВЕННАЯ сеть сайта (соседние /24
 /// вокруг его родных адресов). Если список CF не скачался, принадлежность
 /// сайта неизвестна — но скан собственной сети честен и без списка.
-fn decide_range_scan(app: &AppHandle, host: &str, native_ips: &[IpAddr]) -> BlockScanReport {
+fn decide_range_scan(
+    app: &AppHandle,
+    host: &str,
+    native_ips: &[IpAddr],
+    budget: StageBudget,
+) -> BlockScanReport {
     // Внешний дедлайн получения списка CIDR: 3 источника по FETCH_TIMEOUT
     // (плюс build клиента) + запас; иначе зависший запрос к raw.githubusercontent
     // держит разбор вечнее воркера (см. инцидент 03.11.26).
@@ -801,13 +816,14 @@ fn decide_range_scan(app: &AppHandle, host: &str, native_ips: &[IpAddr]) -> Bloc
                     &parsed,
                     ScanSource::Cloudflare { ranges_count },
                     PER_CIDR,
+                    budget,
                 ))
             } else {
                 app_log(
                     app,
                     "[IPSCAN] родные IP вне диапазонов Cloudflare — скан соседних /24 сети сайта",
                 );
-                neighborhood_scan(app, host, native_ips, None)
+                neighborhood_scan(app, host, native_ips, None, budget)
             }
         }
         Err(e) => {
@@ -815,7 +831,7 @@ fn decide_range_scan(app: &AppHandle, host: &str, native_ips: &[IpAddr]) -> Bloc
                 app,
                 format!("[IPSCAN] список CIDR не получен ({e}) — скан соседних /24 сети сайта"),
             );
-            neighborhood_scan(app, host, native_ips, Some(e))
+            neighborhood_scan(app, host, native_ips, Some(e), budget)
         }
     }
 }
@@ -827,6 +843,7 @@ fn neighborhood_scan(
     host: &str,
     native_ips: &[IpAddr],
     cf_note: Option<String>,
+    budget: StageBudget,
 ) -> BlockScanReport {
     let ranges = neighborhood_ranges(native_ips);
     if ranges.is_empty() {
@@ -841,6 +858,7 @@ fn neighborhood_scan(
         &ranges,
         ScanSource::Neighborhood { ranges: range_strs, cf_note },
         NEIGHBORHOOD_PER_RANGE,
+        budget,
     ))
 }
 
@@ -850,15 +868,17 @@ fn scan_ranges(
     parsed: &[Cidr],
     source: ScanSource,
     per_range: usize,
+    budget: StageBudget,
 ) -> RangeScanOutcome {
     let t0 = Instant::now();
     app_log(app, format!("[IPSCAN] CIDR: {} шт", parsed.len()));
 
     let mut seed = now_seed();
     let pool = sample_pool(parsed, per_range, &mut seed);
+    let scan_budget = budget.left().min(SCAN_BUDGET);
     app_log(
         app,
-        format!("[IPSCAN] пул: {} IP (по {per_range} из каждого), бюджет {} сек", pool.len(), SCAN_BUDGET.as_secs()),
+        format!("[IPSCAN] пул: {} IP (по {per_range} из каждого), бюджет {} сек", pool.len(), scan_budget.as_secs()),
     );
 
     let mut res = RangeScanOutcome {
@@ -871,7 +891,7 @@ fn scan_ranges(
         other_status_count: 0,
         working: Vec::new(),
     };
-    let deadline = Instant::now() + SCAN_BUDGET;
+    let deadline = Instant::now() + scan_budget;
     // Внешний дедлайн одной пробы пула (send 6 с + запас на build/OS-клин;
     // инцидент 03.11.26: проба без внешнего дедлайна заклинила воркер).
     let probe_ceiling = (PROBE_TIMEOUT + Duration::from_secs(2)).as_millis() as u64;

@@ -496,9 +496,10 @@ pub fn resolve_via_doh(domain: &str, doh_host: &str) -> Result<Vec<IpAddr>, Stri
     let svc = doh_host.to_string();
     let boot = bootstrap.clone();
     // Бюджет растёт с числом бутстрап-IP: на каждый — попытка (клиент 5 с)
-    // плюс запас. Один IP → 8 с, как раньше; перебор 7 адресов (eu.geohide.ru)
-    // не обрезается общим потолком раньше времени.
-    let wire_ms = 3000 + 5000 * bootstrap.len() as u64;
+    // плюс запас, но общий потолок 8 с: коллектор resolve_doh_all всё равно
+    // ждёт только 9 с, а зомби-поток с TLS-ретраями после него срал в лог
+    // минутами (инцидент 09.11.26: geohide с 7 бутстрапами = 38 с).
+    let wire_ms = (3000 + 5000 * bootstrap.len() as u64).min(8000);
     let wire = run_with_timeout(
         move || doh_wire_get(&svc, &domain_owned, &boot),
         wire_ms,

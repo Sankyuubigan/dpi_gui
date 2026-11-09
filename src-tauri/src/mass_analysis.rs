@@ -169,7 +169,7 @@ pub fn run_mass(app: &AppHandle, requested: Vec<String>) -> Result<String, Strin
         // Проверка подмены DNS — внутри окна (как в одиночном анализе:
         // их TCP-пробы не должны идти через активный обход).
         let dns_fail_hosts = dns_fail_hosts_of(&hosts, &on_map, &off_map);
-        let dns_subs = dns_fail_subs(&dns_fail_hosts);
+        let dns_subs = dns_fail_subs(&dns_fail_hosts, mass_probe_budget());
 
         // Полная диагностика сломанных — в чистом окне, параллельно
         // (поток на домен: CIDR-скан одного домена не задерживает остальных).
@@ -189,7 +189,7 @@ pub fn run_mass(app: &AppHandle, requested: Vec<String>) -> Result<String, Strin
         let facts_broken = collect_facts_off(app, &broken_on, &HashMap::new(), &doh_map);
 
         let dns_fail_hosts = dns_fail_hosts_of(&hosts, &on_map, &HashMap::new());
-        let dns_subs = dns_fail_subs(&dns_fail_hosts);
+        let dns_subs = dns_fail_subs(&dns_fail_hosts, mass_probe_budget());
         (facts_broken, dns_subs, None)
     };
 
@@ -394,14 +394,22 @@ fn dns_fail_hosts_of(
         .collect()
 }
 
+/// Бюджет фактовой фазы на домен в массовом анализе: переборы DoH-сервисов
+/// и IP раньше жгли минуты на сайтах с дропом TLS (инцидент 09.11.26).
+fn mass_probe_budget() -> crate::probe_budget::StageBudget {
+    crate::probe_budget::StageBudget::new(std::time::Duration::from_secs(45))
+}
+
 /// Одна параллельная проверка подмены DNS для всех dns_fail доменов пачки.
+/// Бюджет тот же, что у фактовой фазы окна (mass_probe_budget).
 fn dns_fail_subs(
     dns_fail_hosts: &[String],
+    budget: crate::probe_budget::StageBudget,
 ) -> HashMap<String, Vec<site_probe::DnsSubstitution>> {
     if dns_fail_hosts.is_empty() {
         HashMap::new()
     } else {
-        crate::analyzer::dns_fail_sub_parallel(dns_fail_hosts, dns_fail_hosts.len())
+        crate::analyzer::dns_fail_sub_parallel(dns_fail_hosts, dns_fail_hosts.len(), budget)
             .into_iter()
             .collect()
     }
@@ -427,14 +435,15 @@ fn collect_facts_off(
         let h = h.clone();
         let app = app.clone();
         thread::spawn(move || {
+            let budget = mass_probe_budget();
             let answers =
                 answers.unwrap_or_else(|| site_probe::resolve_doh_answers(&h));
-            let main_probe = site_probe::probe_domain_with_doh(&h, &answers);
+            let main_probe = site_probe::probe_domain_with_doh(&h, &answers, budget);
             let (main_dns_sub, block_scan) =
                 if main_probe.verdict.site_broken() && main_probe.verdict != Verdict::WwwOnly {
                     (
-                        site_probe::dns_substitutions_from(&h, &answers, true),
-                        Some(ip_range_scan::block_diagnose(&app, &h)),
+                        site_probe::dns_substitutions_from(&h, &answers, true, budget),
+                        Some(ip_range_scan::block_diagnose(&app, &h, budget)),
                     )
                 } else {
                     (Vec::new(), None)
@@ -490,9 +499,10 @@ fn collect_facts_on(
         let tx = tx.clone();
         let h = h.clone();
         thread::spawn(move || {
+            let budget = mass_probe_budget();
             let answers =
                 answers.unwrap_or_else(|| site_probe::resolve_doh_answers(&h));
-            let probe = site_probe::probe_domain_with_doh(&h, &answers);
+            let probe = site_probe::probe_domain_with_doh(&h, &answers, budget);
             let _ = tx.send((h, probe));
         });
     }
