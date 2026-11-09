@@ -7,7 +7,8 @@
 //! 2. Классификация ответов БЕЗ угадывания по ownership IP:
 //!    - `Dead` — не ответил / только заглушки;
 //!    - `Gateway` — отдал СВОИ адреса (`DohAnswers::gateway_owner`):
-//!      фронтинг-шлюзы, браузер пойдёт через сервис (кейс eu.geohide.ru);
+//!      фронтинг-шлюзы сервиса (кейс eu.geohide.ru); вердикт фронтинга
+//!      ставит только сквозная проба (ниже);
 //!    - `Resolves` — консенсус большинства (если повторяющихся сетов нет
 //!      вообще — GeoDNS-норма «у каждого свои», все считаются Resolves);
 //!    - `Diverges` — расходится с консенсусом большинства.
@@ -21,10 +22,11 @@
 //!      самого сайта; у Cloudflare это в т.ч. ошибка 1009 — страна
 //!      забанена владельцем) / `DpiBlocked` (RST/TLS — лечится обходом
 //!      winws) / `Unreachable`;
-//!    - шлюзовые сеты HTTP-пробой проверять НЕЛЬЗЯ: шлюз может отдать
-//!      свой 200, не являющийся страницей сайта (документировано в доке
-//!      `DohAnswers::own_ips`, кейс openrouter.ai/80.74.30.162) — им
-//!      только TCP-живость `site_probe::tcp_scan_parallel`.
+//!    - шлюзовые сеты — сквозная HTTP-проба `site_probe::http_via_ip` по
+//!      каждому IP пула: мина «свой 200» обезврежена валидацией TLS-
+//!      сертификата имени сайта (чужой 200 → честный `BadCert`; кейс
+//!      openrouter.ai 09.11.26: сайт открывался только через 2 из 7
+//!      шлюзов пула — TCP-вердикт удалён как источник лжи).
 //!
 //! Посессионный гео-блок (кейс aistudio.google.com, пробы 28.10.26): проба
 //! с исходного IP видит страницу (часто с «регион ограничен» —
@@ -33,7 +35,7 @@
 //! рекомендуется даже при «не-Open» пробе честных адресов.
 
 use serde::Serialize;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::mpsc;
 use std::thread;
@@ -47,7 +49,7 @@ use crate::config;
 use crate::diagnostics_probe::{self, is_stub_ip, DohAnswers, HttpResult};
 use crate::events::app_log;
 use crate::ip_target;
-use crate::site_probe::{probe_https_by_ip, substitution_note, tcp_scan_parallel};
+use crate::site_probe::{http_via_ip, probe_https_by_ip, substitution_note};
 
 /// Лимит HTTP-проб: уникальных сетов адресов и адресов внутри сета.
 const MAX_PROBE_SETS: usize = 4;
@@ -58,7 +60,7 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(12);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ResolverKind {
-    /// Отдал собственные адреса-шлюзы (фронтинг): браузер пойдёт через сервис.
+    /// Отдал собственные адреса-шлюзы (фронтинг): вердикт ставит сквозная проба.
     Gateway,
     /// Адреса совпадают с консенсусом большинства (или большинства нет —
     /// GeoDNS-норма «у каждого свои»).
@@ -88,10 +90,16 @@ pub enum ProbeVerdict {
     DpiBlocked,
     /// Адрес не отвечает (таймаут/прочее).
     Unreachable,
-    /// Шлюз DoH-сервиса отвечает по TCP:443. HTTP-проба шлюзам запрещена:
-    /// их 200 не является страницей сайта (дока DohAnswers::own_ips).
+    /// Фронтинг подтверждён сквозной пробой (`http_via_ip` с валидацией
+    /// сертификата): сайт открывается через не меньше половины шлюзов пула.
+    /// TCP-живость вердиктом не считается — она лгала на openrouter.ai
+    /// (09.11.26: сайт открывался только через 2 из 7 шлюзов пула).
     GatewayAlive,
-    /// Шлюз не отвечает даже по TCP.
+    /// Фронтинг подтверждён пробой, но меньше чем на половине шлюзов пула:
+    /// браузер получает весь пул и может попадать на нерабочие IP.
+    GatewayPartial,
+    /// Ни один шлюз пула не открыл сайт (сквозная проба) — фронтинг не
+    /// подтверждён; TCP-живость при этом ничего не доказывает.
     GatewayDead,
 }
 
@@ -105,6 +113,10 @@ pub struct DnsPickEntry {
     /// Результат сквозной проверки (None — Dead: проверять нечего).
     pub probe: Option<ProbeVerdict>,
     pub probe_note: String,
+    /// Шлюзы, через которые сайт РЕАЛЬНО открылся сквозной пробой — SSOT
+    /// для «Применить» (маппинг берёт проверенный IP, а не resolved[0],
+    /// который в кейсе 09.11.26 был мёртвым). Пусто у не-шлюзовых записей.
+    pub fronting_ips: Vec<IpAddr>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -152,7 +164,8 @@ pub struct Classification {
     /// entry[i] → адреса сайта из его ответа (наследование пробы по IP,
     /// когда свой сет не попал в лимит проб).
     pub entry_site_ips: Vec<Option<Vec<IpAddr>>>,
-    /// entry[i] → собственные шлюзы сервиса (чистые Gateway) для TCP-пробы.
+    /// entry[i] → собственные шлюзы сервиса (чистые Gateway) для сквозной
+    /// пробы фронтинга.
     pub entry_gateways: Vec<Option<Vec<IpAddr>>>,
 }
 
@@ -267,6 +280,7 @@ pub fn pick_resolvers(answers: &DohAnswers) -> Classification {
                     note: err.clone(),
                     probe: None,
                     probe_note: String::new(),
+                    fronting_ips: Vec::new(),
                 });
                 entry_set.push(None);
                 entry_site_ips.push(None);
@@ -282,6 +296,7 @@ pub fn pick_resolvers(answers: &DohAnswers) -> Classification {
                         note: "не вернул адресов (или только заглушки)".to_string(),
                         probe: None,
                         probe_note: String::new(),
+                        fronting_ips: Vec::new(),
                     });
                     entry_set.push(None);
                     entry_site_ips.push(None);
@@ -300,7 +315,7 @@ pub fn pick_resolvers(answers: &DohAnswers) -> Classification {
                     (
                         ResolverKind::Gateway,
                         format!(
-                            "отдаёт собственные шлюзы ({}) — трафик пойдёт через сервис (фронтинг)",
+                            "отдаёт собственные шлюзы ({}) — вердикт фронтинга ставит сквозная проба",
                             ips_str(&d.gateway_ips)
                         ),
                         None,
@@ -349,6 +364,7 @@ pub fn pick_resolvers(answers: &DohAnswers) -> Classification {
                     note,
                     probe: None,
                     probe_note: String::new(),
+                    fronting_ips: Vec::new(),
                 });
                 entry_set.push(key);
                 entry_site_ips.push(Some(d.site_ips.clone()));
@@ -415,22 +431,171 @@ fn aggregate_site_set(results: &[(IpAddr, HttpResult)]) -> (ProbeVerdict, String
     (verdict, format!("{} ({})", substitution_note(best), ip))
 }
 
-/// TCP-живость шлюзового сета (HTTP-проба шлюзам запрещена — их 200 не
-/// является страницей сайта).
-fn gateway_tcp_probe(ips: &[IpAddr]) -> (ProbeVerdict, String) {
-    let res = tcp_scan_parallel(ips);
-    let alive: Vec<&IpAddr> = ips.iter().zip(res.iter()).filter(|(_, s)| s.as_str() == "Success").map(|(ip, _)| ip).collect();
-    if let Some(first) = alive.first() {
-        (
-            ProbeVerdict::GatewayAlive,
-            format!("шлюз {} отвечает на :443", first),
+/// Результат сквозной пробы шлюзового пула.
+#[derive(Debug, Clone)]
+pub struct GatewayProbe {
+    pub verdict: ProbeVerdict,
+    pub note: String,
+    /// Шлюзы, через которые сайт реально открылся (или транспорт до сайта
+    /// работает — JS-оболочка): подтверждено пробой, не догадкой.
+    pub fronting: Vec<IpAddr>,
+}
+
+/// Строка «IP 0.6с, IP 0.7с» для подтверждённых шлюзов (≤3, как ips_str).
+fn ips_times_str(items: &[(IpAddr, Duration)]) -> String {
+    let all: Vec<String> = items
+        .iter()
+        .map(|(ip, d)| format!("{} {:.1}с", ip, d.as_secs_f64()))
+        .collect();
+    if all.len() <= 3 {
+        all.join(", ")
+    } else {
+        format!("{}, … (всего {})", all[..3].join(", "), all.len())
+    }
+}
+
+/// Агрегат сквозных проб шлюзового пула (чистая функция — покрыта тестами).
+/// Фронтинг подтверждает только `Ok` (настоящая страница через валидный
+/// сертификат сайта) или `Unverified` (транспорт работает, страница —
+/// оболочка). Отказ сайта и через шлюз (Forbidden/ServiceRestrict) —
+/// транспорт доходит, но сайт отказывает и IP шлюза (VPN-кейс). Всё
+/// остальное (BadCert/Tls/Rst/Timeout/BlockPage/Other) — этот шлюз сайт
+/// не фронтит: «свой 200» шлюза без валидного сертификата отфильтрован
+/// как `BadCert` (blocks.md §3), TCP-живость подтверждением не считается.
+fn aggregate_gateway_set(results: &[(IpAddr, HttpResult, Duration)]) -> GatewayProbe {
+    let total = results.len();
+    let ok: Vec<(IpAddr, Duration)> = results
+        .iter()
+        .filter(|(_, r, _)| matches!(r, HttpResult::Ok(_)))
+        .map(|(ip, _, d)| (*ip, *d))
+        .collect();
+    let unverified: Vec<(IpAddr, Duration)> = results
+        .iter()
+        .filter(|(_, r, _)| matches!(r, HttpResult::Unverified))
+        .map(|(ip, _, d)| (*ip, *d))
+        .collect();
+    let refused: Vec<&(IpAddr, HttpResult, Duration)> = results
+        .iter()
+        .filter(|(_, r, _)| matches!(r, HttpResult::Forbidden(_) | HttpResult::ServiceRestrict))
+        .collect();
+    let confirmed_cnt = ok.len() + unverified.len();
+    let fronting: Vec<IpAddr> = ok
+        .iter()
+        .chain(unverified.iter())
+        .map(|(ip, _)| *ip)
+        .collect();
+
+    if confirmed_cnt == 0 {
+        if !refused.is_empty() {
+            return GatewayProbe {
+                verdict: ProbeVerdict::SiteBlocked,
+                note: format!(
+                    "транспорт до сайта через шлюзы работает, но сайт отказывает и IP шлюзов ({} из {}): поможет только VPN",
+                    refused.len(),
+                    total
+                ),
+                fronting: Vec::new(),
+            };
+        }
+        return GatewayProbe {
+            verdict: ProbeVerdict::GatewayDead,
+            note: format!(
+                "сайт не открывается ни через один из {} шлюзов — фронтинг не подтверждён",
+                total
+            ),
+            fronting: Vec::new(),
+        };
+    }
+
+    let fronting_items: Vec<(IpAddr, Duration)> = ok
+        .iter()
+        .chain(unverified.iter())
+        .cloned()
+        .collect();
+    let front_list = ips_times_str(&fronting_items);
+    let dead_cnt = total - confirmed_cnt - refused.len();
+    let mut note = if ok.is_empty() {
+        format!(
+            "фронтинг подтверждён пробой: транспорт до сайта работает через {} из {} шлюзов ({}), но страница — JS-оболочка: доступность не подтверждена",
+            confirmed_cnt,
+            total,
+            front_list
         )
     } else {
-        (
-            ProbeVerdict::GatewayDead,
-            "шлюз не отвечает даже по TCP:443".to_string(),
+        let times: Vec<f64> = ok.iter().map(|(_, d)| d.as_secs_f64()).collect();
+        format!(
+            "фронтинг подтверждён пробой: сайт открывается через {} из {} шлюзов ({}, время {:.1}–{:.1} с)",
+            confirmed_cnt,
+            total,
+            front_list,
+            times.iter().cloned().fold(f64::INFINITY, f64::min),
+            times.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
         )
+    };
+    if dead_cnt > 0 {
+        note.push_str(&format!(
+            "; {} из {} шлюзов не фронтят сайт — браузер может попасть на нерабочий IP",
+            dead_cnt,
+            total
+        ));
     }
+    if !refused.is_empty() {
+        note.push_str(&format!(
+            "; {} — сайт отказывает и IP шлюза (VPN-кейс)",
+            refused.len()
+        ));
+    }
+    let verdict = if confirmed_cnt * 2 >= total {
+        ProbeVerdict::GatewayAlive
+    } else {
+        note.push_str(" — сайт может открываться не с первой попытки");
+        ProbeVerdict::GatewayPartial
+    };
+    GatewayProbe {
+        verdict,
+        note,
+        fronting,
+    }
+}
+
+/// Сквозная проба шлюзового сета: сайт должен открыться через шлюз.
+/// `http_via_ip` валидирует TLS-сертификат имени сайта — «свой 200» шлюза
+/// без валидного сертификата отфильтруется как BadCert и успехом не
+/// притворится (blocks.md §3). Пробы параллельны (по одной на IP);
+/// не ответившие в бюджет считаются нерабочими — так их видит браузер.
+fn gateway_fronting_probe(host: &str, ips: &[IpAddr]) -> GatewayProbe {
+    let (tx, rx) = mpsc::channel();
+    for ip in ips {
+        let tx = tx.clone();
+        let host = host.to_string();
+        let ip = *ip;
+        thread::spawn(move || {
+            let start = Instant::now();
+            let r = http_via_ip(&host, ip, 443);
+            let _ = tx.send((ip, r, start.elapsed()));
+        });
+    }
+    drop(tx);
+    let deadline = Instant::now() + PROBE_DEADLINE;
+    let mut results: Vec<(IpAddr, HttpResult, Duration)> = Vec::new();
+    while results.len() < ips.len() {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match rx.recv_timeout(deadline - now) {
+            Ok(res) => results.push(res),
+            Err(_) => break,
+        }
+    }
+    // Не ответившие в бюджет — честный Timeout (в агрегате «не фронтят»).
+    let answered: HashSet<IpAddr> = results.iter().map(|(ip, _, _)| *ip).collect();
+    for ip in ips {
+        if !answered.contains(ip) {
+            results.push((*ip, HttpResult::Timeout, PROBE_DEADLINE));
+        }
+    }
+    aggregate_gateway_set(&results)
 }
 
 /// HTTP-пробы не-шлюзовых сетов, параллельно (до MAX_PROBE_SETS сетов,
@@ -496,7 +661,7 @@ fn attach_probes(
     mut class: Classification,
     site: &HashMap<String, (ProbeVerdict, String)>,
     per_ip: &HashMap<IpAddr, HttpResult>,
-    gateways: &HashMap<String, (ProbeVerdict, String)>,
+    gateways: &HashMap<String, GatewayProbe>,
 ) -> Vec<DnsPickEntry> {
     for (i, e) in class.entries.iter_mut().enumerate() {
         if let Some(key) = &class.entry_set[i] {
@@ -521,9 +686,10 @@ fn attach_probes(
                 e.probe_note = format!("{} — по адресам из других сетов", n);
             }
         } else if let Some(gips) = &class.entry_gateways[i] {
-            if let Some((v, n)) = gateways.get(&set_key(gips)) {
-                e.probe = Some(*v);
-                e.probe_note = n.clone();
+            if let Some(gp) = gateways.get(&set_key(gips)) {
+                e.probe = Some(gp.verdict);
+                e.probe_note = gp.note.clone();
+                e.fronting_ips = gp.fronting.clone();
             }
         }
     }
@@ -531,8 +697,9 @@ fn attach_probes(
 }
 
 /// Итоговая строка + уровень по приоритету честных исходов:
-/// открылся пробой > живой фронтинг-шлюз > оболочка (не подтверждено) >
-/// отказ сайта (VPN) > DPI > ничего. Чистая функция — покрыта тестами.
+/// открылся пробой > фронтинг подтверждён (≥ половины пула) > фронтинг
+/// частичный (warn) > оболочка (не подтверждено) > отказ сайта (VPN) >
+/// DPI > ничего. Чистая функция — покрыта тестами.
 fn build_summary(host: &str, entries: &[DnsPickEntry]) -> (String, &'static str) {
     if let Some(e) = entries.iter().find(|e| e.probe == Some(ProbeVerdict::Open)) {
         return (
@@ -549,10 +716,24 @@ fn build_summary(host: &str, entries: &[DnsPickEntry]) -> (String, &'static str)
     {
         return (
             format!(
-                "Рабочий DNS: {} — отдаёт собственные шлюзы для {}: трафик пойдёт через сервис, сайт будет видеть IP шлюза, а не ваш (кейс посессионного гео-блока). Включите его как Secure DNS в браузере: https://{}/dns-query",
-                e.service, host, e.service
+                "Рабочий DNS: {} — отдаёт собственные шлюзы для {}; {}. Сайт будет видеть IP шлюза, а не ваш (кейс посессионного гео-блока). Включите его как Secure DNS в браузере: https://{}/dns-query",
+                e.service, host, e.probe_note, e.service
             ),
             "ok",
+        );
+    }
+    // Частичный фронтинг (кейс openrouter.ai 09.11.26: сайт открывался
+    // только через 2 из 7 шлюзов пула): «Рабочий DNS» без оговорок — ложь.
+    if let Some(e) = entries
+        .iter()
+        .find(|e| e.kind == ResolverKind::Gateway && e.probe == Some(ProbeVerdict::GatewayPartial))
+    {
+        return (
+            format!(
+                "Шлюзы {} для {} фронтят сайт только частично ({}): браузер получает весь пул и может попадать на нерабочие IP — смена DNS может не открыть сайт с первой попытки, надёжнее VPN",
+                e.service, host, e.probe_note
+            ),
+            "warn",
         );
     }
     // Посессионный гео-блок (кейс aistudio 08.11.26): транспорт работает,
@@ -596,8 +777,14 @@ fn build_summary(host: &str, entries: &[DnsPickEntry]) -> (String, &'static str)
     }
     let causes: Vec<String> = entries
         .iter()
-        .filter(|e| e.kind == ResolverKind::Dead)
-        .map(|e| format!("{} — {}", e.service, e.note))
+        .filter(|e| e.kind == ResolverKind::Dead || e.probe == Some(ProbeVerdict::GatewayDead))
+        .map(|e| {
+            if e.probe == Some(ProbeVerdict::GatewayDead) {
+                format!("{} — {}", e.service, e.probe_note)
+            } else {
+                format!("{} — {}", e.service, e.note)
+            }
+        })
         .chain(entries.iter().filter(|e| e.kind != ResolverKind::Dead && e.probe_note.contains("лимит сетов")).map(|e| format!("{} — {}", e.service, e.probe_note)))
         .take(3)
         .collect();
@@ -680,7 +867,11 @@ pub fn run_pick(app: Option<&AppHandle>, url: &str) -> Result<DnsPickOutcome, St
 
     let class = pick_resolvers(&answers);
 
-    // Шлюзовые сеты — только TCP-живость (HTTP-проба шлюза лжёт 200-м).
+    // Шлюзовые сеты — сквозная проба: «фронтинг подтверждён» только когда
+    // сайт реально открывается через шлюз (валидный сертификат + контент).
+    // TCP-живость была ложью (кейс openrouter.ai 09.11.26: сайт открывался
+    // только через 2 из 7 шлюзов пула). Мера с обходом (blocks.md §2) —
+    // состояние «браузер + обход ВКЛ».
     let mut gateway_sets: Vec<(String, Vec<IpAddr>)> = Vec::new();
     for gips in class.entry_gateways.iter().flatten() {
         let key = set_key(gips);
@@ -688,12 +879,39 @@ pub fn run_pick(app: Option<&AppHandle>, url: &str) -> Result<DnsPickOutcome, St
             gateway_sets.push((key, gips.clone()));
         }
     }
-    let gateways: HashMap<String, (ProbeVerdict, String)> = gateway_sets
-        .iter()
-        .map(|(k, ips)| (k.clone(), gateway_tcp_probe(ips)))
-        .collect();
+    let gateways: HashMap<String, GatewayProbe> = {
+        if let Some(app) = app {
+            let total: usize = gateway_sets.iter().map(|(_, ips)| ips.len()).sum();
+            app_log(
+                app,
+                format!(
+                    "[Подбор DNS] Сквозная проба шлюзов: {} шт. — сайт должен реально открываться через каждый (валидный сертификат)",
+                    total
+                ),
+            );
+        }
+        let started = Instant::now();
+        let res: HashMap<String, GatewayProbe> = gateway_sets
+            .iter()
+            .map(|(k, ips)| (k.clone(), gateway_fronting_probe(&host, ips)))
+            .collect();
+        if let Some(app) = app {
+            for gp in res.values() {
+                app_log(
+                    app,
+                    format!(
+                        "[Подбор DNS] Проба шлюзов за {:.1} с: {:?} — {}",
+                        started.elapsed().as_secs_f64(),
+                        gp.verdict,
+                        gp.note
+                    ),
+                );
+            }
+        }
+        res
+    };
 
-    // Контрольная точка после TCP-проб шлюзов, перед HTTP-пробами сайта.
+    // Контрольная точка после сквозных проб шлюзов, перед HTTP-пробами сайта.
     if cancel::is_cancelled(cancel::DNS_PICK) {
         return Err("Подбор DNS остановлен пользователем".into());
     }
@@ -953,6 +1171,7 @@ mod tests {
             note: "резолвит верно".into(),
             probe: Some(ProbeVerdict::Open),
             probe_note: "HTTP 200 (1.2.3.4)".into(),
+            fronting_ips: Vec::new(),
         }];
         let (s, level) = build_summary("example.com", &entries);
         assert_eq!(level, "ok");
@@ -969,7 +1188,8 @@ mod tests {
                 kind: ResolverKind::Gateway,
                 note: "отдаёт собственные шлюзы".into(),
                 probe: Some(ProbeVerdict::GatewayAlive),
-                probe_note: "шлюз 5.175.161.40 отвечает на :443".into(),
+                probe_note: "фронтинг подтверждён пробой: сайт открывается через 7 из 7 шлюзов (5.175.161.40 0.6с, … (всего 7), время 0.6–0.7 с)".into(),
+                fronting_ips: vec![ip("5.175.161.40")],
             },
             DnsPickEntry {
                 service: "dns.google".into(),
@@ -978,11 +1198,13 @@ mod tests {
                 note: "резолвит верно".into(),
                 probe: Some(ProbeVerdict::SiteBlocked),
                 probe_note: "страница отдалась, но сервис сообщает об ограничении (регион) (142.251.155.2)".into(),
+                fronting_ips: Vec::new(),
             },
         ];
         let (s, level) = build_summary("aistudio.google.com", &entries);
         assert_eq!(level, "ok");
         assert!(s.contains("eu.geohide.ru") && s.contains("собственные шлюзы"), "{}", s);
+        assert!(s.contains("фронтинг подтверждён"), "{}", s);
     }
 
     /// Итог «сайт сам отказывает» → fail с честным «нужен VPN» (кейс
@@ -996,6 +1218,7 @@ mod tests {
             note: "резолвит верно".into(),
             probe: Some(ProbeVerdict::SiteBlocked),
             probe_note: "отказ сервера HTTP 403 (104.16.24.14)".into(),
+            fronting_ips: Vec::new(),
         }];
         let (s, level) = build_summary("www.patreon.com", &entries);
         assert_eq!(level, "fail");
@@ -1013,6 +1236,7 @@ mod tests {
             note: "резолвит верно".into(),
             probe: Some(ProbeVerdict::DpiBlocked),
             probe_note: "RST — TCP:443 открыт, но HTTPS рвётся (DPI по SNI) (104.16.24.14)".into(),
+            fronting_ips: Vec::new(),
         }];
         let (s, level) = build_summary("example.com", &entries);
         assert_eq!(level, "warn");
@@ -1030,6 +1254,7 @@ mod tests {
             note: "резолвит верно".into(),
             probe: Some(ProbeVerdict::Unverified),
             probe_note: "страница без видимого контента (JS-оболочка) — доступность после входа не подтверждена (142.250.65.100)".into(),
+            fronting_ips: Vec::new(),
         }];
         let (s, level) = build_summary("aistudio.google.com", &entries);
         assert_eq!(level, "warn");
@@ -1049,6 +1274,7 @@ mod tests {
                 note: "резолвит верно".into(),
                 probe: Some(ProbeVerdict::Unverified),
                 probe_note: "оболочка".into(),
+                fronting_ips: Vec::new(),
             },
             DnsPickEntry {
                 service: "eu.geohide.ru".into(),
@@ -1056,7 +1282,8 @@ mod tests {
                 kind: ResolverKind::Gateway,
                 note: "отдаёт собственные шлюзы".into(),
                 probe: Some(ProbeVerdict::GatewayAlive),
-                probe_note: "шлюз 5.175.161.40 отвечает на :443".into(),
+                probe_note: "фронтинг подтверждён пробой: сайт открывается через 7 из 7 шлюзов (5.175.161.40 0.6с, … (всего 7), время 0.6–0.7 с)".into(),
+                fronting_ips: vec![ip("5.175.161.40")],
             },
         ];
         let (s, level) = build_summary("aistudio.google.com", &entries);
@@ -1074,6 +1301,7 @@ mod tests {
             note: "не ответил за 9 с (таймаут)".into(),
             probe: None,
             probe_note: String::new(),
+            fronting_ips: Vec::new(),
         }];
         let (s, level) = build_summary("example.com", &entries);
         assert_eq!(level, "fail");
@@ -1093,6 +1321,7 @@ mod tests {
                 note: "резолвит верно".into(),
                 probe: None,
                 probe_note: String::new(),
+                fronting_ips: Vec::new(),
             }],
             site_sets: vec![(key.clone(), vec![ip("1.2.3.4")])],
             entry_set: vec![Some(key.clone())],
@@ -1117,6 +1346,7 @@ mod tests {
                 note: "резолвит верно".into(),
                 probe: None,
                 probe_note: String::new(),
+                fronting_ips: Vec::new(),
             }],
             site_sets: vec![],
             entry_set: vec![Some("104.16.24.14".to_string())],
@@ -1169,7 +1399,14 @@ mod tests {
             .find(|e| e.service == "eu.geohide.ru")
             .expect("eu.geohide.ru не в списке doh-services.txt");
         assert_eq!(geohide.kind, ResolverKind::Gateway, "эталон: geohide отдаёт свои шлюзы ({:?})", geohide);
-        assert_eq!(geohide.probe, Some(ProbeVerdict::GatewayAlive), "шлюз geohide должен отвечать при включённом обходе");
+        assert!(
+            matches!(
+                geohide.probe,
+                Some(ProbeVerdict::GatewayAlive) | Some(ProbeVerdict::GatewayPartial)
+            ),
+            "фронтинг geohide обязан подтверждаться сквозной пробой (сайт реально открывается через шлюз), а не TCP-живостью: {:?}",
+            geohide
+        );
         // PRP-1 гейт: aistudio анонимно — JS-оболочка, честные резолверы НЕ
         // могут иметь пробу Open («открывается») — это была главная ложь.
         // Проверка НЕ зависит от GeoDNS-дрейфа: любой сервис с ответом.
@@ -1192,6 +1429,172 @@ mod tests {
             if let Some(e) = out.entries.iter().find(|e| e.service == svc) {
                 assert_ne!(e.kind, ResolverKind::Dead, "эталон: {} живой, не Dead ({:?})", svc, e);
             }
+        }
+    }
+
+    /// Фикстура результата сквозной пробы одного шлюза.
+    fn gp(ip_s: &str, r: HttpResult, secs: u64) -> (IpAddr, HttpResult, Duration) {
+        (ip(ip_s), r, Duration::from_secs(secs))
+    }
+
+    /// Весь пул фронтит → GatewayAlive с подтверждёнными IP и временем.
+    #[test]
+    fn gateway_probe_all_front_is_alive() {
+        let g = aggregate_gateway_set(&[
+            gp("1.1.1.1", HttpResult::Ok(200), 1),
+            gp("2.2.2.2", HttpResult::Ok(200), 2),
+        ]);
+        assert_eq!(g.verdict, ProbeVerdict::GatewayAlive);
+        assert_eq!(g.fronting, vec![ip("1.1.1.1"), ip("2.2.2.2")]);
+        assert!(g.note.contains("2 из 2") && g.note.contains("время 1.0–2.0 с"), "{}", g.note);
+    }
+
+    /// Меньше половины пула → GatewayPartial: «Рабочий DNS» без оговорок —
+    /// ложь (кейс openrouter.ai 09.11.26: фронтинг только на 2 из 7).
+    #[test]
+    fn gateway_probe_minority_is_partial() {
+        let g = aggregate_gateway_set(&[
+            gp("1.1.1.1", HttpResult::Ok(200), 1),
+            gp("2.2.2.2", HttpResult::Ok(200), 2),
+            gp("3.3.3.3", HttpResult::Timeout, 6),
+            gp("4.4.4.4", HttpResult::BadCert, 1),
+            gp("5.5.5.5", HttpResult::Tls, 1),
+        ]);
+        assert_eq!(g.verdict, ProbeVerdict::GatewayPartial);
+        assert_eq!(g.fronting.len(), 2);
+        assert!(g.note.contains("2 из 5"), "{}", g.note);
+        assert!(g.note.contains("не фронтят сайт"), "{}", g.note);
+    }
+
+    /// Ровно половина — уже GatewayAlive (граница включена).
+    #[test]
+    fn gateway_probe_half_counts_as_alive() {
+        let g = aggregate_gateway_set(&[
+            gp("1.1.1.1", HttpResult::Ok(200), 1),
+            gp("2.2.2.2", HttpResult::Timeout, 6),
+        ]);
+        assert_eq!(g.verdict, ProbeVerdict::GatewayAlive);
+    }
+
+    /// Оболочка на шлюзе: транспорт работает, но честно «не подтверждена»,
+    /// а не «открывается» (инвариант PRP-1).
+    #[test]
+    fn gateway_probe_unverified_is_alive_with_shell_note() {
+        let g = aggregate_gateway_set(&[
+            gp("1.1.1.1", HttpResult::Unverified, 1),
+            gp("2.2.2.2", HttpResult::Unverified, 2),
+        ]);
+        assert_eq!(g.verdict, ProbeVerdict::GatewayAlive);
+        assert!(
+            g.note.contains("оболочка") && g.note.contains("не подтверждена"),
+            "{}",
+            g.note
+        );
+    }
+
+    /// Ни один шлюз не открыл сайт → GatewayDead, не Alive: TCP-живость и
+    /// «свой 200» без валидного сертификата подтверждением не считаются
+    /// (мина blocks.md §3; кейс openrouter 09.11.26).
+    #[test]
+    fn gateway_probe_none_fronting_is_dead() {
+        let g = aggregate_gateway_set(&[
+            gp("1.1.1.1", HttpResult::Timeout, 6),
+            gp("2.2.2.2", HttpResult::BadCert, 1),
+            gp("3.3.3.3", HttpResult::Tls, 1),
+        ]);
+        assert_eq!(g.verdict, ProbeVerdict::GatewayDead);
+        assert!(g.fronting.is_empty());
+        assert!(g.note.contains("не подтверждён"), "{}", g.note);
+    }
+
+    /// Сайт отказывает и IP шлюзов (403 сквозь фронтинг) → SiteBlocked:
+    /// транспорт работает, виноват сайт — VPN-кейс (Patreon).
+    #[test]
+    fn gateway_probe_site_refuses_gateway_is_site_blocked() {
+        let g = aggregate_gateway_set(&[
+            gp("1.1.1.1", HttpResult::Forbidden(403), 1),
+            gp("2.2.2.2", HttpResult::Forbidden(403), 2),
+        ]);
+        assert_eq!(g.verdict, ProbeVerdict::SiteBlocked);
+        assert!(g.note.contains("VPN"), "{}", g.note);
+    }
+
+    /// Частичный фронтинг → warn с честной оговоркой (не «Рабочий DNS»).
+    #[test]
+    fn summary_gateway_partial_is_warn() {
+        let entries = vec![DnsPickEntry {
+            service: "eu.geohide.ru".into(),
+            resolved: vec![],
+            kind: ResolverKind::Gateway,
+            note: "отдаёт собственные шлюзы".into(),
+            probe: Some(ProbeVerdict::GatewayPartial),
+            probe_note: "фронтинг подтверждён пробой: сайт открывается через 2 из 7 шлюзов (143.20.64.192 0.6с, 37.221.93.141 0.7с, время 0.6–0.7 с); 4 из 7 шлюзов не фронтят сайт — браузер может попасть на нерабочий IP — сайт может открываться не с первой попытки".into(),
+            fronting_ips: vec![ip("143.20.64.192")],
+        }];
+        let (s, level) = build_summary("openrouter.ai", &entries);
+        assert_eq!(level, "warn");
+        assert!(s.contains("частично") && s.contains("VPN"), "{}", s);
+        assert!(
+            !s.contains("Рабочий DNS"),
+            "ложь: частичный фронтинг назван рабочим: {}",
+            s
+        );
+    }
+
+    /// Мёртвый фронтинг попадает в причины честного «ничего не найдено».
+    #[test]
+    fn summary_gateway_dead_in_causes() {
+        let entries = vec![DnsPickEntry {
+            service: "eu.geohide.ru".into(),
+            resolved: vec![],
+            kind: ResolverKind::Gateway,
+            note: "отдаёт собственные шлюзы".into(),
+            probe: Some(ProbeVerdict::GatewayDead),
+            probe_note: "сайт не открывается ни через один из 7 шлюзов — фронтинг не подтверждён".into(),
+            fronting_ips: vec![],
+        }];
+        let (s, level) = build_summary("openrouter.ai", &entries);
+        assert_eq!(level, "fail");
+        assert!(
+            s.contains("Рабочего адреса не найдено") && s.contains("eu.geohide.ru"),
+            "{}",
+            s
+        );
+    }
+
+    /// Живой эталон кейса лжи 09.11.26 (юзер: «Рабочий DNS», сайт не пашет):
+    /// geohide отдаёт для openrouter.ai свой пул, где фронтит только часть
+    /// шлюзов. Инвариант честности: вердикт шлюза подтверждается РЕАЛЬНЫМ
+    /// открытием сайта сквозной пробой; частичный пул → warn (не безусловное
+    /// «Рабочий DNS»). Пул дрейфует — фиксируем класс вердикта, не долю.
+    #[test]
+    #[ignore = "requires network + включённый обход (docs/blocks.md §2)"]
+    fn live_pick_openrouter_honest_gateway() {
+        let out = run_pick(None, "https://openrouter.ai").expect("run_pick");
+        for e in &out.entries {
+            println!("[{:?} / {:?}] {}: {} | {}", e.kind, e.probe, e.service, e.note, e.probe_note);
+        }
+        println!("ИТОГ ({}): {}", out.verdict_level, out.summary);
+        let geohide = out
+            .entries
+            .iter()
+            .find(|e| e.service == "eu.geohide.ru")
+            .expect("eu.geohide.ru не в списке doh-services.txt");
+        assert_eq!(geohide.kind, ResolverKind::Gateway, "эталон: geohide отдаёт свои шлюзы ({:?})", geohide);
+        assert!(
+            matches!(
+                geohide.probe,
+                Some(ProbeVerdict::GatewayAlive) | Some(ProbeVerdict::GatewayPartial)
+            ),
+            "фронтинг geohide должен подтверждаться сквозной пробой, а не TCP: {:?}",
+            geohide
+        );
+        if geohide.probe == Some(ProbeVerdict::GatewayPartial) {
+            assert_eq!(
+                out.verdict_level, "warn",
+                "частичный фронтинг — не безусловный «Рабочий DNS»: {}",
+                out.summary
+            );
         }
     }
 }

@@ -150,7 +150,11 @@ export default function SiteFixTab({ url, setUrl, isTesting, setIsTesting, solut
       }>("pick_dns", { url: domain });
       for (const e of out.entries) {
         const mark =
-          e.kind === "gateway" ? "🛰 СВОИ ШЛЮЗЫ (ФРОНТИНГ)"
+          e.kind === "gateway"
+            ? e.probe === "gatewayAlive" ? "🛰 СВОИ ШЛЮЗЫ (ФРОНТИНГ ПОДТВЕРЖДЁН)"
+              : e.probe === "gatewayPartial" ? "🛰 СВОИ ШЛЮЗЫ (ФРОНТИНГ ЧАСТИЧНЫЙ)"
+                : e.probe === "gatewayDead" ? "🛰 СВОИ ШЛЮЗЫ (ФРОНТИНГ НЕ ПОДТВЕРЖДЁН)"
+                  : "🛰 СВОИ ШЛЮЗЫ (ФРОНТИНГ)"
             : e.kind === "resolves"
               ? e.probe === "unverified" ? "⚪ РЕЗОЛВИТ (доступность не подтверждена)"
                 : e.probe === null ? "⚪ GeoDNS: свои адреса (консенсус невозможен, проба не выполнялась)"
@@ -160,8 +164,10 @@ export default function SiteFixTab({ url, setUrl, isTesting, setIsTesting, solut
         const level =
           (e.kind === "resolves" && e.probe === "open") ||
             (e.kind === "gateway" && e.probe === "gatewayAlive") ? "ok"
-            : e.kind === "dead" ? "fail"
-              : "info";
+            : e.kind === "gateway" && e.probe === "gatewayPartial" ? "warn"
+              : e.kind === "dead" ||
+                  (e.kind === "gateway" && e.probe === "gatewayDead") ? "fail"
+                : "info";
         const probeSuffix = e.probe ? `; проба: ${e.probeNote}` : "";
         appendEntry(`${mark} — ${e.service}: ${e.note}${probeSuffix}`, level);
       }

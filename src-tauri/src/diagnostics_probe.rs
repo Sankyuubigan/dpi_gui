@@ -935,9 +935,13 @@ pub fn resolve_doh_all(domain: &str) -> DohAnswers {
     }
 }
 
-/// Собственные IP всех DoH-сервисов (A-записи их имён) — параллельно, с общим
-/// дедлайном. Единственный источник карты «сервис → его инфраструктура»:
-/// её используют и анализ (отличать адрес сайта от SNI-шлюза сервиса),
+/// Собственные IP всех DoH-сервисов — параллельно, с общим дедлайном.
+/// Карта «сервис → его инфраструктура» из ДВУХ источников (объединение):
+/// системный резолв имени + DoH-ответ сервиса о собственном имени (его слова
+/// о своей инфре — тот пул, что он раздаёт целевым доменам как SNI-шлюзы).
+/// Один системный резолв флейкует (кейс 09.11.26: сорвался резолв
+/// eu.geohide.ru — карта осталась без сервиса, шлюзы ушли в «адреса сайта»).
+/// Карту используют и анализ (отличать адрес сайта от SNI-шлюза сервиса),
 /// и проверка hosts-IP перед ручной записью.
 pub fn doh_own_ips(services: &[String]) -> Vec<(String, Vec<IpAddr>)> {
     let (tx, rx) = mpsc::channel::<(String, Vec<IpAddr>)>();
@@ -945,12 +949,27 @@ pub fn doh_own_ips(services: &[String]) -> Vec<(String, Vec<IpAddr>)> {
         let tx = tx.clone();
         let svc = svc.clone();
         thread::spawn(move || {
-            let ips = resolve_system(&svc);
+            let mut ips = resolve_system(&svc);
+            // Системный DNS может не отдать имя сервиса (отравление/флейк —
+            // кейс 09.11.26: системный резолв eu.geohide.ru сорвался, карта
+            // own_ips осталась без сервиса, весь пул шлюзов ушёл в «адреса
+            // сайта», классификация Diverges вместо Gateway, вердикт по 2 из 7
+            // IP пула — лотерея, как браузер). Второй источник — сам сервис:
+            // его DoH-ответ о собственном имени (тот пул, что он раздаёт
+            // целевым доменам как SNI-шлюзы). Union двух источников покрывает
+            // и полный провал системного DNS, и GeoDNS-подмножества.
+            if let Ok(extra) = resolve_via_doh(&svc, &svc) {
+                for ip in extra {
+                    if !ips.contains(&ip) {
+                        ips.push(ip);
+                    }
+                }
+            }
             let _ = tx.send((svc, ips));
         });
     }
     drop(tx);
-    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
     let mut out = Vec::new();
     while std::time::Instant::now() < deadline {
         match rx.recv_timeout(deadline - std::time::Instant::now()) {

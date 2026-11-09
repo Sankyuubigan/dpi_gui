@@ -169,27 +169,54 @@ pub enum PickMapErr {
     Other(String),
 }
 
+/// Подтверждённый пробой IP шлюзовой записи (fronting_ips), иначе первый
+/// адрес ответа (у Open-записей fronting_ips пуст — проба шла по resolved).
+fn first_verified_ip(e: &crate::dns_pick::DnsPickEntry) -> String {
+    e.fronting_ips
+        .first()
+        .map(|i| i.to_string())
+        .or_else(|| e.resolved.first().cloned())
+        .unwrap_or_default()
+}
+
 /// Первый подходящий адрес из результата `run_pick`: запись с честной пробой
-/// Open (сайт открывается через адреса резолвера) или GatewayAlive (фронтинг —
-/// кейс посессионных гео-блоков). Unverified (JS-оболочка, PRP-1) молча НЕ
-/// применяется: без force — вопрос юзеру (PickMapErr::Unverified). Чистая
-/// функция — юнит-тесты; возвращает (домен, IP, откуда адрес).
+/// Open (сайт открывается через адреса резолвера), GatewayAlive (фронтинг
+/// подтверждён на ≥ половины пула) или GatewayPartial — частичный пул,
+/// применяем ТОЛЬКО подтверждённый пробой IP (`fronting_ips`, не resolved[0]:
+/// в кейсе 09.11.26 resolved[0] был мёртв). Unverified (JS-оболочка, PRP-1)
+/// молча НЕ применяется: без force — вопрос юзеру (PickMapErr::Unverified).
+/// Чистая функция — юнит-тесты; возвращает (домен, IP, откуда адрес).
 pub fn pick_mapping_from_outcome(
     outcome: &DnsPickOutcome,
     force: bool,
 ) -> Result<(String, String, String), PickMapErr> {
     let mut unverified_note: Option<String> = None;
+    let mut partial: Option<(String, String, String)> = None;
     for e in &outcome.entries {
-        if e.resolved.is_empty() {
+        if e.resolved.is_empty() && e.fronting_ips.is_empty() {
             continue;
         }
         match e.probe {
             Some(ProbeVerdict::Open) | Some(ProbeVerdict::GatewayAlive) => {
-                return Ok((
-                    outcome.domain.clone(),
-                    e.resolved[0].clone(),
-                    format!("{} ({}; {})", e.service, e.resolved[0], e.probe_note),
-                ));
+                let ip = first_verified_ip(e);
+                let src = format!("{} ({}; {})", e.service, ip, e.probe_note);
+                return Ok((outcome.domain.clone(), ip, src));
+            }
+            Some(ProbeVerdict::GatewayPartial) => {
+                if partial.is_none() {
+                    // Частичный пул (кейс openrouter 09.11.26): берём только
+                    // подтверждённый пробой шлюз — он проверен целиком
+                    // (сертификат + контент), в отличие от лотереи по всему
+                    // пулу, которую получает браузер.
+                    let ip = first_verified_ip(e);
+                    if !ip.is_empty() {
+                        let src = format!(
+                            "{} ({}; фронтинг частичный — IP подтверждён пробой; {})",
+                            e.service, ip, e.probe_note
+                        );
+                        partial = Some((outcome.domain.clone(), ip, src));
+                    }
+                }
             }
             Some(ProbeVerdict::Unverified) => {
                 if unverified_note.is_none() {
@@ -202,6 +229,10 @@ pub fn pick_mapping_from_outcome(
             }
             _ => {}
         }
+    }
+    // Частичный пул ценнее оболочки: есть сквозно подтверждённый адрес.
+    if let Some(p) = partial {
+        return Ok(p);
     }
     if let Some(note) = unverified_note {
         if force {
@@ -224,7 +255,7 @@ pub fn pick_mapping_from_outcome(
         )));
     }
     Err(PickMapErr::Other(
-        "в результате подбора нет адресов с пробой «открывается» или «живой шлюз» — применять нечего".into(),
+        "в результате подбора нет подтверждённых пробой адресов (открывается / фронтинг) — применять нечего".into(),
     ))
 }
 
@@ -728,6 +759,7 @@ mod tests {
             note: String::new(),
             probe: kind_probe.1,
             probe_note: String::new(),
+            fronting_ips: Vec::new(),
         }
     }
 
@@ -746,6 +778,42 @@ mod tests {
         assert_eq!(domain, "aistudio.google.com");
         assert_eq!(ip, "80.74.30.162");
         assert!(src.contains("eu.geohide.ru"));
+    }
+
+    /// Частичный пул (кейс openrouter 09.11.26): маппинг берёт ПОДТВЕРЖДЁННЫЙ
+    /// пробой шлюз из fronting_ips, а не resolved[0] (там был мёртвый IP), и
+    /// применяется без force — есть сквозное подтверждение сертификатом.
+    #[test]
+    fn pick_mapping_partial_uses_verified_fronting_ip() {
+        let mut gw = entry(
+            "eu.geohide.ru",
+            &["37.221.93.128", "143.20.64.192"],
+            (
+                crate::dns_pick::ResolverKind::Gateway,
+                Some(ProbeVerdict::GatewayPartial),
+            ),
+        );
+        gw.fronting_ips = vec!["143.20.64.192".parse().unwrap()];
+        let outcome = DnsPickOutcome {
+            domain: "openrouter.ai".into(),
+            entries: vec![
+                entry(
+                    "dns.google",
+                    &["8.8.8.8"],
+                    (crate::dns_pick::ResolverKind::Resolves, Some(ProbeVerdict::SiteBlocked)),
+                ),
+                gw,
+            ],
+            summary: String::new(),
+            verdict_level: "warn".into(),
+        };
+        let (domain, ip, src) = pick_mapping_from_outcome(&outcome, false).unwrap();
+        assert_eq!(domain, "openrouter.ai");
+        assert_eq!(
+            ip, "143.20.64.192",
+            "берём подтверждённый пробой шлюз, не resolved[0]"
+        );
+        assert!(src.contains("фронтинг частичный"), "{}", src);
     }
 
     #[test]
