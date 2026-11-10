@@ -30,6 +30,17 @@ export default function SettingsTab() {
     }
   };
 
+  const saveReanim = async (enabled: boolean) => {
+    if (!config) return;
+    const next = { ...config, media_reanim_mode: enabled ? "on" : "off" };
+    setConfig(next);
+    try {
+      await invoke("save_config", { config: next });
+    } catch (e) {
+      console.error("save_config:", e);
+    }
+  };
+
   const openFile = async (type: string) => {
     try { await invoke("open_file", { fileType: type }); }
     catch (e) { console.error(e); }
@@ -111,6 +122,27 @@ export default function SettingsTab() {
             <option value="off">Выключено</option>
           </select>
         </div>
+
+        <label className="flex items-start gap-3 mt-4 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={config ? config.media_reanim_mode !== "off" : false}
+            onChange={(e) => saveReanim(e.target.checked)}
+            disabled={!config}
+            className="mt-0.5 h-4 w-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+          />
+          <span>
+            <span className="block text-sm font-medium text-gray-700">
+              Реаниматор видео YouTube
+            </span>
+            <span className="block text-xs text-gray-500">
+              Когда поток к видео-CDN googlevideo зависает (рукопожатие без ответа
+              или тишина посреди стрима), сбрасывает его серверным RST — плеер
+              сам переподключается, видео продолжает грузиться без обновления
+              страницы. Изменение применяется после перезапуска обхода.
+            </span>
+          </span>
+        </label>
       </div>
     </div>
   );

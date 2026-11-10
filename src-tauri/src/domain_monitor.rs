@@ -18,7 +18,7 @@
 //! - списки пользователя НИКАК не затрагиваются (детектор списки даже не читает);
 //! - ошибки не молчат: честная строка в лог с кодом ошибки.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,8 +34,15 @@ use crate::quic_sniff::{
     classify_quic, parse_initial_payload, parse_udp_packet, ParsedInitial, QuicCryptoBuffer,
     QuicPacketKind,
 };
+use crate::reanim::{
+    build_inbound_rst, is_googlevideo, make_send_address_ifidx, FlowKeyLite, InjectionDecision,
+    ReanimCandidate, ReanimLedger, RstParams, HANDSHAKE_T, MAX_QUAR, MAX_RST,
+    QUAR_COOLDOWN_T, QUARANTINE_T, QUAR_MAX_CONCURRENT, QUIC_DATA_MIN, QUIC_RETRANS_FRESH_T,
+    QUIC_SILENCE_T, SILENCE_T, STATS_WINDOW, SUCCESS_WINDOW,
+};
 use crate::win_divert::{
-    open_sniff_handle, SniffHandle, WinDivertAddress, MAX_PACKET_LEN,
+    open_capture_handle, open_send_handle, open_sniff_handle, CaptureHandle, SendHandle,
+    SniffHandle, WinDivertAddress, MAX_PACKET_LEN,
 };
 
 // ---------------------------------------------------------------------------
@@ -58,7 +65,9 @@ pub const NO_DOMAIN_FLUSH_EVERY: u64 = 100;
 
 /// TCP-флаги из заголовка.
 const FLAG_FIN: u8 = 0x01;
+const FLAG_SYN: u8 = 0x02;
 const FLAG_RST: u8 = 0x04;
+const FLAG_ACK: u8 = 0x10;
 
 // ---------------------------------------------------------------------------
 // Событие для UI.
@@ -113,6 +122,19 @@ pub fn read_mode() -> MonitorMode {
         Err(_) => None,
     };
     MonitorMode::from_str(raw.as_deref().unwrap_or("observe"))
+}
+
+/// Реаниматор (PRP 10.11.26): включён ли. Config-ключ `media_reanim_mode`,
+/// дефолт «on»; тумблер двухпозиционный — всё, кроме «off», трактуем как «on».
+pub fn read_reanim_mode() -> bool {
+    let raw = match crate::config::read_config() {
+        Ok(v) => v
+            .get("media_reanim_mode")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        Err(_) => None,
+    };
+    raw.as_deref() != Some("off")
 }
 
 /// Строка фильтра WinDivert — ровно одна функция сборки (SSOT).
@@ -297,6 +319,27 @@ struct FlowState {
     /// seq исходящих DATA → (количество повторов | флаг «событие уже отдали» = бит 0x80).
     retx: HashMap<u32, u8>,
     last_seen: Instant,
+    // --- Реаниматор (M1, PRP 10.11.26): заполняются только при включённом режиме ---
+    /// Клиентский IP (src исходящих пакетов) — адресация RST.
+    client_ip: Option<Ipv4Addr>,
+    /// RCV.NXT клиента = ACK-поле его исходящих сегментов (bare-ACK тоже) —
+    /// это SEQ для RST.
+    rcv_nxt: Option<u32>,
+    /// SND.NXT клиента = последний outgoing seq + длина payload (+1 на SYN/FIN)
+    /// — это ACK для RST|ACK.
+    snd_nxt: Option<u32>,
+    /// Входящие DATA видели (ServerHello пришёл) — живой путь, guard: такой
+    /// поток для кейса «висящее рукопожатие» не трогаем.
+    saw_inbound_data: bool,
+    /// Момент последнего входящего DATA (порог тишины SILENCE_T).
+    last_inbound_data: Option<Instant>,
+    /// Начало попытки рукопожатия — первый исходящий пакет с DATA.
+    first_out_at: Option<Instant>,
+    /// Дупретрансы какого-то seq достигали RETRANS_THRESHOLD (кейс 2).
+    stalled_retrans: bool,
+    /// IfIdx/SubIfIdx флоу (из WinDivertAddress исходящего пакета) — адресация
+    /// инжекции в тот же интерфейс.
+    ifidx: (u32, u32),
 }
 
 impl FlowState {
@@ -310,7 +353,97 @@ impl FlowState {
             proc_path: None,
             retx: HashMap::new(),
             last_seen: Instant::now(),
+            client_ip: None,
+            rcv_nxt: None,
+            snd_nxt: None,
+            saw_inbound_data: false,
+            last_inbound_data: None,
+            first_out_at: None,
+            stalled_retrans: false,
+            ifidx: (0, 0),
         }
+    }
+
+    /// Метаданные исходящего пакета для реаниматора (в т.ч. bare-ACK без
+    /// payload — ACK-поле и есть RCV.NXT клиента).
+    fn note_outgoing_meta(
+        &mut self,
+        client_ip: IpAddr,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload_len: usize,
+        addr: &WinDivertAddress,
+    ) {
+        if let IpAddr::V4(v4) = client_ip {
+            self.client_ip = Some(v4);
+        }
+        if flags & FLAG_ACK != 0 {
+            self.rcv_nxt = Some(ack);
+        }
+        // SYN/FIN съедают один номер seq.
+        let adv = payload_len as u32
+            + if flags & (FLAG_SYN | FLAG_FIN) != 0 { 1 } else { 0 };
+        self.snd_nxt = Some(seq.wrapping_add(adv));
+        if payload_len > 0 && self.first_out_at.is_none() {
+            self.first_out_at = Some(Instant::now());
+        }
+        // IfIdx/SubIfIdx лежат в union_data[0..8] (LE) — интерфейс флоу.
+        self.ifidx = (
+            u32::from_le_bytes(addr.union_data[0..4].try_into().expect("4 байта")),
+            u32::from_le_bytes(addr.union_data[4..8].try_into().expect("4 байта")),
+        );
+    }
+
+    /// M1: условия инжекции для зависшего googlevideo-потока (PRP «уточнение
+    /// триггера»). Кейс 1 — висящее рукопожатие: ClientHello ушёл, ServerHello
+    /// не пришёл HANDSHAKE_T. Кейс 2 — установленный поток замер: дупретрансы
+    /// ≥ RETRANS_THRESHOLD и входящие DATA молчат SILENCE_T.
+    fn reanim_stall_check(&self, key: &FlowKey, now: Instant) -> Option<ReanimCandidate> {
+        let host = self.hostname.as_ref()?;
+        if !is_googlevideo(host) {
+            return None;
+        }
+        let (reason, silence) = if !self.saw_inbound_data {
+            let first = self.first_out_at?;
+            let age = now.duration_since(first);
+            if age < HANDSHAKE_T {
+                return None;
+            }
+            ("handshake", age)
+        } else {
+            if !self.stalled_retrans {
+                return None;
+            }
+            let last = self.last_inbound_data?;
+            let quiet = now.duration_since(last);
+            if quiet < SILENCE_T {
+                return None;
+            }
+            ("stall", quiet)
+        };
+        // Без RCV.NXT/SND.NXT честный RST не собрать — не инжектим (не молчим:
+        // такое состояние уже не детектится как «зависшее» до появления ACK).
+        let client_ip = self.client_ip?;
+        let rcv_nxt = self.rcv_nxt?;
+        let snd_nxt = self.snd_nxt?;
+        let IpAddr::V4(server_ip) = key.remote_ip else { return None };
+        let retx_n = self.retx.values().map(|v| (*v & 0x7F) as u32).max().unwrap_or(0);
+        Some(ReanimCandidate {
+            params: RstParams {
+                server_ip,
+                client_ip,
+                server_port: key.remote_port,
+                client_port: key.local_port,
+                seq: rcv_nxt,
+                ack: snd_nxt,
+            },
+            reason,
+            host: host.clone(),
+            retx_n,
+            silence,
+            ifidx: self.ifidx,
+        })
     }
 
     /// Возвращает Some((reason, домен)), если по этому seq надо отдать событие
@@ -336,6 +469,9 @@ impl FlowState {
         }
         let count = (*entry & 0x7F) + 1;
         if count >= RETRANS_THRESHOLD {
+            // Кейс 2 реаниматора: дупретрансы уже на пороге (событие «retrans»
+            // как было, так и остаётся — реаниматор смотрит ещё и на тишину).
+            self.stalled_retrans = true;
             if let Some(h) = self.hostname.clone() {
                 *entry = FlowState::RETX_FLAGGED;
                 return Some(("retrans", h));
@@ -460,6 +596,16 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// 4-tuple в «плоской» форме леджера реаниматора (только IPv4; v6 вне этапа).
+fn flow_key_lite_parts(remote_ip: IpAddr, remote_port: u16, local_port: u16) -> Option<FlowKeyLite> {
+    match remote_ip {
+        IpAddr::V4(ip) => {
+            Some(FlowKeyLite { remote_ip: ip, remote_port, local_port })
+        }
+        IpAddr::V6(_) => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // QUIC (UDP:443) — HTTP/3-поток: собираем Crypto из расшифрованных Initial.
 // Крипто-разбор живёт в модуле quic_sniff; здесь — только трекинг и решения.
@@ -527,7 +673,6 @@ impl QuicTracker {
     fn new() -> Self {
         Self { flows: HashMap::new(), no_decrypt_initials: 0 }
     }
-
     /// TTL и вытеснение при MAX_FLOWS — та же дисциплина, что у TCP-трекера.
     fn maintain(&mut self, now: Instant) {
         self.flows.retain(|_, st| {
@@ -551,6 +696,129 @@ impl QuicTracker {
 }
 
 // ---------------------------------------------------------------------------
+// М3: стол QUIC-потока к googlevideo (исходящие есть — входящие молчат).
+// ---------------------------------------------------------------------------
+
+/// 3-tuple (без dcid): для столова соединение идентифицируется тройкой
+/// (клиент, сервер, локальный порт) — dcid меняется при ретрае Chrome.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct QuicStallKey {
+    remote_ip: IpAddr,
+    remote_port: u16,
+    local_port: u16,
+}
+
+/// Состояние одного QUIC-флоу для реанимации (М4).
+#[derive(Clone)]
+struct QuicStallState {
+    /// SNI googlevideo подтверждён (расшифрованный Initial) — только такие
+    /// потоки реанимируем.
+    hostname_gv: bool,
+    /// Последний полноразмерный входящий пакет (≥ QUIC_DATA_MIN — медиа-данные).
+    /// ACK-мелочь не считается: она ходит и по мёртвому потоку.
+    last_inbound_data: Option<Instant>,
+    /// Последний полноразмерный исходящий пакет (запрос/ретрансмит
+    /// незаэкношенного стрима). Здоровый PING-idle полноразмерных не даёт.
+    last_outbound_data: Option<Instant>,
+    last_seen: Instant,
+}
+
+/// Трекер столов QUIC — часть рантайма реаниматора (М4).
+struct QuicStallTracker {
+    flows: HashMap<QuicStallKey, QuicStallState>,
+}
+
+impl QuicStallTracker {
+    fn new() -> Self {
+        Self { flows: HashMap::new() }
+    }
+
+    /// Исходящий пакет: полноразмерный = исходящие данные живы. Карта
+    /// пополняется всеми UDP:443-флоу (когда реаниматор включён) — лимит
+    /// MAX_FLOWS и TTL срезают балласт в maintain().
+    fn note_outbound(&mut self, key: QuicStallKey, bytes: &[u8], now: Instant) {
+        let st = self.flows.entry(key).or_insert_with(|| QuicStallState {
+            hostname_gv: false,
+            last_inbound_data: None,
+            last_outbound_data: None,
+            last_seen: now,
+        });
+        st.last_seen = now;
+        if bytes.len() >= QUIC_DATA_MIN {
+            st.last_outbound_data = Some(now);
+        }
+    }
+
+    /// Входящий пакет: полноразмерный = медиа-данные подтвердились.
+    fn note_inbound(
+        &mut self,
+        remote_ip: IpAddr,
+        remote_port: u16,
+        local_port: u16,
+        bytes_len: usize,
+        now: Instant,
+    ) {
+        if let Some(st) =
+            self.flows.get_mut(&QuicStallKey { remote_ip, remote_port, local_port })
+        {
+            st.last_seen = now;
+            if bytes_len >= QUIC_DATA_MIN {
+                st.last_inbound_data = Some(now);
+            }
+        }
+    }
+
+    /// hostname-переход googlevideo (расшифрованный Initial) — поток
+    /// подтверждён, кандидат на карантин.
+    fn mark_gv(&mut self, remote_ip: IpAddr, remote_port: u16, local_port: u16) {
+        if let Some(st) =
+            self.flows.get_mut(&QuicStallKey { remote_ip, remote_port, local_port })
+        {
+            st.hostname_gv = true;
+        }
+    }
+
+    /// Кандидаты на карантин: SNI googlevideo, входящие медиа-данные молчат
+    /// ≥ `QUIC_SILENCE_T`, при этом полноразмерные исходящие СВЕЖЕЕ входящих
+    /// (`lo > li` — Chrome гребёт против молчащего сервера) и свежие
+    /// (≤ `QUIC_RETRANS_FRESH_T` — ретрансмиты незаэкношенного; отсекает
+    /// PING-idle буфера и паузу ролика, где полноразмерных исходящих нет).
+    fn candidates(&self, now: Instant) -> Vec<(QuicStallKey, QuicStallState)> {
+        self.flows
+            .iter()
+            .filter(|(_, st)| {
+                let Some(li) = st.last_inbound_data else { return false };
+                let Some(lo) = st.last_outbound_data else { return false };
+                st.hostname_gv
+                    && lo > li
+                    && now.duration_since(li) >= QUIC_SILENCE_T
+                    && now.duration_since(lo) <= QUIC_RETRANS_FRESH_T
+            })
+            .map(|(k, st)| (k.clone(), st.clone()))
+            .collect()
+    }
+
+    /// TTL и вытеснение — та же дисциплина, что у TCP/QUIC-трекеров.
+    fn maintain(&mut self, now: Instant) {
+        self.flows.retain(|_, st| {
+            now.duration_since(st.last_seen) < Duration::from_secs(FLOW_TTL_SECS)
+        });
+        if self.flows.len() > MAX_FLOWS {
+            let mut vec: Vec<(Instant, QuicStallKey)> = self
+                .flows
+                .iter()
+                .map(|(k, v)| (v.last_seen, k.clone()))
+                .collect();
+            vec.sort_by_key(|(t, _)| *t);
+            let excess = self.flows.len() - MAX_FLOWS;
+            for (_, k) in vec.into_iter().take(excess) {
+                self.flows.remove(&k);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Данные одного пакета.
 // ---------------------------------------------------------------------------
 struct TcpInfo<'a> {
@@ -559,6 +827,9 @@ struct TcpInfo<'a> {
     src_port: u16,
     dst_port: u16,
     seq: u32,
+    /// ACK-поле сегмента (номер, который отправитель ЖДЁТ = его RCV.NXT);
+    /// валиден только при флаге ACK — реаниматору для адресации RST.seq.
+    ack: u32,
     flags: u8,
     payload: &'a [u8],
 }
@@ -634,6 +905,7 @@ fn make_tcp<'a>(
         return None;
     }
     let seq = ((tcp[4] as u32) << 24) | ((tcp[5] as u32) << 16) | ((tcp[6] as u32) << 8) | tcp[7] as u32;
+    let ack = ((tcp[8] as u32) << 24) | ((tcp[9] as u32) << 16) | ((tcp[10] as u32) << 8) | tcp[11] as u32;
     let flags = tcp[13];
     let payload = &tcp[thl..];
     Some(TcpInfo {
@@ -642,6 +914,7 @@ fn make_tcp<'a>(
         src_port: u16::from_be_bytes([tcp[0], tcp[1]]),
         dst_port: u16::from_be_bytes([tcp[2], tcp[3]]),
         seq,
+        ack,
         flags,
         payload,
     })
@@ -664,6 +937,264 @@ struct WorkerCtx {
     /// Честное предупреждение не молчит, но и не шумит: один лог за сессию.
     ipv6_warned: bool,
     packets_since_maintain: u64,
+    /// Реаниматор (M1): None = выключен (media_reanim_mode=off) или send-хендл
+    /// не открылся (причина — в логе старта).
+    reanim: Option<ReanimRuntime>,
+}
+
+/// Рантайм реаниматора: хендл инжекции + лимиты + счётчики транспорта (M2).
+struct ReanimRuntime {
+    handle: SendHandle,
+    ledger: ReanimLedger,
+    /// Ключи, по которым «лимит исчерпан» уже отдали в лог (не спамим).
+    limit_logged: HashSet<FlowKeyLite>,
+    /// M2: исходящие ClientHello к googlevideo (TCP:443) за окно отчёта.
+    gc_ch_tcp: u64,
+    /// M2: новые QUIC-потоки к googlevideo (UDP:443) за окно отчёта.
+    gc_quic: u64,
+    /// Момент последней строки отчёта о транспорте.
+    last_stats_flush: Option<Instant>,
+    /// М4: трекер столов QUIC-потоков (медиа-данных нет ≥ 10 с, ретраи свежие).
+    stall: QuicStallTracker,
+    /// М4: активные карантины флоу → (capture-хендл, дедлайн). Снятие — по
+    /// дедлайну в свипке: закрытие хендла (Drop) → blocked recv треда
+    /// карантина вернёт ошибку → тред завершится, трафик флоу отпущен.
+    quarantines: HashMap<FlowKeyLite, (CaptureHandle, Instant)>,
+}
+
+impl WorkerCtx {
+    /// M1: инжекция RST в зависший поток — лимиты, сборка, отправка, логи.
+    fn reanim_inject(&mut self, app: &AppHandle, key: &FlowKey, cand: ReanimCandidate) {
+        let Some(rt) = self.reanim.as_mut() else { return };
+        let Some(lite) = flow_key_lite_parts(key.remote_ip, key.remote_port, key.local_port) else {
+            return;
+        };
+        let now = Instant::now();
+        match rt.ledger.decide(&lite, now) {
+            InjectionDecision::Cooldown => {} // недавно уже сбрасывали — тишина
+            InjectionDecision::Limit => {
+                if rt.limit_logged.insert(lite) {
+                    app_log(
+                        app,
+                        format!(
+                            "[Реаниматор] не реанимировалось: {}:443 ({}) — лимит {} сбросов исчерпан",
+                            cand.params.server_ip, cand.host, MAX_RST
+                        ),
+                    );
+                }
+            }
+            InjectionDecision::Allow => {
+                let pkt = build_inbound_rst(&cand.params);
+                let addr = make_send_address_ifidx(cand.ifidx);
+                let reason_text = match cand.reason {
+                    "handshake" => "рукопожатие без ответа",
+                    _ => "поток замер посреди данных",
+                };
+                match rt.handle.send_packet(&pkt, &addr) {
+                    Ok(()) => {
+                        rt.ledger.note_injected(lite, now);
+                        app_log(
+                            app,
+                            format!(
+                                "[Реаниматор] сброшен зависший поток {}:{} ({}): причина — {}, {:?} назад, дупретранс {}",
+                                cand.params.server_ip,
+                                cand.params.server_port,
+                                cand.host,
+                                reason_text,
+                                cand.silence,
+                                cand.retx_n
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        app_log(app, format!("[Реаниматор] ошибка отправки RST: {}", e));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Факт успеха: новый поток к googlevideo (TCP ClientHello или QUIC
+    /// Initial) в окне SUCCESS_WINDOW после инжекции → «реанимировано».
+    fn reanim_note_new_flow(&mut self, app: &AppHandle, lite: FlowKeyLite) {
+        let Some(rt) = self.reanim.as_mut() else { return };
+        if rt.ledger.note_new_handshake(&lite, Instant::now()) {
+            app_log(
+                app,
+                "[Реаниматор] подтверждено: плеер открыл новый поток к googlevideo — видео должно ожить"
+                    .to_string(),
+            );
+        }
+    }
+
+    /// Периодическая свипка реаниматора (каждые 512 пакетов): истечение
+    /// pending без подтверждения + строка отчёта о транспорте (M2).
+    fn reanim_sweep(&mut self, app: &AppHandle, now: Instant) {
+        let Some(rt) = self.reanim.as_mut() else { return };
+        if let Some(expired) = rt.ledger.expire_pending(now) {
+            app_log(
+                app,
+                format!(
+                    "[Реаниматор] не подтвердилось: новый поток к googlevideo не появился за {} с (инжекция {})",
+                    SUCCESS_WINDOW.as_secs(),
+                    expired.remote_ip
+                ),
+            );
+        }
+
+        // М4: зависшие QUIC-потоки к googlevideo — медиа-данных (пакеты
+        // ≥ QUIC_DATA_MIN) нет ≥ QUIC_SILENCE_T, исходящие полноразмерные
+        // ретраи свежие → карантин: capture-хендл изымает пакеты ОБЕИХ
+        // направлений 5-tuple на QUARANTINE_T → Chrome не видит ни одного
+        // пакета → QUIC idle-timeout (согласованный ~30 с) → Chrome сам
+        // закрывает соединение и ретраит на новом порту (Initial с фейком
+        // winws проходит — доказано) → видео оживает. Подделки пакетов мертвы:
+        // ICMP Chrome глотает (SIO_UDP_CONNRESET), VN отбрасывает
+        // (RFC 9000 §17.2.1), остальное зашифровано — тишина единственный
+        // честный внешний «убийца» установленного QUIC.
+        rt.stall.maintain(now);
+        // Просроченные карантины снимаются: закрытие хендла (Drop) завершает
+        // recv-цикл треда, пакеты флоу снова идут в стек.
+        let expired: Vec<FlowKeyLite> = rt
+            .quarantines
+            .iter()
+            .filter_map(|(k, (_, deadline))| (*deadline <= now).then_some(*k))
+            .collect();
+        for lite in expired {
+            if let Some((qh, _)) = rt.quarantines.remove(&lite) {
+                drop(qh); // WinDivertClose → blocked recv треда выйдет
+                app_log(
+                    app,
+                    format!(
+                        "[Реаниматор] карантин {}:{} снят — поток отпущен, исходное соединение Chrome уже переоткрыл",
+                        lite.remote_ip,
+                        lite.local_port
+                    ),
+                );
+            }
+        }
+        let cands = rt.stall.candidates(now);
+        if !cands.is_empty() {
+            // Деструктуризация: заимствования раздельных полей рантайма.
+            let ReanimRuntime { ledger, quarantines, limit_logged, .. } = rt;
+            for (key, _st) in cands {
+                let IpAddr::V4(server_v4) = key.remote_ip else { continue };
+                let lite = FlowKeyLite {
+                    remote_ip: server_v4,
+                    remote_port: key.remote_port,
+                    local_port: key.local_port,
+                };
+                if quarantines.contains_key(&lite) {
+                    continue; // уже гасим этот флоу — ждём idle-timeout Chrome
+                }
+                if quarantines.len() >= QUAR_MAX_CONCURRENT {
+                    if limit_logged.insert(lite) {
+                        app_log(
+                            app,
+                            format!(
+                                "[Реаниматор] {}:{} — слоты карантина заняты (максимум {}), отложено до освобождения",
+                                server_v4, key.remote_port, QUAR_MAX_CONCURRENT
+                            ),
+                        );
+                    }
+                    continue;
+                }
+                match ledger.decide_with(&lite, now, QUAR_COOLDOWN_T, MAX_QUAR) {
+                    InjectionDecision::Cooldown => {} // недавно уже гасили — тишина
+                    InjectionDecision::Limit => {
+                        if limit_logged.insert(lite) {
+                            app_log(
+                                app,
+                                format!(
+                                    "[Реаниматор] не реанимировалось: {}:{} — лимит {} карантинов на флоу исчерпан",
+                                    server_v4, key.remote_port, MAX_QUAR
+                                ),
+                            );
+                        }
+                    }
+                    InjectionDecision::Allow => {
+                        let filter = quarantine_filter(server_v4, key.local_port);
+                        match open_capture_handle(&filter) {
+                            Ok(qh) => {
+                                spawn_quarantine_thread(qh.raw());
+                                quarantines.insert(lite, (qh, now + QUARANTINE_T));
+                                ledger.note_injected(lite, now);
+                                app_log(
+                                    app,
+                                    format!(
+                                        "[Реаниматор] карантин зависшего QUIC-потока {}:{}: медиа-данных нет {} с, исходящие ретраи есть → гашу оба направления на {} с — Chrome сам переоткроет соединение (idle-timeout)",
+                                        server_v4,
+                                        key.remote_port,
+                                        QUIC_SILENCE_T.as_secs(),
+                                        QUARANTINE_T.as_secs()
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                app_log(
+                                    app,
+                                    format!(
+                                        "[Реаниматор] ошибка открытия capture-хендла для {}:{}: {}",
+                                        server_v4, key.remote_port, e
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        match rt.last_stats_flush {
+            None => rt.last_stats_flush = Some(now),
+            Some(t) if now.duration_since(t) >= STATS_WINDOW => {
+                rt.last_stats_flush = Some(now);
+                app_log(
+                    app,
+                    format!(
+                        "[Реаниматор] транспорт видео за 5 мин: ClientHello TCP:443 — {}, новых QUIC-потоков — {}, инжекций всего (RST + карантин) — {}",
+                        rt.gc_ch_tcp,
+                        rt.gc_quic,
+                        rt.ledger.total_injections()
+                    ),
+                );
+                rt.gc_ch_tcp = 0;
+                rt.gc_quic = 0;
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// М4: фильтр карантина на полный 5-tuple (оба направления флоу). Порт сервера
+/// всегда 443 (ветка трекера гейтится на remote_port == 443), локальный — от
+/// флоу. Capture-хендл с этим фильтром изымает совпавшие пакеты из стека.
+fn quarantine_filter(server_ip: Ipv4Addr, local_port: u16) -> String {
+    format!(
+        "(outbound and ip.DstAddr == {ip} and udp.DstPort == 443 and udp.SrcPort == {lp}) or \
+         (inbound and ip.SrcAddr == {ip} and udp.SrcPort == 443 and udp.DstPort == {lp})",
+        ip = server_ip,
+        lp = local_port
+    )
+}
+
+/// М4: тред карантина — recv-цикл на capture-хендле. Полученный пакет НЕ
+/// реинжектится = изъятие (дроп): Chrome не видит ни одного пакета флоу.
+/// Завершение — по закрытию хендла родителем (WinDivertClose при Drop → recv
+/// вернёт Err) — официальный механизм остановки recv-потока WinDivert 2.x.
+fn spawn_quarantine_thread(raw: *mut std::ffi::c_void) {
+    // Raw pointer не Send — переносим хендл как usize (WinDivert допускает
+    // использование/закрытие хендла из других потоков, доки 2.x).
+    let raw_addr = raw as usize;
+    let _ = std::thread::Builder::new()
+        .name("quarantine".into())
+        .spawn(move || {
+            let raw = raw_addr as *mut std::ffi::c_void;
+            let mut buf = vec![0u8; MAX_PACKET_LEN];
+            let mut addr = unsafe { std::mem::zeroed::<WinDivertAddress>() };
+            while crate::win_divert::recv_raw_packet(raw, &mut buf, &mut addr).is_ok() {
+                // Пакет изъят и отброшен сознательно: не send'им его обратно.
+            }
+        });
 }
 
 fn handle_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], addr: &WinDivertAddress) {
@@ -679,6 +1210,18 @@ fn handle_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], addr: &WinD
         return;
     }
     let outbound = addr.is_outbound();
+
+    // Шлюз периодики — общий для TCP и UDP (М4): UDP-трафик видео обязан
+    // питать свипку реаниматора. До правки UDP-ветка выходила ДО шлюза —
+    // при QUIC-просмотре свипка голодала (тест юзера: 1 прогон за 9 мин).
+    ctx.packets_since_maintain += 1;
+    if ctx.packets_since_maintain >= 512 {
+        ctx.packets_since_maintain = 0;
+        let now = Instant::now();
+        ctx.tracker.maintain(now);
+        ctx.quic.maintain(now);
+        ctx.reanim_sweep(app, now);
+    }
 
     // UDP → QUIC-ветка (HTTP/3), всё остальное — классический TCP-детектор.
     if bytes.len() >= 10 && bytes[9] == 17 {
@@ -696,17 +1239,15 @@ fn handle_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], addr: &WinD
     };
     let key = FlowKey { remote_ip, remote_port, local_port };
 
-    ctx.packets_since_maintain += 1;
-    if ctx.packets_since_maintain >= 512 {
-        ctx.packets_since_maintain = 0;
-        let now = Instant::now();
-        ctx.tracker.maintain(now);
-        ctx.quic.maintain(now);
-    }
-
     // Исходящий (клиент → сервер): собираем ClientHello и считаем ретрансы.
     if outbound {
+        let reanim_on = ctx.reanim.is_some();
         if t.payload.is_empty() {
+            // Реаниматору нужен bare-ACK: ACK-поле = RCV.NXT (SEQ для RST).
+            if reanim_on {
+                let st = ctx.tracker.get_or_create(key.clone());
+                st.note_outgoing_meta(t.src_ip, t.seq, t.ack, t.flags, 0, addr);
+            }
             return;
         }
         if ctx.fakes.is_fake_payload(t.payload) {
@@ -715,31 +1256,75 @@ fn handle_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], addr: &WinD
             // и лочили SNI-коллектор (фантомы onetrust/google, инцидент 27.10.26).
             return;
         }
-        let state = ctx.tracker.get_or_create(key.clone());
-        // ШАГ E (PRP §7.6): владелец сокета кэшируем на живом соединении
-        // (исходящий пакет), один lookup на флоу; remote = dst.
-        if state.proc.is_none() {
-            if let Some((name, exe)) =
-                crate::process_owner::owner_name_and_exe(local_port, remote_ip, remote_port)
-            {
-                state.proc = Some(name);
-                state.proc_path = if exe.is_empty() { None } else { Some(exe) };
+        let mut cand: Option<ReanimCandidate> = None;
+        let mut gv_new_flow = false;
+        {
+            let state = ctx.tracker.get_or_create(key.clone());
+            if reanim_on {
+                state.note_outgoing_meta(t.src_ip, t.seq, t.ack, t.flags, t.payload.len(), addr);
             }
-        }
-        if let Some((reason, domain)) = state.record_outgoing(t.seq, t.payload) {
+            // ШАГ E (PRP §7.6): владелец сокета кэшируем на живом соединении
+            // (исходящий пакет), один lookup на флоу; remote = dst.
+            if state.proc.is_none() {
+                if let Some((name, exe)) =
+                    crate::process_owner::owner_name_and_exe(local_port, remote_ip, remote_port)
+                {
+                    state.proc = Some(name);
+                    state.proc_path = if exe.is_empty() { None } else { Some(exe) };
+                }
+            }
+            let hostname_was = state.hostname.is_some();
+            let event = state.record_outgoing(t.seq, t.payload);
             let proc_name = state.proc.clone();
             let proc_path = state.proc_path.clone();
-            ctx.emit(app, domain, reason, remote_ip, remote_port, proc_name, proc_path, "tls");
+            if reanim_on {
+                // M1/M2: новый ClientHello к googlevideo — счётчик транспорта
+                // + потенциальное подтверждение реанимации.
+                gv_new_flow = !hostname_was
+                    && state.hostname.as_ref().is_some_and(|h| is_googlevideo(h));
+                cand = state.reanim_stall_check(&key, Instant::now());
+            }
+            if let Some((reason, domain)) = event {
+                ctx.emit(app, domain, reason, remote_ip, remote_port, proc_name, proc_path, "tls");
+            }
+        }
+        if gv_new_flow {
+            if let Some(rt) = ctx.reanim.as_mut() {
+                rt.gc_ch_tcp += 1;
+            }
+            if let Some(lite) =
+                flow_key_lite_parts(remote_ip, remote_port, local_port)
+            {
+                ctx.reanim_note_new_flow(app, lite);
+            }
+        }
+        if let Some(c) = cand {
+            ctx.reanim_inject(app, &key, c);
         }
         return;
     }
 
-    // Входящий: RST (главный сигнал) и FIN (гашение состояния).
+    // Входящий: RST (главный сигнал), FIN (гашение состояния) и DATA (живость).
     if t.flags & FLAG_RST != 0 {
+        if addr.is_impostor() {
+            // Это НАША инжекция RST, вернувшаяся через сниффер: поток умирает —
+            // гасим состояние молча (фантомное «RST от сервера» в UI не пишем).
+            ctx.tracker.flows.remove(&key);
+            return;
+        }
         if let Some(mut state) = ctx.tracker.flows.remove(&key) {
             let proc_name = state.proc.clone();
             let proc_path = state.proc_path.clone();
             state.maintenance(Instant::now());
+            // Сервер сам закрыл поток — ожидание подтверждения реанимации
+            // этого ключа теряет смысл.
+            if let Some(rt) = ctx.reanim.as_mut() {
+                if let Some(lite) =
+                    flow_key_lite_parts(remote_ip, remote_port, local_port)
+                {
+                    rt.ledger.cancel_pending_on_server_rst(&lite);
+                }
+            }
             match state.hostname.clone() {
                 Some(domain) => {
                     ctx.emit(app, domain, "rst", remote_ip, remote_port, proc_name, proc_path, "tls")
@@ -762,6 +1347,21 @@ fn handle_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], addr: &WinD
     }
     if t.flags & FLAG_FIN != 0 {
         ctx.tracker.flows.remove(&key);
+        if let Some(rt) = ctx.reanim.as_mut() {
+            if let Some(lite) = flow_key_lite_parts(remote_ip, remote_port, local_port) {
+                rt.ledger.cancel_pending_on_server_rst(&lite);
+            }
+        }
+    } else if !t.payload.is_empty() {
+        // Входящие DATA: путь жив — guard честности реаниматора (ServerHello
+        // пришёл: кейс «висящее рукопожатие» на этот поток не действует).
+        // Только при включённом реаниматоре — поведение детектора не меняется.
+        if ctx.reanim.is_some() {
+            let st = ctx.tracker.get_or_create(key.clone());
+            st.saw_inbound_data = true;
+            st.last_inbound_data = Some(Instant::now());
+            st.last_seen = Instant::now(); // живой поток — TTL не рвёт
+        }
     }
 }
 
@@ -779,6 +1379,20 @@ fn handle_udp_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], outboun
     };
 
     if !outbound {
+        // М4: сервер ответил — QUIC-поток жив. В счёт «данных» идёт только
+        // полноразмерный пакет (≥ QUIC_DATA_MIN): ACK-мелочь ходит и по
+        // мёртвому потоку, ей стол не опровергнуть.
+        if remote_port == 443 {
+            if let Some(rt) = ctx.reanim.as_mut() {
+                rt.stall.note_inbound(
+                    remote_ip,
+                    remote_port,
+                    local_port,
+                    bytes.len(),
+                    Instant::now(),
+                );
+            }
+        }
         // Сервер ответил (Handshake/VN/Retry) — соединение живо: гасим треки
         // данного 4-tuple БЕЗ события (событие тут не нужно).
         ctx.quic.flows.retain(|k, _| {
@@ -792,6 +1406,18 @@ fn handle_udp_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], outboun
     // «QUIC: сервер не отвечает на Initial» (инцидент 27.10.26).
     if ctx.fakes.is_fake_payload(u.payload) {
         return;
+    }
+
+    // М4: исходящий пакет UDP:443 — живость ИСХОДЯЩИХ ДАННЫХ (полноразмерный
+    // пакет = запрос/ретрансмит незаэкношенного стрима; ACK-мелочь не считается).
+    if remote_port == 443 {
+        if let Some(rt) = ctx.reanim.as_mut() {
+            rt.stall.note_outbound(
+                QuicStallKey { remote_ip, remote_port, local_port },
+                bytes,
+                Instant::now(),
+            );
+        }
     }
 
     let Some(kind) = classify_quic(u.payload) else { return };
@@ -824,10 +1450,27 @@ fn handle_udp_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], outboun
         proc_path: owner_path,
         ..QuicFlowState::new()
     });
-    if let Some(domain) = state.note_initial(parsed) {
-        let proc_name = state.proc.clone();
-        let proc_path = state.proc_path.clone();
+    let hostname_was = state.hostname.is_some();
+    let proc_name = state.proc.clone();
+    let proc_path = state.proc_path.clone();
+    let event = state.note_initial(parsed);
+    // M1/M2: новый QUIC-поток к googlevideo — счётчик транспорта + факт успеха
+    // реанимации (Chrome ретраит видео по QUIC после нашего RST на TCP-фолбэк).
+    let gv_new_flow = ctx.reanim.is_some()
+        && !hostname_was
+        && state.hostname.as_deref().is_some_and(|h| is_googlevideo(h));
+    if let Some(domain) = event {
         ctx.emit(app, domain, "quic", remote_ip, remote_port, proc_name, proc_path, "quic");
+    }
+    if gv_new_flow {
+        if let Some(rt) = ctx.reanim.as_mut() {
+            rt.gc_quic += 1;
+            // М3: поток подтверждён SNI googlevideo — кандидат на ICMP-реанимацию.
+            rt.stall.mark_gv(remote_ip, remote_port, local_port);
+        }
+        if let Some(lite) = flow_key_lite_parts(remote_ip, remote_port, local_port) {
+            ctx.reanim_note_new_flow(app, lite);
+        }
     }
 }
 
@@ -933,6 +1576,26 @@ pub fn start_domain_monitor(app: AppHandle, winws_args: &[String]) -> Result<(),
     }
     let fakes = Arc::new(fakes);
 
+    // Реаниматор (PRP 10.11.26): send-хендл SNIFF|SEND_ONLY. Фильтр тот же
+    // (tcp/udp src/dst 443) — инжектируемый RST (src=сервер:443) под него
+    // подпадает по построению. Ошибка открытия не валит монитор: детектор
+    // продолжает работать, реаниматор честно сообщает о неготовности.
+    let reanim_handle = if read_reanim_mode() {
+        match open_send_handle(sniff_filter()) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                app_log(
+                    &app,
+                    format!("[Реаниматор] НЕ активен — хендл инжекции не открылся: {}", e),
+                );
+                None
+            }
+        }
+    } else {
+        app_log(&app, "[Реаниматор] выключен (media_reanim_mode = off)");
+        None
+    };
+
     let handle = open_sniff_handle(sniff_filter())
         .map_err(|e| format!("[Автомонитор] не запущен: {}", e))?;
     let raw = handle.raw();
@@ -951,7 +1614,7 @@ pub fn start_domain_monitor(app: AppHandle, winws_args: &[String]) -> Result<(),
     let thread = std::thread::Builder::new()
         .name("domain-monitor".into())
         .spawn(move || {
-            worker(app_thread, handle, stop_thread, lists, fakes);
+            worker(app_thread, handle, stop_thread, lists, fakes, reanim_handle);
         })
         .map_err(|e| format!("[Автомонитор] старт потока не удался: {}", e))?;
 
@@ -983,7 +1646,18 @@ fn worker(
     stop: Arc<AtomicBool>,
     lists: ListIndex,
     fakes: Arc<FakeBlobs>,
+    reanim_handle: Option<SendHandle>,
 ) {
+    let reanim = reanim_handle.map(|h| ReanimRuntime {
+        handle: h,
+        ledger: ReanimLedger::new(),
+        limit_logged: HashSet::new(),
+        gc_ch_tcp: 0,
+        gc_quic: 0,
+        last_stats_flush: None,
+        stall: QuicStallTracker::new(),
+        quarantines: HashMap::new(),
+    });
     let mut ctx = WorkerCtx {
         tracker: FlowTracker::new(),
         quic: QuicTracker::new(),
@@ -994,7 +1668,20 @@ fn worker(
         no_domain_count: 0,
         ipv6_warned: false,
         packets_since_maintain: 0,
+        reanim,
     };
+    if ctx.reanim.is_some() {
+        app_log(
+            &app,
+            format!(
+                "[Реаниматор] активен: рукопожатие без ответа {} с / тишина {} с → RST; карантин QUIC-стола: медиа-данных нет {} с → гашу поток на {} с (Chrome переоткроет сам)",
+                HANDSHAKE_T.as_secs(),
+                SILENCE_T.as_secs(),
+                QUIC_SILENCE_T.as_secs(),
+                QUARANTINE_T.as_secs()
+            ),
+        );
+    }
     let mut buf = vec![0u8; MAX_PACKET_LEN];
     let mut addr = WinDivertAddress { timestamp: 0, bitfields: 0, reserved2: 0, union_data: [0u8; 64] };
 
@@ -1022,6 +1709,76 @@ fn worker(
 mod tests {
     use super::*;
 
+    // --- QuicStallTracker (М4: детект по медиа-данным ≥ QUIC_DATA_MIN) ------
+    #[test]
+    fn quic_stall_candidate_requires_gv_and_data_direction() {
+        let key = QuicStallKey {
+            remote_ip: IpAddr::V4(Ipv4Addr::new(173, 194, 160, 161)),
+            remote_port: 443,
+            local_port: 51000,
+        };
+        let data_pkt = [0u8; 1200]; // ≥ QUIC_DATA_MIN — «медиа-данные»
+        let small_pkt = [0u8; 80]; // ACK/PING-мелочь — «данные» не считается
+        let t0 = Instant::now();
+
+        // 1) Только мелочь в обе стороны — «входящие данные» не обновлялись
+        //    вовсе (li = None) → кандидата нет (PING-idle не реанимируем).
+        let mut tr = QuicStallTracker::new();
+        tr.note_outbound(key.clone(), &small_pkt, t0);
+        tr.note_inbound(key.remote_ip, key.remote_port, key.local_port, small_pkt.len(), t0);
+        tr.mark_gv(key.remote_ip, key.remote_port, key.local_port);
+        assert!(tr.candidates(t0 + Duration::from_secs(30)).is_empty());
+
+        // 2) Обмен полноразмерными: out t0, in t0 → lo == li → не кандидат
+        //    (застопорило сразу после ответа — исходящих ретраев ещё нет).
+        let mut tr = QuicStallTracker::new();
+        tr.note_outbound(key.clone(), &data_pkt, t0);
+        tr.note_inbound(key.remote_ip, key.remote_port, key.local_port, data_pkt.len(), t0);
+        tr.mark_gv(key.remote_ip, key.remote_port, key.local_port);
+        assert!(tr.candidates(t0 + Duration::from_secs(12)).is_empty());
+
+        // 3) Стол: сервер замолчал после t0, клиент ретрансммитит
+        //    полноразмерные через 1 с → кандидат на t12 (молчание 12 с).
+        tr.note_outbound(key.clone(), &data_pkt, t0 + Duration::from_secs(1));
+        let cands = tr.candidates(t0 + Duration::from_secs(12));
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].0.local_port, 51000);
+
+        // ACK-мелочь от сервера НЕ освежает «входящие данные» (ACK ходит и по
+        // мёртвому потоку) — кандидат остаётся.
+        tr.note_inbound(key.remote_ip, key.remote_port, key.local_port, small_pkt.len(), t0 + Duration::from_secs(3));
+        assert!(!tr.candidates(t0 + Duration::from_secs(12)).is_empty());
+
+        // Ретраи старше QUIC_RETRANS_FRESH_T → не кандидат (Chrome сдался
+        // или поток жив в idle — карантин не нужен).
+        assert!(tr.candidates(t0 + Duration::from_secs(17)).is_empty());
+
+        // 4) Пауза ролика: сервер ответил ПОСЛЕ последнего исходящего
+        //    (li > lo) → не кандидат.
+        let mut tr = QuicStallTracker::new();
+        tr.note_outbound(key.clone(), &data_pkt, t0);
+        tr.note_inbound(key.remote_ip, key.remote_port, key.local_port, data_pkt.len(), t0 + Duration::from_secs(2));
+        tr.mark_gv(key.remote_ip, key.remote_port, key.local_port);
+        assert!(tr.candidates(t0 + Duration::from_secs(20)).is_empty());
+
+        // 5) Не-googlevideo — не кандидат никогда (51000 не помечен, 51001
+        //    помечен по чужому IP).
+        let mut tr = QuicStallTracker::new();
+        tr.note_outbound(key.clone(), &data_pkt, t0);
+        tr.mark_gv(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443, 51001);
+        tr.note_outbound(
+            QuicStallKey {
+                remote_ip: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+                remote_port: 443,
+                local_port: 51001,
+            },
+            &data_pkt,
+            t0,
+        );
+        assert!(tr.candidates(t0 + Duration::from_secs(30)).is_empty());
+    }
+
+    // --- parse_client_hello ------------------------------------------------
     // --- parse_client_hello ------------------------------------------------
     #[test]
     fn sni_parse_tls12_full() {

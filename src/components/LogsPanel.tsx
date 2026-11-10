@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { logFront, saveLogsToFile } from "@my-tauri-plugins/plugin-logs";
-import { Activity, ClipboardCopy, Save, Eraser } from "lucide-react";
+import { getLogFilePath, logFront, saveLogsToFile } from "@my-tauri-plugins/plugin-logs";
+import { Activity, ClipboardCopy, Save, Eraser, FileText } from "lucide-react";
 
 /// ЕДИНАЯ лог-область приложения (08.11.26): один источник данных —
 /// строки единого конвейера плагина logs (log::info! бэкенда + logFront
@@ -18,12 +18,26 @@ export default function LogsPanel({ lines, onClear, full = false }: {
   full?: boolean;
 }) {
   const [autoscroll, setAutoscroll] = useState(true);
+  /// Путь лог-файла — резолвит бэкенд-команда плагина (единый источник),
+  /// null = недоступен (честная строка вместо молчания; core_rules §2.5.1).
+  const [logPath, setLogPath] = useState<string | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (autoscroll) endRef.current?.scrollIntoView({ behavior: "auto" });
   }, [lines, autoscroll]);
+
+  // Путь перечитывается при каждом открытии вкладки «Логи» (full=false→true):
+  // резолв пути зависит от фактического запуска, кешировать навсегда нельзя.
+  useEffect(() => {
+    if (!full) return;
+    let alive = true;
+    getLogFilePath()
+      .then((p) => { if (alive) setLogPath(p); })
+      .catch(() => { if (alive) setLogPath(null); });
+    return () => { alive = false; };
+  }, [full]);
 
   const copyAll = () => {
     navigator.clipboard.writeText(lines.join("\n"))
@@ -37,6 +51,13 @@ export default function LogsPanel({ lines, onClear, full = false }: {
         ? `[Логи] Сохранено: ${path}`
         : "[Логи] Сохранение отменено."))
       .catch((e) => logFront(`[Логи] ОШИБКА сохранения: ${e}`));
+  };
+
+  const copyPath = () => {
+    if (!logPath) return;
+    navigator.clipboard.writeText(logPath)
+      .then(() => logFront("[Логи] Путь лог-файла скопирован: " + logPath))
+      .catch(() => logFront("[Логи] ОШИБКА: не удалось скопировать путь лог-файла."));
   };
 
   const lineClass = (l: string) => {
@@ -88,6 +109,22 @@ export default function LogsPanel({ lines, onClear, full = false }: {
           </button>
         </div>
       </div>
+      {full && (
+        <div className="flex items-center gap-2 text-xs text-gray-500 mb-2 font-mono min-w-0">
+          <FileText size={13} className="shrink-0" />
+          {logPath ? (
+            <button
+              onClick={copyPath}
+              className="truncate hover:text-gray-300 text-left"
+              title="Клик — скопировать путь лог-файла"
+            >
+              {logPath}
+            </button>
+          ) : (
+            <span>путь лог-файла недоступен</span>
+          )}
+        </div>
+      )}
       <div ref={boxRef} className="flex-1 overflow-y-auto font-mono text-sm break-all space-y-1">
         {lines.length === 0 ? <span className="text-gray-600">Ожидание действий...</span> : null}
         {lines.map((l, i) => <div key={i} className={lineClass(l)}>{l}</div>)}

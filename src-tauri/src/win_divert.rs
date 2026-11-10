@@ -36,8 +36,23 @@ pub const LAYER_NETWORK: i32 = 0;
 /// `WINDIVERT_FLAG_SNIFF = 0x0001` | `WINDIVERT_FLAG_RECV_ONLY = 0x0004` (READ_ONLY).
 pub const SNIFF_FLAGS: u64 = 0x0001 | 0x0004;
 
+/// `WINDIVERT_FLAG_SNIFF = 0x0001` | `WINDIVERT_FLAG_SEND_ONLY = 0x0008`.
+/// SNIFF оставляет легитимный трафик стеку (копия, не изъятие); SEND_ONLY
+/// запрещает Recv — хендл умеет только WinDivertSend (реаниматор инжектит RST).
+pub const SEND_FLAGS: u64 = 0x0001 | 0x0008;
+
 /// `WINDIVERT_PRIORITY_LOWEST = -30000` (header 2.x: `-WINDIVERT_PRIORITY_HIGHEST`).
 pub const SNIFF_PRIORITY: i16 = -30000;
+
+/// Флаги capture-хендла карантина (М4): 0 = ни SNIFF (пакет ИЗЫМАЕТСЯ из
+/// стека, а не копируется), ни SEND_ONLY (Recv разрешён). Дока WinDivert 2.x:
+/// полученный пакет, который хендл не реинжектировал, отбрасывается — это и
+/// есть механизм карантина (глушение обоих направлений зависшего флоу).
+pub const CAPTURE_FLAGS: u64 = 0;
+
+/// `WINDIVERT_PRIORITY_HIGHEST = 30000`: capture-хендл карантина обязан
+/// увидеть пакет РАНЬШЕ снифферов (иначе изъятие будет неполным).
+pub const CAPTURE_PRIORITY: i16 = 30000;
 
 /// `WINDIVERT_SHUTDOWN_RECV = 0x1` — штатная остановка очереди читающего потока.
 pub const SHUTDOWN_RECV: u32 = 0x1;
@@ -101,6 +116,11 @@ impl WinDivertAddress {
     pub fn is_ipv6(&self) -> bool {
         self.bitfields & (1 << 20) != 0
     }
+    /// Impostor (бит 19): пакет был заинжекчен через WinDivertSend другим
+    /// хендлом/процессом (наша инжекция RST видна снифферу с этим битом).
+    pub fn is_impostor(&self) -> bool {
+        self.bitfields & (1 << 19) != 0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +174,12 @@ type WinDivertRecvFn = unsafe extern "C" fn(
 ) -> i32; // BOOL
 type WinDivertShutdownFn = unsafe extern "C" fn(*mut c_void, u32) -> i32;
 type WinDivertCloseFn = unsafe extern "C" fn(*mut c_void) -> i32;
+type WinDivertSendFn = unsafe extern "C" fn(
+    *mut c_void,                  // handle
+    *const u8,                    // pPacket
+    u32,                          // packetLen
+    *const WinDivertAddress,      // pAddr
+) -> i32; // BOOL
 
 #[derive(Debug)]
 pub struct Syms {
@@ -163,6 +189,7 @@ pub struct Syms {
     recv: WinDivertRecvFn,
     shutdown: WinDivertShutdownFn,
     close: WinDivertCloseFn,
+    send: WinDivertSendFn,
 }
 
 impl Syms {
@@ -219,8 +246,9 @@ fn load_syms_from(dll_path: &Path) -> Result<Syms, String> {
         let recv: WinDivertRecvFn = proc!("WinDivertRecv");
         let shutdown: WinDivertShutdownFn = proc!("WinDivertShutdown");
         let close: WinDivertCloseFn = proc!("WinDivertClose");
+        let send: WinDivertSendFn = proc!("WinDivertSend");
 
-        Ok(Syms { open, recv, shutdown, close })
+        Ok(Syms { open, recv, shutdown, close, send })
     }
 }
 
@@ -259,6 +287,120 @@ pub fn open_sniff_handle(filter: &str) -> Result<SniffHandle, WinDivertError> {
         });
     }
     Ok(SniffHandle { handle, close: syms.close })
+}
+
+/// Открытие send-хендла (реаниматор): flags `SNIFF|SEND_ONLY`, приоритет LOWEST.
+/// Тот же контракт SNIFF (не изымает легитимный трафик), но Recv запрещён —
+/// только инжекция через WinDivertSend.
+pub fn open_send_handle(filter: &str) -> Result<SendHandle, WinDivertError> {
+    let c_filter = CString::new(filter)
+        .map_err(|_| WinDivertError { code: 87, detail: "в фильтре есть NUL-байт".into() })?;
+    let syms = get_sniff_syms()
+        .map_err(|detail| WinDivertError { code: 0, detail })?;
+    let handle = unsafe { (syms.open)(c_filter.as_ptr(), LAYER_NETWORK, SNIFF_PRIORITY, SEND_FLAGS) };
+
+    if handle.is_null() || handle as isize == INVALID_HANDLE_VALUE {
+        let code = unsafe { GetLastError() };
+        return Err(WinDivertError {
+            code,
+            detail: format!("фильтры: «{}»", filter),
+        });
+    }
+    Ok(SendHandle { handle, close: syms.close })
+}
+
+/// Открытие capture-хендла (карантин М4): flags 0 — пакет изымается из стека и
+/// отбрасывается, если его не реинжектировать; приоритет HIGHEST — изъятие
+/// раньше остальных хендлов.
+pub fn open_capture_handle(filter: &str) -> Result<CaptureHandle, WinDivertError> {
+    let c_filter = CString::new(filter)
+        .map_err(|_| WinDivertError { code: 87, detail: "в фильтре есть NUL-байт".into() })?;
+    let syms = get_sniff_syms()
+        .map_err(|detail| WinDivertError { code: 0, detail })?;
+    let handle = unsafe { (syms.open)(c_filter.as_ptr(), LAYER_NETWORK, CAPTURE_PRIORITY, CAPTURE_FLAGS) };
+
+    if handle.is_null() || handle as isize == INVALID_HANDLE_VALUE {
+        let code = unsafe { GetLastError() };
+        return Err(WinDivertError {
+            code,
+            detail: format!("фильтры: «{}»", filter),
+        });
+    }
+    Ok(CaptureHandle { handle, close: syms.close })
+}
+
+/// RAII-хендл карантина (М4): recv-цикл треда глотает пакеты (не реинжектит),
+/// закрытие из Drop снимает карантин — blocked recv треда вернёт ошибку и
+/// тред завершится.
+#[derive(Debug)]
+pub struct CaptureHandle {
+    handle: *mut c_void,
+    close: WinDivertCloseFn,
+}
+
+unsafe impl Send for CaptureHandle {}
+
+impl CaptureHandle {
+    /// Сырой хендл для recv-треда карантина (владелец хендла — рантайм).
+    pub fn raw(&self) -> *mut c_void {
+        self.handle
+    }
+}
+
+impl Drop for CaptureHandle {
+    fn drop(&mut self) {
+        if !self.handle.is_null() && self.handle as isize != INVALID_HANDLE_VALUE {
+            unsafe { (self.close)(self.handle) };
+        }
+        self.handle = std::ptr::null_mut();
+    }
+}
+
+/// RAII-хендл для инжекции пакетов (WinDivertSend). Drop — официальное close.
+#[derive(Debug)]
+pub struct SendHandle {
+    handle: *mut c_void,
+    close: WinDivertCloseFn,
+}
+
+unsafe impl Send for SendHandle {}
+
+impl SendHandle {
+    /// Инжектит готовый пакет (например, inbound RST реаниматора). Адрес
+    /// (`WinDivertAddress`) несёт IfIdx/SubIfIdx + направление (inbound):
+    /// реаниматор копирует их из последнего sniffed-адреса этого флоу.
+    pub fn send_packet(
+        &self,
+        bytes: &[u8],
+        addr: &WinDivertAddress,
+    ) -> Result<(), WinDivertError> {
+        if bytes.len() > MAX_PACKET_LEN {
+            return Err(WinDivertError {
+                code: 122,
+                detail: format!("пакет {} байт больше лимита 0xFFFF", bytes.len()),
+            });
+        }
+        let syms = get_sniff_syms()
+            .map_err(|detail| WinDivertError { code: 0, detail })?;
+        let ok = unsafe { (syms.send)(self.handle, bytes.as_ptr(), bytes.len() as u32, addr) };
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err(WinDivertError {
+                code: unsafe { GetLastError() },
+                detail: String::new(),
+            })
+        }
+    }
+}
+
+impl Drop for SendHandle {
+    fn drop(&mut self) {
+        if !self.handle.is_null() && self.handle as isize != INVALID_HANDLE_VALUE {
+            unsafe { (self.close)(self.handle) };
+        }
+        self.handle = std::ptr::null_mut();
+    }
 }
 
 /// RAII-хендл: Drop вызывает официальное WinDivertClose. `Send` — штатно для
@@ -306,6 +448,29 @@ impl SniffHandle {
     }
 }
 
+/// Recv на СЫРОМ хендле (карантин М4): тред карантина держит только
+/// `CaptureHandle::raw()` и читает через эту функцию — поля `Syms` закрыты.
+/// При закрытии хендла владельцем (Drop) вернёт Err — штатное завершение
+/// recv-цикла треда карантина.
+pub fn recv_raw_packet(
+    handle: *mut c_void,
+    buf: &mut [u8],
+    addr: &mut WinDivertAddress,
+) -> Result<usize, WinDivertError> {
+    let syms = get_sniff_syms()
+        .map_err(|detail| WinDivertError { code: 0, detail })?;
+    let mut recv_len: u32 = 0;
+    let ok = unsafe { (syms.recv)(handle, buf.as_mut_ptr(), buf.len() as u32, &mut recv_len, addr) };
+    if ok != 0 {
+        Ok(recv_len as usize)
+    } else {
+        Err(WinDivertError {
+            code: unsafe { GetLastError() },
+            detail: String::new(),
+        })
+    }
+}
+
 impl Drop for SniffHandle {
     fn drop(&mut self) {
         if !self.handle.is_null() && self.handle as isize != INVALID_HANDLE_VALUE {
@@ -329,6 +494,15 @@ mod tests {
         assert_eq!(std::mem::align_of::<WinDivertAddress>(), 8);
     }
 
+    // М4: capture-хендл карантина = ИЗЪЯТИЕ (flags 0) на приоритете HIGHEST.
+    #[test]
+    fn capture_flags_allow_recv_and_isolate() {
+        assert_eq!(CAPTURE_FLAGS, 0);
+        assert_eq!(CAPTURE_FLAGS & 0x0001, 0, "SNIFF превратил бы изъятие в копию");
+        assert_eq!(CAPTURE_FLAGS & 0x0008, 0, "SEND_ONLY запретил бы Recv-цикл");
+        assert_eq!(CAPTURE_PRIORITY, 30000);
+    }
+
     #[test]
     fn bitfield_extraction_layer_event_outbound() {
         // Layer=0 (NETWORK), Event=0 (packet), Sniffed=1, Outbound=1, Loopback=0,
@@ -345,9 +519,30 @@ mod tests {
         assert!(a.is_outbound());
         assert!(!a.is_loopback());
         assert!(!a.is_ipv6());
+        assert!(!a.is_impostor());
         // IPv6-флаг.
         a.bitfields |= 1 << 20;
         assert!(a.is_ipv6());
+        // Impostor: пакет, заинжекченный чужим WinDivertSend (наш RST).
+        a.bitfields |= 1 << 19;
+        assert!(a.is_impostor());
+    }
+
+    #[test]
+    fn send_handle_nul_filter_rejected() {
+        // NUL отсекается ДО загрузки DLL — честный код 87 без драйвера.
+        let res = open_send_handle("bad\0filter");
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, 87);
+    }
+
+    #[test]
+    fn send_flags_dont_allow_recv_only_mixup() {
+        // SEND_FLAGS обязан содержать SEND_ONLY (0x0008) и НЕ содержать
+        // RECV_ONLY (0x0004) — иначе Recv/Send-контракты хендлов перепутаются.
+        assert_eq!(SEND_FLAGS & 0x0008, 0x0008, "нет SEND_ONLY");
+        assert_eq!(SEND_FLAGS & 0x0004, 0, "лишний RECV_ONLY");
+        assert_eq!(SEND_FLAGS & 0x0001, 0x0001, "нет SNIFF");
     }
 
     #[test]
