@@ -233,6 +233,30 @@ pub fn refine_with_isp_redirect(verdict: Verdict, isp_redirect: Option<&str>) ->
     }
 }
 
+/// Слой, на котором HTTPS-проба по настоящим (DoH) адресам не открыла сайт.
+/// Выводится один раз из результатов пробы (SSOT, `site_probe`) и доводится
+/// до текста вердикта, чтобы тот не утверждал больше, чем показала проба
+/// (инцидент 10.11.26: «TLS до него обрывается» при так и не открывшемся
+/// TCP:443 — догадка, поданная как факт; core rules §1.9).
+///
+/// Значение читается только при `doh_http80_hint == true`; пустой список
+/// DoH-адресов подсказку по порту 80 не даёт вовсе (`probe_alive_over_http80`
+/// на пустом списке = false), поэтому для него слой в текст не попадает.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DohFailLayer {
+    /// TCP:443 не установился ни по одному адресу — TLS-рукопожатие даже не
+    /// начиналось. `any_reset`: соединение активно сбрасывалось (RST/отказ);
+    /// false — запросы остались без ответа (тихий дроп порта).
+    TcpDead { any_reset: bool },
+    /// TCP:443 открылся, но TLS-рукопожатие рвётся (RST/TLS-ошибка) —
+    /// честная зона SNI-десинка winws.
+    HandshakeBroken,
+    /// TCP:443 открылся, HTTPS-проба не подтвердилась по другой причине
+    /// (таймаут, отказ сервера и т.п.) — утверждать, что именно режется,
+    /// данных недостаточно.
+    Unconfirmed,
+}
+
 /// Контекст для разбора причины: всё, что известно о домене на момент проверки.
 #[derive(Debug)]
 pub struct CauseContext<'a> {
@@ -250,9 +274,13 @@ pub struct CauseContext<'a> {
     /// Хост, на который провайдер подменил редирект вместо ответа сервера.
     pub isp_redirect: Option<&'a str>,
     /// По HTTP-порту 80 у проверенных (DoH) адресов приходил осмысленный
-    /// ответ сайта/CDN: транспорт до настоящего адреса жив, а TLS/SNI рвёт
-    /// цензор. Меняет ТЕКСТ причины (совет включить обход), не вердикт.
+    /// ответ сайта/CDN: транспорт до настоящего адреса жив. Меняет ТЕКСТ
+    /// причины (советы), не вердикт; что именно режется — см. `doh_fail_layer`.
     pub doh_http80_hint: bool,
+    /// Слой отказа HTTPS-пробы по настоящим адресам (`DohFailLayer`).
+    /// Вердикт обязан опираться на него, а не угадывать по паре
+    /// «порт 80 жив + HTTPS не открылся» (инцидент 10.11.26).
+    pub doh_fail_layer: DohFailLayer,
     /// Найденные через DoH адреса, HTTPS-пробу по которым приложение
     /// не сумело подтвердить. Пустой список = кандидатов нет вовсе —
     /// тогда никакого «hosts-совета» по кандидатам не появляется.
@@ -408,10 +436,14 @@ fn probable_cause(verdict: Verdict, ctx: &CauseContext) -> String {
     }
 }
 
-/// Текст первопричины для отравленного DNS. Различает три разных случая,
-/// потому что лечение у них разное:
+/// Текст первопричины для отравленного DNS. Различает случаи, потому что
+/// лечение у них разное:
 /// - найти рабочий адрес (лечится hosts);
-/// - не найти адрес, но HTTP:80 подтвердил живой транспорт (лечится обходом);
+/// - не найти адрес, но HTTP:80 подтвердил живой транспорт — текст держится
+///   в рамках слоя отказа (`doh_fail_layer`, SSOT из пробы): мёртвый TCP,
+///   рвущееся рукопожатие и непонятный отказ — разные болезни с разным
+///   лечением (инцидент 10.11.26: «TLS обрывается» при так и не открывшемся
+///   TCP:443 — догадка, поданная как факт);
 /// - не найти адрес вообще (сначала смена DNS, hosts советовать нельзя).
 fn dns_poisoned_cause(ctx: &CauseContext) -> String {
     let apex = ctx.apex_ip.unwrap_or("?");
@@ -420,10 +452,36 @@ fn dns_poisoned_cause(ctx: &CauseContext) -> String {
             "DNS подменён: системный DNS отдал для «{}» адрес {}, но настоящие адреса сайта лежат на другом сервере. Через подменённый адрес сайт не открывается, а через проверенный адрес {} — открывается. Лечение — записать этот адрес в файл hosts.",
             ctx.host, apex, ip
         ),
-        None if ctx.doh_http80_hint => format!(
-            "DNS подменён: системный DNS отдал для «{}» адрес {}, который сайту не принадлежит. Настоящий адрес через защищённый канал найден, но TLS до него обрывается (по обычному HTTP:80 сайт отвечает — транспорт до него жив, режется именно TLS/SNI). Такой режим лечится обходом DPI (winws) для этого домена либо записью настоящего адреса в hosts.",
-            ctx.host, apex
-        ),
+        None if ctx.doh_http80_hint => {
+            match ctx.doh_fail_layer {
+                DohFailLayer::TcpDead { any_reset } => {
+                    let cut = if any_reset {
+                        "TCP-подключение к ним на порту 443 не проходит: соединение активно сбрасывается (RST/отказ)"
+                    } else {
+                        "TCP-подключение к ним на порту 443 не проходит: запросы остаются без ответа"
+                    };
+                    format!(
+                        "DNS подменён: системный DNS отдал для «{}» адрес {}, который сайту не принадлежит. Настоящие адреса через защищённый канал найдены, но {}. При этом порт 80 тех же адресов отвечает — фильтр режет именно порт 443. TLS-рукопожатие не начинается: SNI-десинк нечему применять, поэтому обход winws и запись в hosts тут не помогут. Такую блокировку обходит VPN или смена сети.",
+                        ctx.host, apex, cut
+                    )
+                }
+                DohFailLayer::HandshakeBroken => format!(
+                    "DNS подменён: системный DNS отдал для «{}» адрес {}, который сайту не принадлежит. Настоящий адрес через защищённый канал найден, но TLS-рукопожатие на нём рвётся (TCP-подключение проходит, по обычному HTTP:80 сайт тоже отвечает — транспорт жив, режется именно TLS/SNI). Такой режим лечится обходом DPI (winws) для этого домена.",
+                    ctx.host, apex
+                ),
+                DohFailLayer::Unconfirmed => {
+                    let note = ctx
+                        .probe_fail_note
+                        .as_deref()
+                        .map(|n| format!(" (причина: {})", n))
+                        .unwrap_or_default();
+                    format!(
+                        "DNS подменён: системный DNS отдал для «{}» адрес {}, который сайту не принадлежит. Настоящие адреса через защищённый канал найдены, но HTTPS-проба по ним не подтвердилась{}. При этом порт 80 тех же адресов отвечает — транспорт жив. Утверждать, что именно режется, данных недостаточно.",
+                        ctx.host, apex, note
+                    )
+                }
+            }
+        }
         None => {
             let note = ctx
                 .probe_fail_note
@@ -612,13 +670,40 @@ fn dns_poisoned_actions(ctx: &CauseContext, d: &mut Diagnosis) {
             );
         }
         None => {
-            // TLS рвётся цензором, а транспорт жив — обходим через winws.
-            if ctx.doh_http80_hint {
-                d.do_this.insert(
-                    0,
-                    "Включите профиль обхода и откройте сайт снова: TLS до настоящего адреса режется цензором, по обычному HTTP:80 сайт отвечает."
-                        .to_string(),
-                );
+            // Что честно советовать, решает слой отказа из пробы (SSOT
+            // doh_fail_layer), а не догадка «80 жив → рвётся TLS».
+            // Инцидент 10.11.26: при мёртвом TCP:443 совет «включите профиль
+            // обхода» был ложью — десинк нечему применять.
+            match ctx.doh_fail_layer {
+                DohFailLayer::HandshakeBroken => {
+                    d.do_this.insert(
+                        0,
+                        "Включите профиль обхода и откройте сайт снова: TLS до настоящего адреса режется цензором, по обычному HTTP:80 сайт отвечает."
+                            .to_string(),
+                    );
+                }
+                DohFailLayer::TcpDead { .. } => {
+                    d.do_this.insert(
+                        0,
+                        "Такую блокировку (фильтр режет порт 443 на уровне TCP) обходит VPN или смена сети."
+                            .to_string(),
+                    );
+                    d.wont_help.push(
+                        "Обход winws тут не поможет: TCP-подключение не устанавливается — TLS-рукопожатие не начинается, десинкать нечего."
+                            .to_string(),
+                    );
+                    d.wont_help.push(
+                        "Запись в hosts тут не поможет: режется порт 443, а не имя — подмена адреса мёртвый порт не оживит."
+                            .to_string(),
+                    );
+                }
+                DohFailLayer::Unconfirmed => {
+                    d.do_this.insert(
+                        0,
+                        "Можно попробовать включить профиль обхода: он помогает, если режется TLS-рукопожатие. По данным пробы утверждать, что именно режется, нельзя."
+                            .to_string(),
+                    );
+                }
             }
             // Честность (core §2.2): найденные DoH-адреса нельзя прятать только
             // потому, что приложение само не сумело их проверить. Показываем
@@ -669,9 +754,109 @@ mod tests {
             same_host_alt_ip_works: false,
             isp_redirect: None,
             doh_http80_hint: false,
+            doh_fail_layer: DohFailLayer::Unconfirmed,
             doh_candidates: Vec::new(),
             probe_fail_note: None,
         }
+    }
+
+    /// Инцидент 10.11.26 (googlevideo.com): при так и не открывшемся TCP:443
+    /// вердикт лгал — «TLS обрывается», «лечится winws», «hosts поможет».
+    /// Текст причины обязан держаться в рамках слоя отказа (doh_fail_layer).
+    #[test]
+    fn dns_blocked_tcp_dead_says_vpn_not_winws_or_hosts() {
+        let mut c = ctx("googlevideo.com");
+        c.dns_spoofed = true;
+        c.doh_http80_hint = true;
+        c.doh_candidates = vec!["142.250.120.147".to_string()];
+        c.doh_fail_layer = DohFailLayer::TcpDead { any_reset: false };
+        let d = explain(Verdict::DnsBlocked, &c);
+        let actions = d.do_this.join("\n");
+        let wont = d.wont_help.join("\n");
+        assert!(d.probable_cause.contains("VPN"), "{}", d.probable_cause);
+        assert!(
+            d.probable_cause.contains("нечему применять"),
+            "{}",
+            d.probable_cause
+        );
+        assert!(
+            !d.probable_cause.contains("режется именно TLS/SNI"),
+            "{}",
+            d.probable_cause
+        );
+        assert!(
+            !d.probable_cause.contains("лечится обходом DPI"),
+            "{}",
+            d.probable_cause
+        );
+        assert!(
+            !d.probable_cause.contains("записью настоящего адреса в hosts"),
+            "{}",
+            d.probable_cause
+        );
+        assert!(!actions.contains("Включите профиль обхода"), "{}", actions);
+        assert!(actions.contains("VPN"), "{}", actions);
+        assert!(wont.contains("десинкать нечего"), "{}", wont);
+        assert!(wont.contains("hosts"), "{}", wont);
+    }
+
+    /// Тихий дроп и активный сброс — разные картины; RST обязан звучать в
+    /// тексте, иначе проба, видевшая RST, описана неверно.
+    #[test]
+    fn dns_blocked_tcp_dead_rst_is_named() {
+        let mut c = ctx("example.com");
+        c.dns_spoofed = true;
+        c.doh_http80_hint = true;
+        c.doh_fail_layer = DohFailLayer::TcpDead { any_reset: true };
+        let d = explain(Verdict::DnsBlocked, &c);
+        assert!(d.probable_cause.contains("RST"), "{}", d.probable_cause);
+    }
+
+    /// Рукопожатие рвётся при живом TCP — единственный случай, где совет
+    /// «включите профиль обхода» правдив (SNI-десинк применим).
+    #[test]
+    fn dns_blocked_handshake_broken_recommends_bypass() {
+        let mut c = ctx("example.com");
+        c.dns_spoofed = true;
+        c.doh_http80_hint = true;
+        c.doh_fail_layer = DohFailLayer::HandshakeBroken;
+        let d = explain(Verdict::DnsBlocked, &c);
+        let actions = d.do_this.join("\n");
+        assert!(
+            d.probable_cause.contains("режется именно TLS/SNI"),
+            "{}",
+            d.probable_cause
+        );
+        assert!(actions.contains("Включите профиль обхода"), "{}", actions);
+    }
+
+    /// Данных недостаточно — вердикт не имеет права утверждать, что именно
+    /// режется, и обещать обход.
+    #[test]
+    fn dns_blocked_unconfirmed_does_not_assert_the_cut_layer() {
+        let mut c = ctx("example.com");
+        c.dns_spoofed = true;
+        c.doh_http80_hint = true;
+        c.probe_fail_note = Some("таймаут".to_string());
+        c.doh_fail_layer = DohFailLayer::Unconfirmed;
+        let d = explain(Verdict::DnsBlocked, &c);
+        let actions = d.do_this.join("\n");
+        assert!(
+            d.probable_cause.contains("данных недостаточно"),
+            "{}",
+            d.probable_cause
+        );
+        assert!(
+            d.probable_cause.contains("причина: таймаут"),
+            "{}",
+            d.probable_cause
+        );
+        assert!(!actions.contains("режется цензором"), "{}", actions);
+        assert!(
+            actions.contains("утверждать, что именно режется, нельзя"),
+            "{}",
+            actions
+        );
     }
 
     #[test]
@@ -983,14 +1168,19 @@ fn clean_dns_site_opens_via_system_is_open() {
         );
     }
 
-    /// HTTP:80 подтвердил живой транспорт: причина говорит об обходе/резке
-    /// TLS, но НЕ декларирует, что сайт мёртв.
+    /// HTTP:80 подтвердил живой транспорт: причина называет транспорт живым
+    /// и НЕ декларирует смерть сайта. Утверждение про TLS допустимо только
+    /// на слое HandshakeBroken (инцидент 10.11.26: при мёртвом TCP «TLS
+    /// рвётся» было догадкой — текст держится в рамках слоя отказа).
     #[test]
-    fn spoofed_http80_hint_upgrades_tls_note() {
+    fn spoofed_http80_hint_keeps_cause_within_probe_layer() {
+        // Слой Unconfirmed (TCP открылся, HTTPS не подтвердился): транспорт
+        // жив, но утверждать, что именно режется, — нельзя.
         let mut c = ctx("example.com");
         c.dns_spoofed = true;
         c.apex_ip = Some("188.186.154.88");
         c.doh_http80_hint = true;
+        c.doh_fail_layer = DohFailLayer::Unconfirmed;
         let d = explain(Verdict::DnsBlocked, &c);
         assert!(
             d.probable_cause.contains("подменён"),
@@ -998,10 +1188,39 @@ fn clean_dns_site_opens_via_system_is_open() {
             d.probable_cause
         );
         assert!(
-            d.probable_cause.contains("TLS"),
+            d.probable_cause.contains("транспорт жив"),
             "{}",
             d.probable_cause
         );
+        assert!(
+            d.probable_cause.contains("данных недостаточно"),
+            "{}",
+            d.probable_cause
+        );
+        assert!(
+            !d.probable_cause.contains("сайт мёртв"),
+            "{}",
+            d.probable_cause
+        );
+        assert!(
+            !d.probable_cause.contains("режется именно TLS/SNI"),
+            "{}",
+            d.probable_cause
+        );
+        assert!(
+            d.do_this.iter().any(|a| a.contains("обхода")),
+            "{:?}",
+            d.do_this
+        );
+
+        // Слой HandshakeBroken — единственное основание для TLS-текста.
+        let mut c = ctx("example.com");
+        c.dns_spoofed = true;
+        c.apex_ip = Some("188.186.154.88");
+        c.doh_http80_hint = true;
+        c.doh_fail_layer = DohFailLayer::HandshakeBroken;
+        let d = explain(Verdict::DnsBlocked, &c);
+        assert!(d.probable_cause.contains("TLS"), "{}", d.probable_cause);
         assert!(
             !d.probable_cause.contains("сайт мёртв"),
             "{}",

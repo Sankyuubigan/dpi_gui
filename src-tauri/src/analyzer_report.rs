@@ -22,6 +22,12 @@ pub struct ReportMeta {
     pub main_probe: Option<site_probe::DomainProbe>,
     /// Автопроверка «подмены DNS» для главного домена (пусто, если сайт открывается).
     pub main_dns_sub: Vec<site_probe::DnsSubstitution>,
+    /// Та же проверка С ВКЛЮЧЁННЫМ обходом (фаза ON): DoH-сервисы резолвятся
+    /// и в чистом окне, и с обходом (РКН блокирует сами DoH — без обхода часть
+    /// списка горит таймаутами), подмена идёт по merged-ответам. Пусто, если
+    /// сайт открывается, вердикт GeoBlocked/ServiceRestricted или обход не
+    /// включался.
+    pub main_dns_sub_on: Vec<site_probe::DnsSubstitution>,
     /// Проверка подмены DNS для доменов из списка «не резолвится» (до 5).
     pub dns_fail_sub: Vec<(String, Vec<site_probe::DnsSubstitution>)>,
     /// Разбор первопричины недоступности главного домена: разновидность 403,
@@ -777,29 +783,24 @@ fn write_block_scan(log: &mut String, meta: &ReportMeta) {
 }
 
 fn write_dns_substitution(log: &mut String, meta: &ReportMeta) {
-    if meta.main_dns_sub.is_empty() {
+    if meta.main_dns_sub.is_empty() && meta.main_dns_sub_on.is_empty() {
         return;
     }
     let probe = meta.main_probe.as_ref();
 
     log.push_str("🔁 ПРОВЕРКА ПОДМЕНЫ DNS (обход отравленного DNS через DoH):\n");
+    // Колонка БЕЗ обхода: что реально ответили DoH-сервисы при выключенном winws.
     for sub in &meta.main_dns_sub {
-        if sub.http_ok && sub.working_ip.is_some() {
-            log.push_str(&format!("  ✅ {} — {}\n", sub.service, sub.http_note));
-        } else if sub.resolved.is_empty() {
-            log.push_str(&format!("  ❌ {} — {}\n", sub.service, sub.http_note));
-        } else if sub.working_ip.is_some() {
-            // TCP-кандидат есть, но HTTPS не открылся: адрес отвечает, сайт —
-            // нет. Это не доказательство «блока по SNI, а не DNS» (раньше
-            // врали именно так) — лишь факт, что подмена не открыла сайт.
-            log.push_str(&format!(
-                "  ❌ {} — {}. IP {} сайт не открыли (адрес отвечает, HTTPS — нет)\n",
-                sub.service,
-                sub.http_note,
-                sub.resolved.join(", ")
-            ));
-        } else {
-            log.push_str(&format!("  ❌ {} — {}\n", sub.service, sub.http_note));
+        log.push_str(&dns_sub_row(sub));
+    }
+
+    // Колонка С обходом: РКН режет сами DoH-сервисы, поэтому рабочий IP может
+    // найтись только при активном winws. Пустая колонка = ON-фаза не запускалась
+    // (сайт открылся без обхода / GeoBlocked / ServiceRestricted / обход выкл).
+    if !meta.main_dns_sub_on.is_empty() {
+        log.push_str("  → С ВКЛЮЧЁННЫМ ОБХОДОМ (те же сервисы, проба при активном winws):\n");
+        for sub in &meta.main_dns_sub_on {
+            log.push_str(&dns_sub_row(sub));
         }
     }
 
@@ -826,12 +827,70 @@ fn write_dns_substitution(log: &mut String, meta: &ReportMeta) {
         }
         log.push_str("    Затем выполните: ipconfig /flushdns\n");
     } else {
-        // Не советуем hosts, если ни один IP не дал валидного HTTPS: подсказка
-        // «пропишите IP вручную» без доказанного рабочего адреса бесполезна.
-        log.push_str("  → ПОДМЕНА DNS НЕ ПОМОГЛА: ни один из найденных IP не отдал валидный HTTPS-ответ для этого имени.\n");
-        log.push_str("    Смена DNS и запись в hosts тут не помогут — ищите причину в блоке «ВЕРОЯТНАЯ ПРИЧИНА» выше.\n");
+        // Рабочий IP из ON-колонки: сайт открылся только при активном winws —
+        // hosts-запись сама по себе сайт не оживит (без обхода TCP:443 к этому
+        // адресу режется DPI).
+        let on_ip = meta
+            .main_dns_sub_on
+            .iter()
+            .find(|s| s.http_ok)
+            .and_then(|s| s.working_ip.clone());
+        let on_entries = on_ip.as_deref().map(|ip| {
+            crate::site_verdict::hosts_lines(&meta.main_host_name(), Some(ip))
+        });
+        if let Some(lines) = on_entries.filter(|l| !l.is_empty()) {
+            log.push_str("  → ПРОВЕРЕННЫЙ АДРЕС НАЙДЕН (работает только С ВКЛЮЧЁННЫМ обходом — hosts-запись без активного winws сайт не оживит):\n");
+            for line in &lines {
+                log.push_str(&format!("      {}\n", line));
+            }
+            log.push_str("    Затем выполните: ipconfig /flushdns\n");
+        } else if has_any_completed_check(&meta.main_dns_sub)
+            || has_any_completed_check(&meta.main_dns_sub_on)
+        {
+            // Честность §1.9 (инцидент 09.11.26): «не помогло» можно писать только
+            // когда проверки РЕАЛЬНО состоялись. «не проверено: не хватило бюджета
+            // окна» — это не результат, а отсутствие проверки; писать по нему
+            // «НЕ ПОМОГЛА» — ложь.
+            log.push_str("  → ПОДМЕНА DNS НЕ ПОМОГЛА: ни один из ПРОВЕРЕННЫХ IP не отдал валидный HTTPS-ответ для этого имени.\n");
+            log.push_str("    Смена DNS и запись в hosts тут не помогут — ищите причину в блоке «ВЕРОЯТНАЯ ПРИЧИНА» выше.\n");
+        } else {
+            log.push_str("  → Проверка подмены DNS не состоялась: не хватило бюджета окна. Повторите анализ.\n");
+        }
     }
     log.push('\n');
+}
+
+/// Строка одного DoH-сервиса (формат общий для OFF- и ON-колонок отчёта).
+fn dns_sub_row(sub: &site_probe::DnsSubstitution) -> String {
+    if sub.http_ok && sub.working_ip.is_some() {
+        format!("  ✅ {} — {}\n", sub.service, sub.http_note)
+    } else if sub.resolved.is_empty() {
+        format!("  ❌ {} — {}\n", sub.service, sub.http_note)
+    } else if sub.working_ip.is_some() {
+        // TCP-кандидат есть, но HTTPS не открылся: адрес отвечает, сайт —
+        // нет. Это не доказательство «блока по SNI, а не DNS» (раньше
+        // врали именно так) — лишь факт, что подмена не открыла сайт.
+        format!(
+            "  ❌ {} — {}. IP {} сайт не открыли (адрес отвечает, HTTPS — нет)\n",
+            sub.service,
+            sub.http_note,
+            sub.resolved.join(", ")
+        )
+    } else {
+        format!("  ❌ {} — {}\n", sub.service, sub.http_note)
+    }
+}
+
+/// Есть ли в колонке хотя бы одна РЕАЛЬНО проведённая проверка (сетевой факт).
+/// Пометки «не проверено» / «ошибка DoH» / «HTTPS не проверен» — отсутствие
+/// проверки, а не её результат: они не дают права писать «НЕ ПОМОГЛА».
+fn has_any_completed_check(subs: &[site_probe::DnsSubstitution]) -> bool {
+    subs.iter().any(|s| {
+        s.http_ok
+            || !(s.http_note.starts_with("не проверено")
+                || s.http_note.starts_with("ошибка DoH")
+                || s.http_note.starts_with("HTTPS не проверен"))
+    })
 }
 
 /// Фоновый домен (трекер/телеметрия/аналитика): на доступность сайта не
@@ -1089,7 +1148,7 @@ mod tests {
     use crate::analyzer_probe::Classification;
     use crate::diagnostics_probe::{DnsInfo, DnsState, HttpResult};
     use crate::site_probe::{DomainProbe, IpSource};
-    use crate::site_verdict::{CauseContext, Verdict};
+    use crate::site_verdict::{CauseContext, DohFailLayer, Verdict};
 
     fn empty_classification() -> Classification {
         Classification {
@@ -1111,6 +1170,7 @@ mod tests {
             had_browser_failures: false,
             main_probe: Some(probe),
             main_dns_sub: Vec::new(),
+            main_dns_sub_on: Vec::new(),
             dns_fail_sub: Vec::new(),
             block_scan: None,
             bypass_map: std::collections::HashMap::new(),
@@ -1125,6 +1185,121 @@ mod tests {
         let mut m = meta_with(www_only_probe());
         m.bypass_on = false;
         m
+    }
+
+    /// Проба «мёртвого» домена: вердикт IpReset, ни одного рабочего адреса
+    /// (hosts_entries пуст ⇒ отчёт попадает в честные ветки подмены DNS).
+    fn broken_probe() -> DomainProbe {
+        let mut dns = DnsInfo::new();
+        dns.system = vec!["1.2.3.4".parse().unwrap()];
+        DomainProbe {
+            host: "example.com".to_string(),
+            dns,
+            primary_ips: vec!["1.2.3.4".to_string()],
+            doh_ips: vec![],
+            doh_gateway_ips: vec![],
+            doh_ip_services: vec![],
+            working_ip: None,
+            working_ip_source: None,
+            working_http: None,
+            http_note: "ни один IP не ответил на TCP:443".to_string(),
+            verdict: Verdict::IpReset,
+            www_host: None,
+            www_ips: vec![],
+            www_url: None,
+            isp_redirect: None,
+            dns_spoofed: None,
+            geo_dns_note: None,
+            doh_failures: vec![],
+            big_ch_dropped: None,
+            big_ch_working_ip: None,
+            diagnosis: None,
+        }
+    }
+
+    /// Строка подмены DNS для теста (OFF- и ON-колонки отчёта).
+    fn dns_sub(
+        service: &str,
+        ip: Option<&str>,
+        note: &str,
+        ok: bool,
+    ) -> crate::site_probe::DnsSubstitution {
+        crate::site_probe::DnsSubstitution {
+            service: service.to_string(),
+            resolved: ip.map(|v| vec![v.to_string()]).unwrap_or_default(),
+            working_ip: ip.map(|v| v.to_string()),
+            http_note: note.to_string(),
+            http_ok: ok,
+            http: if ok { Some(HttpResult::Ok(200)) } else { None },
+        }
+    }
+
+    /// Честность §1.9 (инцидент 09.11.26): пометка «не проверено» — не провал.
+    /// Отчёт не имеет права писать «ПОДМЕНА DNS НЕ ПОМОГЛА», когда ни одна
+    /// проверка не состоялась, — это ложь.
+    #[test]
+    fn dns_sub_all_unverified_no_lie() {
+        let mut m = meta_with(broken_probe());
+        m.main_dns_sub = vec![
+            dns_sub(
+                "doh.a",
+                None,
+                "не проверено: не хватило бюджета окна (DoH не опрашивался)",
+                false,
+            ),
+            dns_sub("doh.b", None, "ошибка DoH: сервис не ответил за 9 с", false),
+        ];
+        let log = build_report(&m, &empty_classification());
+        assert!(!log.contains("ПОДМЕНА DNS НЕ ПОМОГЛА"), "{}", log);
+        assert!(
+            log.contains("Проверка подмены DNS не состоялась"),
+            "{}",
+            log
+        );
+    }
+
+    /// Когда проверки реально шли и все IP провалились — честный текст провала
+    /// сохраняется (теперь с явным «ПРОВЕРЕННЫХ»).
+    #[test]
+    fn dns_sub_all_checked_and_failed_keeps_honest_fail_text() {
+        let mut m = meta_with(broken_probe());
+        m.main_dns_sub = vec![dns_sub(
+            "doh.a",
+            Some("203.0.113.10"),
+            "TCP:443 сброшен (RST)",
+            false,
+        )];
+        let log = build_report(&m, &empty_classification());
+        assert!(log.contains("ПОДМЕНА DNS НЕ ПОМОГЛА"), "{}", log);
+        assert!(log.contains("ПРОВЕРЕННЫХ IP"), "{}", log);
+    }
+
+    /// Рабочий IP нашёлся только в ON-колонке (РКН режет сами DoH — без обхода
+    /// сервис горел таймаутом): hosts-подсказка появляется с честной пометкой,
+    /// что адрес работает только при включённом обходе.
+    #[test]
+    fn dns_sub_on_working_ip_gets_hosts_hint_with_bypass_note() {
+        let mut m = meta_with(broken_probe());
+        m.main_dns_sub = vec![dns_sub(
+            "doh.off",
+            None,
+            "не проверено: не хватило бюджета окна",
+            false,
+        )];
+        m.main_dns_sub_on = vec![dns_sub(
+            "doh.on",
+            Some("203.0.113.50"),
+            "HTTPS открыт через подмену DNS",
+            true,
+        )];
+        let log = build_report(&m, &empty_classification());
+        assert!(log.contains("С ВКЛЮЧЁННЫМ ОБХОДОМ"), "{}", log);
+        assert!(
+            log.contains("работает только С ВКЛЮЧЁННЫМ обходом"),
+            "{}",
+            log
+        );
+        assert!(log.contains("203.0.113.50"), "{}", log);
     }
 
     /// §2.2 (ложь недопустима): при обходе ВЫКЛ отчёт не имеет права утверждать
@@ -1177,6 +1352,7 @@ mod tests {
                 same_host_alt_ip_works: false,
                 isp_redirect: None,
                 doh_http80_hint: false,
+                doh_fail_layer: DohFailLayer::Unconfirmed,
                 doh_candidates: Vec::new(),
                 probe_fail_note: None,
             },
@@ -1554,6 +1730,7 @@ let log = build_report(&meta_with(p), &empty_classification());
                 same_host_alt_ip_works: true,
                 isp_redirect: None,
                 doh_http80_hint: false,
+                doh_fail_layer: DohFailLayer::Unconfirmed,
                 doh_candidates: Vec::new(),
                 probe_fail_note: None,
             },
@@ -1615,6 +1792,7 @@ let log = build_report(&meta_with(p), &empty_classification());
                 same_host_alt_ip_works: false,
                 isp_redirect: None,
                 doh_http80_hint: false,
+                doh_fail_layer: DohFailLayer::Unconfirmed,
                 doh_candidates: Vec::new(),
                 probe_fail_note: None,
             },
@@ -1719,6 +1897,7 @@ let log = build_report(&meta_with(p), &empty_classification());
                 same_host_alt_ip_works: true,
                 isp_redirect: None,
                 doh_http80_hint: false,
+                doh_fail_layer: DohFailLayer::Unconfirmed,
                 doh_candidates: Vec::new(),
                 probe_fail_note: None,
             },
@@ -1787,6 +1966,7 @@ let log = build_report(&meta_with(p), &empty_classification());
                 same_host_alt_ip_works: false,
                 isp_redirect: None,
                 doh_http80_hint: false,
+                doh_fail_layer: DohFailLayer::Unconfirmed,
                 doh_candidates: Vec::new(),
                 probe_fail_note: None,
             },
@@ -1899,6 +2079,7 @@ let log = build_report(&meta_with(p), &empty_classification());
                 same_host_alt_ip_works: false,
                 isp_redirect: None,
                 doh_http80_hint: false,
+                doh_fail_layer: DohFailLayer::Unconfirmed,
                 doh_candidates: Vec::new(),
                 probe_fail_note: None,
             },
@@ -1967,6 +2148,7 @@ let log = build_report(&meta_with(p), &empty_classification());
                 same_host_alt_ip_works: false,
                 isp_redirect: None,
                 doh_http80_hint: false,
+                doh_fail_layer: DohFailLayer::Unconfirmed,
                 doh_candidates: Vec::new(),
                 probe_fail_note: None,
             },

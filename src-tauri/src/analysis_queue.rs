@@ -40,7 +40,7 @@ const POLL: Duration = Duration::from_millis(200);
 /// поэтому типичный анализ укладывается в 20–30 с, а худший случай (каждый
 /// сетевой вызов истекает по своему таймауту) — в ~40–55 с. 90 с покрывает
 /// полный конвейер с запасом.
-const ANALYSIS_DEADLINE: Duration = Duration::from_secs(90);
+pub(crate) const ANALYSIS_DEADLINE: Duration = Duration::from_secs(90);
 
 // ---------------------------------------------------------------------------
 // Событие прогресса для UI: статусы в строках «Ошибок сети».
@@ -184,7 +184,9 @@ fn worker(app: AppHandle) {
                 }
                 let label = display_domain_of(&url);
                 emit_progress(&app, &label, "running", None, None);
-                app_log(&app, format!("[Анализ] анализ {}...", label));
+                // Старт анализа в лог не дублируем: он пишется у источника
+                // действия (FE «Запуск анализа: …» / «Массовый анализ: …»);
+                // отчёт по готовности логирует analyze_domain (SSOT бэкенда).
                 // Анализ живёт в своём потоке, worker ждёт только до дедлайна
                 // (иначе один заклинивший probe() держал бы очередь навсегда —
                 // инцидент 03.11.26). Поток-зомби НЕ join-ится.
@@ -221,7 +223,8 @@ fn worker(app: AppHandle) {
                 finish_job();
             }
             Job::Mass { domains, respond } => {
-                app_log(&app, "[Анализ] массовый анализ списка ошибок...");
+                // Старт массового анализа логирует фронт («Массовый анализ:
+                // запускаю N поз. …») — дубля отсюда не нужно.
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     crate::mass_analysis::run_mass(&app, domains)
                 }))

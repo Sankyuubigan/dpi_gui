@@ -40,23 +40,20 @@ export default function LogsPanel({ lines, onClear, full = false }: {
   }, [full]);
 
   const copyAll = () => {
+    // Успех в лог не пишем (мета-шум вкладки «Логи» не нужен); ошибка — пишем.
     navigator.clipboard.writeText(lines.join("\n"))
-      .then(() => logFront("[Логи] Скопировано в буфер: строк — " + lines.length))
       .catch(() => logFront("[Логи] ОШИБКА: не удалось скопировать лог в буфер."));
   };
 
   const saveToFile = () => {
+    // Успех/отмена в лог не пишем (мета-шум вкладки «Логи»); ошибка — пишем.
     saveLogsToFile(lines.join("\n"))
-      .then((path) => logFront(path
-        ? `[Логи] Сохранено: ${path}`
-        : "[Логи] Сохранение отменено."))
       .catch((e) => logFront(`[Логи] ОШИБКА сохранения: ${e}`));
   };
 
   const copyPath = () => {
     if (!logPath) return;
     navigator.clipboard.writeText(logPath)
-      .then(() => logFront("[Логи] Путь лог-файла скопирован: " + logPath))
       .catch(() => logFront("[Логи] ОШИБКА: не удалось скопировать путь лог-файла."));
   };
 

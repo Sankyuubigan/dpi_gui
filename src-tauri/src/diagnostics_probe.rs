@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{TcpStream, UdpSocket, SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr};
 use std::error::Error as StdError;
 use std::time::Duration;
@@ -11,6 +11,7 @@ use trust_dns_resolver::Resolver;
 use reqwest::blocking::Client;
 use tauri::AppHandle;
 use crate::config;
+use crate::probe_budget::StageBudget;
 use crate::process;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -864,7 +865,36 @@ impl DohAnswers {
 /// подмены DNS, и поиск рабочего IP для hosts берут адреса отсюда, а не
 /// опрашивают сервисы повторно каждый сам по себе.
 pub fn resolve_doh_all(domain: &str) -> DohAnswers {
+    resolve_doh_all_within(domain, StageBudget::new(Duration::from_secs(9)))
+}
+
+/// Бюджетированный вариант resolve_doh_all: дедлайн сбора ответов =
+/// min(9 с, остаток внешнего бюджета фазы); «Стоп» останавливает сбор
+/// немедленно. Сервис, не ответивший в пределах дедлайна, получает
+/// честную пометку: «не ответил за 9 с» — если упёрся в свой дедлайн,
+/// «не проверено: не хватило бюджета окна» — если бюджет/«Стоп» прервали
+/// сбор раньше (§1.9: непроверенное не выдаётся за «не ответил»).
+pub fn resolve_doh_all_within(domain: &str, budget: StageBudget) -> DohAnswers {
     let (services, warnings, config_error) = load_doh_resolvers();
+    if budget.stopped() {
+        // Бюджет исчерпан на входе: ни одного сетевого запроса, но сервисы
+        // SSOT-списка остаются видимыми в отчёте — с честной пометкой.
+        return DohAnswers {
+            answers: services
+                .into_iter()
+                .map(|service| DohAnswer {
+                    service,
+                    ips: vec![],
+                    error: Some(
+                        "не проверено: не хватило бюджета окна (DoH не опрашивался)".to_string(),
+                    ),
+                })
+                .collect(),
+            config_error,
+            warnings,
+            own_ips: Vec::new(),
+        };
+    }
     let (tx, rx) = mpsc::channel::<(usize, DohAnswer)>();
     let total = services.len();
 
@@ -891,9 +921,20 @@ pub fn resolve_doh_all(domain: &str) -> DohAnswers {
     drop(tx);
 
     let mut slots: Vec<Option<DohAnswer>> = (0..total).map(|_| None).collect();
-    let deadline = std::time::Instant::now() + Duration::from_secs(9);
+    let own_cap = Duration::from_secs(9);
+    // Дедлайн = min(9 с, остаток бюджета): внешний бюджет фазы главнее
+    // внутреннего дедлайна резолва — фаза больше не может перерасходовать
+    // окно через «свой» таймаут резолва (кейс googlevideo 00:40: resolve
+    // 9 с вне бюджета + probe_domain 39.8 с съели всё окно).
+    let own_deadline_dur = own_cap.min(budget.left());
+    let deadline = std::time::Instant::now() + own_deadline_dur;
     let mut got = 0usize;
+    let mut stopped_early = false;
     while got < total {
+        if budget.stopped() {
+            stopped_early = true;
+            break;
+        }
         let now = std::time::Instant::now();
         if now >= deadline {
             break;
@@ -916,7 +957,11 @@ pub fn resolve_doh_all(domain: &str) -> DohAnswers {
             slot.unwrap_or_else(|| DohAnswer {
                 service: services[idx].clone(),
                 ips: vec![],
-                error: Some("не ответил за 9 с (таймаут)".to_string()),
+                error: Some(if stopped_early || budget.stopped() || own_deadline_dur < own_cap {
+                    "не проверено: не хватило бюджета окна (DoH не опрашивался)".to_string()
+                } else {
+                    "не ответил за 9 с (таймаут)".to_string()
+                }),
             })
         })
         .collect();
@@ -932,6 +977,95 @@ pub fn resolve_doh_all(domain: &str) -> DohAnswers {
         config_error,
         warnings,
         own_ips,
+    }
+}
+
+/// Слияние ответов DoH двух фаз анализа (без обхода и с обходом). У каждого
+/// сервиса — union адресов обеих фаз (dedup, адреса фазы без обхода идут
+/// первыми), порядок сервисов — как в списке. Ошибка живёт только у сервиса,
+/// не давшего адресов ни в одной фазе, и честно называет причину каждого
+/// прохода. Сервис, ответивший только в одной фазе, свои адреса сохраняет:
+/// merged-ответ идёт в ON-фазу подмены DNS, и сервис не должен теряться от
+/// того, что в другой фазе он молчал (РКН режет сами DoH — без обхода часть
+/// сервисов горит таймаутами).
+pub fn merge_doh_answers(off: &DohAnswers, on: &DohAnswers) -> DohAnswers {
+    let mut order: Vec<String> = Vec::new();
+    // (адреса, ошибка фазы без обхода, ошибка фазы с обходом)
+    let mut per_service: HashMap<String, (Vec<IpAddr>, Option<String>, Option<String>)> =
+        HashMap::new();
+    for (phase_off, ans) in off
+        .answers
+        .iter()
+        .map(|a| (true, a))
+        .chain(on.answers.iter().map(|a| (false, a)))
+    {
+        let slot = per_service.entry(ans.service.clone()).or_insert_with(|| {
+            order.push(ans.service.clone());
+            (Vec::new(), None, None)
+        });
+        for ip in &ans.ips {
+            if !slot.0.contains(ip) {
+                slot.0.push(*ip);
+            }
+        }
+        if phase_off {
+            if slot.1.is_none() {
+                slot.1 = ans.error.clone();
+            }
+        } else if slot.2.is_none() {
+            slot.2 = ans.error.clone();
+        }
+    }
+
+    let answers: Vec<DohAnswer> = order
+        .into_iter()
+        .map(|service| {
+            let (ips, err_off, err_on) = per_service.remove(&service).unwrap();
+            let error = if !ips.is_empty() {
+                None
+            } else {
+                match (err_off, err_on) {
+                    (Some(a), Some(b)) if a == b => Some(a),
+                    (Some(a), Some(b)) => Some(format!("без обхода: {a}; с обходом: {b}")),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(format!("с обходом: {b}")),
+                    (None, None) => None,
+                }
+            };
+            DohAnswer {
+                service,
+                ips,
+                error,
+            }
+        })
+        .collect();
+
+    let mut warnings: Vec<String> = Vec::new();
+    for w in off.warnings.iter().chain(on.warnings.iter()) {
+        if !warnings.contains(w) {
+            warnings.push(w.clone());
+        }
+    }
+
+    let mut own_map: Vec<(String, Vec<IpAddr>)> = Vec::new();
+    for (svc, ips) in off.own_ips.iter().chain(on.own_ips.iter()) {
+        match own_map.iter_mut().find(|(s, _)| s == svc) {
+            Some((_, slot)) => {
+                for ip in ips {
+                    if !slot.contains(ip) {
+                        slot.push(*ip);
+                    }
+                }
+            }
+            None => own_map.push((svc.clone(), ips.clone())),
+        }
+    }
+
+    DohAnswers {
+        answers,
+        config_error: off.config_error.clone().or(on.config_error.clone()),
+        warnings,
+        own_ips: own_map,
     }
 }
 
@@ -1159,6 +1293,144 @@ pub fn normalize_host(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn merge_doh_answers_unions_services_and_ips() {
+        // Фаза без обхода: A дал один адрес, B молчит (РКН режет сами DoH).
+        let off = DohAnswers {
+            answers: vec![
+                DohAnswer {
+                    service: "a.doh".into(),
+                    ips: vec![ip("1.1.1.1")],
+                    error: None,
+                },
+                DohAnswer {
+                    service: "b.doh".into(),
+                    ips: vec![],
+                    error: Some("не ответил за 9 с (таймаут)".into()),
+                },
+            ],
+            warnings: vec!["warn-off".into()],
+            own_ips: vec![("a.doh".into(), vec![ip("10.0.0.1")])],
+            ..Default::default()
+        };
+        // Фаза с обходом: A добавил второй адрес, B ожил, C — сервис списка,
+        // отсутствовавший в off-фазе.
+        let on = DohAnswers {
+            answers: vec![
+                DohAnswer {
+                    service: "a.doh".into(),
+                    ips: vec![ip("1.1.1.1"), ip("2.2.2.2")],
+                    error: None,
+                },
+                DohAnswer {
+                    service: "b.doh".into(),
+                    ips: vec![ip("3.3.3.3")],
+                    error: None,
+                },
+                DohAnswer {
+                    service: "c.doh".into(),
+                    ips: vec![ip("4.4.4.4")],
+                    error: None,
+                },
+            ],
+            warnings: vec!["warn-off".into(), "warn-on".into()],
+            own_ips: vec![("b.doh".into(), vec![ip("10.0.0.2")])],
+            ..Default::default()
+        };
+
+        let merged = merge_doh_answers(&off, &on);
+
+        // Порядок сервисов — как в списке; адреса: сначала off-адреса.
+        let names: Vec<&str> = merged.answers.iter().map(|a| a.service.as_str()).collect();
+        assert_eq!(names, vec!["a.doh", "b.doh", "c.doh"]);
+        let a = &merged.answers[0];
+        assert_eq!(a.ips, vec![ip("1.1.1.1"), ip("2.2.2.2")]);
+        assert_eq!(a.error, None);
+        // B ожил только с обходом — адреса сохранены, ошибки больше нет.
+        let b = &merged.answers[1];
+        assert_eq!(b.ips, vec![ip("3.3.3.3")]);
+        assert_eq!(b.error, None);
+        // C не потерян.
+        assert_eq!(merged.answers[2].ips, vec![ip("4.4.4.4")]);
+        // own_ips — union по сервису; warnings — dedup с сохранением порядка.
+        assert_eq!(
+            merged.own_ips,
+            vec![
+                ("a.doh".to_string(), vec![ip("10.0.0.1")]),
+                ("b.doh".to_string(), vec![ip("10.0.0.2")]),
+            ]
+        );
+        assert_eq!(
+            merged.warnings,
+            vec!["warn-off".to_string(), "warn-on".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_doh_answers_keeps_honest_failure_when_silent_in_both_phases() {
+        let off = DohAnswers {
+            answers: vec![DohAnswer {
+                service: "x.doh".into(),
+                ips: vec![],
+                error: Some("не ответил за 9 с (таймаут)".into()),
+            }],
+            ..Default::default()
+        };
+        let on = DohAnswers {
+            answers: vec![DohAnswer {
+                service: "x.doh".into(),
+                ips: vec![],
+                error: Some("не ответил за 9 с (таймаут)".into()),
+            }],
+            ..Default::default()
+        };
+        let merged = merge_doh_answers(&off, &on);
+        // Одинаковые причины обеих фаз не дублируются.
+        assert_eq!(
+            merged.answers[0].error,
+            Some("не ответил за 9 с (таймаут)".to_string())
+        );
+
+        let on_diff = DohAnswers {
+            answers: vec![DohAnswer {
+                service: "x.doh".into(),
+                ips: vec![],
+                error: Some("SERVFAIL".into()),
+            }],
+            ..Default::default()
+        };
+        let merged_diff = merge_doh_answers(&off, &on_diff);
+        // Разные причины честно называются обе.
+        assert_eq!(
+            merged_diff.answers[0].error,
+            Some("без обхода: не ответил за 9 с (таймаут); с обходом: SERVFAIL".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_doh_all_within_respects_immediate_stop() {
+        // Бюджет исчерпан на входе («Стоп»/окно) → ни одного сетевого запроса
+        // (мгновенный возврат), но сервисы SSOT-списка остаются видимыми —
+        // с честной пометкой «не проверено», а не «не ответил за 9 с».
+        let budget = StageBudget::new_with_cancel(Duration::from_secs(9), || true);
+        let t0 = std::time::Instant::now();
+        let ans = resolve_doh_all_within("example.invalid", budget);
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "стоп должен сработать немедленно, а не ждать дедлайн"
+        );
+        assert!(!ans.answers.is_empty(), "сервисы списка не должны исчезать");
+        assert!(ans.answers.iter().all(|a| a.ips.is_empty()));
+        assert!(ans
+            .answers
+            .iter()
+            .all(|a| a.error.as_deref().unwrap_or_default().contains("не хватило бюджета")));
+    }
 
     #[test]
     fn run_with_timeout_deadline_contract() {

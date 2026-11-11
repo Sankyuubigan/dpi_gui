@@ -15,10 +15,11 @@ use crate::diagnostics_probe::{
     body_looks_like_blockpage, body_looks_region_restricted, classify_reqwest_err, dns_multi,
     is_stub_ip, resolve_doh_all, tcp_connect, DnsInfo, DohAnswers, HttpResult,
 };
+use crate::cert_info::{tls_cert_info, CertInfo};
 use crate::probe_budget::StageBudget;
 use crate::site_verdict::{
     classify, explain, hosts_lines, http_result_note, refine_with_isp_redirect, CauseContext,
-    ProbeFacts, Verdict,
+    DohFailLayer, ProbeFacts, Verdict,
 };
 
 /// Сколько адресов одного хоста пробуем подряд.
@@ -524,6 +525,28 @@ pub fn http_via_ip(host: &str, ip: IpAddr, port: u16) -> HttpResult {
     }
 }
 
+/// SSOT-проба с TLS-щупом: при BadCert достаёт сертификат сервера
+/// (issuer/CN/SANs — [`crate::cert_info`]), чтобы отчёт отличал заглушку
+/// цензора от настоящего сервера, у которого нет сертификата для имени
+/// (кейс apex googlevideo.com 11.11.26). `None` — щуп не состоялся (честно:
+/// заметка остаётся без добавки).
+pub fn http_via_ip_with_cert(host: &str, ip: IpAddr, port: u16) -> (HttpResult, Option<CertInfo>) {
+    let r = http_via_ip(host, ip, port);
+    if port != 443 || !matches!(r, HttpResult::BadCert) {
+        return (r, None);
+    }
+    (r, tls_cert_info(ip, host))
+}
+
+/// Добавка к заметке пробы: факты сертификата в квадратных скобках при
+/// состоявшемся щупе; без него заметка без добавки — не выдумываем.
+fn with_cert(note: String, cert: Option<&CertInfo>) -> String {
+    match cert {
+        Some(c) => format!("{} [{}]", note, c),
+        None => note,
+    }
+}
+
 /// Ответ одной пробы: дошёл ли TCP, какой адрес ответил и что на нём с HTTPS.
 #[derive(Debug, Clone)]
 struct ProbeOutcome {
@@ -550,7 +573,7 @@ impl ProbeOutcome {
 /// ответившему — до первого открывшего сайт. Адреса-заглушки (0.0.0.0 и т.п.)
 /// пропускаются до счётчика `MAX_IPS`: пробовать их — ложь в отчёте.
 fn probe_host_at(host: &str, ips: &[String], budget: StageBudget) -> ProbeOutcome {
-    let mut tcp_only: Option<(String, HttpResult)> = None;
+    let mut tcp_only: Option<(String, HttpResult, Option<CertInfo>)> = None;
     let mut any_reset = false;
 
     // Кандидаты: валидные адреса без заглушек, лимит MAX_IPS.
@@ -582,24 +605,30 @@ fn probe_host_at(host: &str, ips: &[String], budget: StageBudget) -> ProbeOutcom
         // Unverified — Open-эквивалент по транспорту (анализ-путь): адрес
         // реально отдаёт живую страницу, но доступность после входа не
         // подтверждена — заметка скажет об этом честно.
-        let Some(r) = slot else { continue }; // бюджет кончился — адрес не проверен
+        let Some((r, cert)) = slot else { continue }; // бюджет кончился — адрес не проверен
         if matches!(r, HttpResult::Ok(_) | HttpResult::Unverified) {
             return ProbeOutcome {
                 tcp_ok: true,
                 ip: Some(ip.to_string()),
-                note: format!("HTTPS через {}: {}", ip, substitution_note(&r)),
+                note: with_cert(
+                    format!("HTTPS через {}: {}", ip, substitution_note(&r)),
+                    cert.as_ref(),
+                ),
                 http: Some(r),
                 any_reset,
             };
         }
         if tcp_only.is_none() {
-            tcp_only = Some((ip.to_string(), r));
+            tcp_only = Some((ip.to_string(), r, cert));
         }
     }
 
     match tcp_only {
-        Some((ip, r)) => {
-        let note = format!("HTTPS через {}: {}", ip, http_result_note(&r));
+        Some((ip, r, cert)) => {
+        let note = with_cert(
+            format!("HTTPS через {}: {}", ip, http_result_note(&r)),
+            cert.as_ref(),
+        );
         ProbeOutcome {
             tcp_ok: true,
             ip: Some(ip),
@@ -608,7 +637,21 @@ fn probe_host_at(host: &str, ips: &[String], budget: StageBudget) -> ProbeOutcom
             any_reset,
         }
     }
-        None => ProbeOutcome::dead("ни один IP не ответил на TCP:443".to_string()),
+        None => ProbeOutcome {
+            // Честность note (core §1.9): RST — это «ответили сбросом», а не
+            // «не ответили»; any_reset обязан дойти до вердикта, чтобы тот не
+            // называл TCP-блокировку «обрывом TLS» (инцидент 10.11.26).
+            tcp_ok: false,
+            ip: None,
+            http: None,
+            note: if any_reset {
+                "TCP:443 не открылся ни по одному адресу: подключение активно сбрасывается (RST/отказ)"
+                    .to_string()
+            } else {
+                "ни один IP не ответил на TCP:443".to_string()
+            },
+            any_reset,
+        },
     }
 }
 
@@ -647,19 +690,21 @@ fn http_probe_slots_parallel(
     host: &str,
     ips: &[IpAddr],
     budget: StageBudget,
-) -> Vec<Option<HttpResult>> {
+) -> Vec<Option<(HttpResult, Option<CertInfo>)>> {
     use std::sync::mpsc;
-    let (tx, rx) = mpsc::channel::<(usize, HttpResult)>();
+    let (tx, rx) = mpsc::channel::<(usize, HttpResult, Option<CertInfo>)>();
     for (idx, ip) in ips.iter().enumerate() {
         let tx = tx.clone();
         let host = host.to_string();
         let ip = *ip;
         std::thread::spawn(move || {
-            let _ = tx.send((idx, http_via_ip(&host, ip, 443)));
+            let (res, cert) = http_via_ip_with_cert(&host, ip, 443);
+            let _ = tx.send((idx, res, cert));
         });
     }
     drop(tx);
-    let mut slots: Vec<Option<HttpResult>> = (0..ips.len()).map(|_| None).collect();
+    let mut slots: Vec<Option<(HttpResult, Option<CertInfo>)>> =
+        (0..ips.len()).map(|_| None).collect();
     let deadline = Instant::now() + budget.left();
     for _ in 0..ips.len() {
         if budget.stopped() {
@@ -670,7 +715,7 @@ fn http_probe_slots_parallel(
             break;
         }
         match rx.recv_timeout(deadline - now) {
-            Ok((idx, res)) => slots[idx] = Some(res),
+            Ok((idx, res, cert)) => slots[idx] = Some((res, cert)),
             Err(_) => break,
         }
     }
@@ -855,6 +900,17 @@ pub fn probe_domain_with_doh(
     };
 
     let apex_ip = primary_ips.first().cloned();
+    // SSOT уровня отказа HTTPS-пробы: вердикт не имеет права утверждать
+    // больше, чем показала проба (инцидент 10.11.26 — «TLS обрывается» при
+    // так и не открывшемся TCP:443). Слой осмыслен при doh_http80_hint=true:
+    // пустой список DoH-адресов подсказку по порту 80 не даёт вовсе.
+    let doh_fail_layer = match &doh_probe.http {
+        None => DohFailLayer::TcpDead {
+            any_reset: doh_probe.any_reset,
+        },
+        Some(HttpResult::Rst | HttpResult::Tls) => DohFailLayer::HandshakeBroken,
+        Some(_) => DohFailLayer::Unconfirmed,
+    };
     let diagnosis = explain(
         verdict,
         &CauseContext {
@@ -866,6 +922,7 @@ pub fn probe_domain_with_doh(
             same_host_alt_ip_works: matches!(doh_probe.http, Some(HttpResult::Ok(_))),
             isp_redirect: isp_redirect.as_deref(),
             doh_http80_hint,
+            doh_fail_layer,
             doh_candidates,
             probe_fail_note,
         },
@@ -964,34 +1021,16 @@ pub struct DnsSubstitution {
     /// HTTPS-проба через `working_ip` реально вернула OK. От этого зависит,
     /// можно ли советовать подмену в hosts (иначе RST — hosts бесполезен).
     pub http_ok: bool,
+    /// Типизированный результат HTTPS-пробы (если она состоялась): Ok/Unverified
+    /// при `http_ok == true`, иначе конкретный отказ (Forbidden/BlockPage/RST…).
+    /// `None` — HTTPS-проба не состоялась (ошибка DoH, TCP-молчание, бюджет).
+    pub http: Option<HttpResult>,
 }
 
 /// Экспорт HTTPS-пробы по конкретному IP (для hosts-фичи: проверяем, что
 /// сайт реально открывается через выбранный адрес после записи в hosts).
 pub fn probe_https_by_ip(host: &str, ip: IpAddr) -> HttpResult {
     http_via_ip(host, ip, 443)
-}
-
-/// Контрольная проба главного домена С активным обходом — вызывается из
-/// analyzer.rs ПОСЛЕ закрытия «чистого окна», когда обход уже восстановлен.
-///
-/// Зачем: фактовые пробы анализа идут без обхода и честно видят RST (DPI
-/// режет TLS). Но отказ самого сайта — гео-блок/WAF (у Cloudflare ошибка 1009
-/// «Access denied») — проявляется ТОЛЬКО с обходом, когда TLS проходит и
-/// сервер отвечает сам (кейс patreon.com 01.11.26). Проба идёт по первому
-/// настоящему DoH-адресу: не шлюз сервиса (шлюз соврёт своим HTTP 200 — см.
-/// доку `DohAnswers.own_ips`), не заглушка (`all_ips` уже отфильтровал).
-///
-/// `None` — настоящего адреса нет (только шлюзы/пусто), пробовать нечего.
-pub fn bypass_on_control_probe(
-    host: &str,
-    doh_answers: &DohAnswers,
-) -> Option<(IpAddr, HttpResult)> {
-    let ip = doh_answers
-        .all_ips()
-        .into_iter()
-        .find(|ip| doh_answers.gateway_owner(ip).is_none())?;
-    Some((ip, probe_https_by_ip(host, ip)))
 }
 
 /// Проверка «подмены DNS»: резолв домена через DoH-сервисы и поиск рабочего IP.
@@ -1055,6 +1094,7 @@ pub fn dns_substitutions_from(
                             .join(", ")
                     ),
                     http_ok: false,
+                    http: None,
                 })
             } else {
                 let real_ips: Vec<IpAddr> = a
@@ -1090,6 +1130,7 @@ pub fn dns_substitutions_from(
                     working_ip: None,
                     http_note: "не проверено: не хватило бюджета окна".to_string(),
                     http_ok: false,
+                    http: None,
                 },
             })
             .collect();
@@ -1153,6 +1194,7 @@ pub fn dns_substitutions_from(
                     working_ip: None,
                     http_note: "не проверено: не хватило бюджета окна".to_string(),
                     http_ok: false,
+                    http: None,
                 },
             },
         })
@@ -1177,6 +1219,7 @@ fn summarize_substitution(
             working_ip: None,
             http_note: format!("ошибка DoH: {}", e),
             http_ok: false,
+            http: None,
         };
     }
 
@@ -1212,6 +1255,7 @@ fn summarize_substitution(
             working_ip: None,
             http_note: "ни один IP из подмены не ответил на TCP:443".to_string(),
             http_ok: false,
+            http: None,
         };
     };
 
@@ -1225,26 +1269,36 @@ fn summarize_substitution(
             working_ip: Some(first.to_string()),
             http_note: format!("TCP:443 отвечает ({}) — HTTPS не проверен", first),
             http_ok: false,
+            http: None,
         };
     }
 
     let http_slots = http_probe_slots_parallel(host, &live, budget);
     let mut last_note = String::new();
+    let mut last_http: Option<HttpResult> = None;
     for (ip, slot) in live.iter().copied().zip(http_slots) {
         // Unverified — Open-эквивалент по транспорту (анализ-путь): подмена
         // DNS сработала, но страница — оболочка (заметка substitution_note).
-        let Some(http) = slot else { continue }; // бюджет кончился — адрес не проверен
+        let Some((http, cert)) = slot else { continue }; // бюджет кончился — адрес не проверен
         if matches!(http, HttpResult::Ok(_) | HttpResult::Unverified) {
             return DnsSubstitution {
                 service: service.to_string(),
                 resolved: display,
                 working_ip: Some(ip.to_string()),
-                http_note: format!("HTTPS через {}: {}", ip, substitution_note(&http)),
+                http_note: with_cert(
+                    format!("HTTPS через {}: {}", ip, substitution_note(&http)),
+                    cert.as_ref(),
+                ),
                 http_ok: true,
+                http: Some(http),
             };
         }
         if last_note.is_empty() {
-            last_note = format!("HTTPS через {}: {}", ip, substitution_note(&http));
+            last_note = with_cert(
+                format!("HTTPS через {}: {}", ip, substitution_note(&http)),
+                cert.as_ref(),
+            );
+            last_http = Some(http);
         }
     }
 
@@ -1259,6 +1313,7 @@ fn summarize_substitution(
             last_note
         },
         http_ok: false,
+        http: last_http,
     }
 }
 
@@ -1352,6 +1407,26 @@ pub fn probe_hosts_pins(host: &str, ips: &[String]) -> Result<Vec<HostsPin>, Str
 mod tests {
     use super::*;
 
+    /// with_cert (PRP 11.11.26): без щупа заметка не меняется (не выдумываем
+    /// факты), с щупом — issuer/CN/SANs в квадратных скобках.
+    #[test]
+    fn with_cert_appends_issuer_details_and_none_keeps_base() {
+        let base = "HTTPS через 142.250.1.1: SSL-сертификат невалиден".to_string();
+        assert_eq!(with_cert(base.clone(), None), base);
+        let cert = CertInfo {
+            issuer_cn: "WR2".into(),
+            issuer_o: "Google Trust Services".into(),
+            subject_cn: "*.googlevideo.com".into(),
+            sans: vec!["*.googlevideo.com".into()],
+        };
+        let s = with_cert(base, Some(&cert));
+        assert!(
+            s.contains("SSL-сертификат невалиден [issuer=\"Google Trust Services (WR2)\""),
+            "got: {s}"
+        );
+        assert!(s.contains("sans=\"*.googlevideo.com\""), "got: {s}");
+    }
+
     /// Параллельный разбор подмены DNS сохраняет исходный порядок сервисов
     /// (поток на сервис, сбор по индексам) — инцидент 09.11.26.
     #[test]
@@ -1425,6 +1500,44 @@ mod tests {
         assert!(!subs[1].http_ok);
         assert!(subs[1].http_note.contains("не проверено"));
         assert!(subs[1].http_note.contains("бюджета"));
+    }
+
+    /// Merged-ответы (объединение двух фаз DoH-резолва: без обхода и с обходом)
+    /// не теряют сервисы, ответившие только в одной фазе: разбор подмены DNS
+    /// идёт по ВСЕМ сервисам merged, у каждого — честная пометка при пустом
+    /// бюджете, типизированной пробы нет (HTTPS не состоялась).
+    #[test]
+    fn dns_substitutions_from_merged_answers_keeps_both_phases() {
+        // merge_doh_answers: «a» жил только без обхода, «b» — только с обходом.
+        let off = crate::diagnostics_probe::DohAnswers {
+            answers: vec![crate::diagnostics_probe::DohAnswer {
+                service: "a-off.test".into(),
+                ips: vec!["203.0.113.20".parse().unwrap()],
+                error: None,
+            }],
+            ..Default::default()
+        };
+        let on = crate::diagnostics_probe::DohAnswers {
+            answers: vec![crate::diagnostics_probe::DohAnswer {
+                service: "b-on.test".into(),
+                ips: vec!["203.0.113.21".parse().unwrap()],
+                error: None,
+            }],
+            ..Default::default()
+        };
+        let merged = crate::diagnostics_probe::merge_doh_answers(&off, &on);
+        assert_eq!(merged.answers.len(), 2, "ни один сервис фаз не теряется");
+
+        // Пустой бюджет — разбор без сети, все строки с честной пометкой.
+        let dead = StageBudget::new(Duration::ZERO);
+        let subs = dns_substitutions_from("example.test", &merged, true, dead);
+        let names: Vec<&str> = subs.iter().map(|s| s.service.as_str()).collect();
+        assert_eq!(names, vec!["a-off.test", "b-on.test"]);
+        for s in &subs {
+            assert!(!s.http_ok);
+            assert!(s.http_note.contains("не проверено"), "{}", s.http_note);
+            assert!(s.http.is_none(), "HTTPS не состоялась — типизированного результата нет");
+        }
     }
 
     /// Детектор JS-оболочки: у SPA-оболочки видимого текста — десятки байт,

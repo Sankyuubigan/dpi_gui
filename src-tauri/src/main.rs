@@ -35,6 +35,7 @@ mod list_index;
 mod dns_pick;
 mod browser;
 mod browser_cookies;
+mod cert_info;
 mod process_owner;
 mod analysis_queue;
 mod mass_analysis;

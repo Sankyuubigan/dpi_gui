@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::time::Duration;
 use std::thread;
 use url::Url;
@@ -169,6 +170,9 @@ pub fn analyze_url(app: &AppHandle, url: &str) -> Result<DomainAnalysisOutcome, 
             };
             let mut report = report;
             report.push_str(&site_solution::report_block(&solution));
+            // Отчёт IP-анализа в лог — как у доменного: SSOT бэкенда
+            // (фронт-эхо убрано, см. analyze_domain).
+            crate::events::app_log(app, report.clone());
             Ok(DomainAnalysisOutcome { report, solution })
         }
         ip_target::AnalysisTarget::Domain { host } => analyze_domain(app, url, host),
@@ -218,6 +222,18 @@ fn analyze_chrome_stage(target_url: String) -> Result<(Vec<String>, HashSet<Stri
 
     let browser = Browser::new(options).map_err(|e| format!("Ошибка запуска Chrome (установлен ли он?): {}", e))?;
     let tab = browser.new_tab().map_err(|e| format!("Ошибка создания вкладки: {}", e))?;
+
+    // Своё компактное логирование lifecycle браузера: INFO-шум крейта
+    // headless_chrome (~13 строк Launching/Started/Navigating/Killing на
+    // анализ) глушится фильтром плагина. PID отдаёт API крейта (Option —
+    // connect-режим без процесса даёт None: честно пишем без PID).
+    log::info!(
+        "[Анализ] Chrome-этап: браузер запущен{}",
+        browser
+            .get_process_id()
+            .map(|p| format!(" (PID {p})"))
+            .unwrap_or_default()
+    );
 
     // ВАЖНО: без явного включения Network-домена события RequestWillBeSent/LoadingFailed
     // вообще не приходят (navigate_to их не включает).
@@ -321,6 +337,12 @@ fn analyze_chrome_stage(target_url: String) -> Result<(Vec<String>, HashSet<Stri
         let _ = hide_handle.join();
     }
 
+    // Явный drop ДО строки остановки: крейтный Drop гасит процесс Chrome
+    // (Killing Chrome — глушится фильтром плагина как шум), наша строка —
+    // честный итог этапа в одну запись.
+    drop(browser);
+    log::info!("[Анализ] Chrome-этап: браузер остановлен");
+
     let mut discovered: Vec<String> =
         discovered_domains.lock().unwrap().iter().cloned().collect();
     discovered.sort();
@@ -328,6 +350,26 @@ fn analyze_chrome_stage(target_url: String) -> Result<(Vec<String>, HashSet<Stri
         browser_failed.lock().unwrap().iter().cloned().collect();
     Ok((discovered, browser_failed_set))
 }
+
+/// Бюджет Chrome-этапа анализа (запуск/навигация/idle-ожидание, теминг «chrome»).
+pub(crate) const CHROME_BUDGET: Duration = Duration::from_secs(10);
+
+/// Окно «обход выключен» (OFF-фаза): все фактовые пробы чистого окна — проба
+/// #2, DoH-резолв главного домена, подмена DNS, CIDR-скан, фоновые подмены.
+/// Гарантия дедлайна очереди (ANALYSIS_DEADLINE 90 с, инцидент 09.11.26):
+/// Chrome 10 + OFF 35 + restore 2 + ON 30 = 77 с < 90 с, запас 13 с. Окно
+/// живёт max(DoH-резолв, probe, подмена, скан): probe подчинён бюджету
+/// частично (факт 34.9 с при бюджете 20 с в прогоне 01:33 11.11.26), поэтому
+/// подмена DNS и CIDR-скан стартуют СРАЗУ после DoH-резолва — параллельно
+/// probe — и успевают при любом probe. Сумму защищает тест
+/// window_budgets_fit_analysis_deadline.
+pub(crate) const WINDOW_BUDGET: Duration = Duration::from_secs(35);
+
+/// Фаза ON (DoH-резолв + подмена DNS С активным обходом): отдельный бюджет —
+/// resolve_doh_all_within ограничен 9 с, на подмену остаётся ~21 с (в прогоне
+/// 01:33 вся фаза шла 17.9 с при прежних 20 — впритык).
+pub(crate) const ON_WINDOW_BUDGET: Duration = Duration::from_secs(30);
+
 
 fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<DomainAnalysisOutcome, String> {
     let target_url = ip_target::target_url_of(url);
@@ -343,7 +385,6 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
     // отражено в отчёте как пустой discovered); брошенный поток сам дошлёт
     // idle-ожидание и умрёт вместе с Browser. 10 с хватает с запасом: старт
     // Chrome ~3-5 с + выход idle-цикла по MIN_WAIT 4 с, когда событий нет.
-    const CHROME_BUDGET: Duration = Duration::from_secs(10);
     let t_chrome = std::time::Instant::now();
     let (chrome_tx, chrome_rx) = std::sync::mpsc::channel();
     let chrome_target = target_url.clone();
@@ -413,10 +454,6 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
     // кончился → пробы останавливаются, отчёт строится из собранного с
     // честными пометками «не проверено: не хватило бюджета». Кнопка «Стоп»
     // останавливает переборы немедленно (без ожидания контрольной точки).
-    // 20 с — с прицелом на худший случай всего анализа ≤ ~40 с: Chrome ≤10 +
-    // окно 20 (+ перерасход одного этапа ≤9 с по его внутреннему дедлайну) +
-    // восстановление обхода ~2 + контроль с обходом ≤6.
-    const WINDOW_BUDGET: Duration = Duration::from_secs(20);
     let window_budget =
         StageBudget::new_with_cancel(WINDOW_BUDGET, || cancel::is_cancelled(cancel::SITE_ANALYSIS));
 
@@ -425,7 +462,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
     // обязаны идти БЕЗ активного winws: обход перехватывает ВЕСЬ трафик процесса,
     // и при включённом профиле, который ломает сайт, отчёт получал ложные
     // «IP не отвечает / фильтрация маршрута» вместо правды (кейс sostav.ru).
-    let (classification, main_probe, main_dns_sub, dns_fail_sub, block_scan, bypass_on_http) =
+    let (classification, main_probe, main_dns_sub, main_dns_sub_on, dns_fail_sub, block_scan, bypass_on_http) =
         if bypass_on {
         // Окно без обхода с гарантией восстановления: паника внутри ветки
         // больше не оставляет обход выключенным (OffWindowGuard::Drop).
@@ -433,47 +470,144 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         bypass_toggled = true;
         let t_off = std::time::Instant::now();
 
-        // Проба #2 без обхода: только домены, сломанные при обходе. Ретрай
-        // («обрыв засчитывается, только если увиден ДВАЖДЫ» — кейс
-        // eu.aptabase.com) — общий рецепт с массовым анализом (SSOT:
-        // analyzer_probe::probe_off).
-        let mut broken_off: HashSet<String> = HashSet::new();
-        let mut dns_off: HashSet<String> = HashSet::new();
-        let mut dead_off: HashSet<String> = HashSet::new();
-        for (h, off) in analyzer_probe::probe_off(&broken_on) {
-            match off {
-                analyzer_probe::OffProbe::Ok => {}
-                analyzer_probe::OffProbe::Dns => {
-                    dns_off.insert(h);
+        // === Две параллельные цепочки под общим бюджетом окна ===
+        // Кейс googlevideo.com 00:40: последовательный хвост окна (подмена DNS,
+        // CIDR-скан, фоновые подмены) входил с исчерпанным бюджетом и целиком
+        // превращался в «не проверено: не хватило бюджета окна». Теперь цепь A
+        // (проба #2 + классификация + фоновые подмены) и цепь B (главный домен:
+        // DoH-резолв → параллельно диагностика ∥ подмена DNS ∥ CIDR-скан) идут
+        // ОДНОВРЕМЕННО и делят один бюджет — фаза больше не тушит другую.
+        // Все бюджеты — new_with_cancel: «Стоп» останавливает всё немедленно.
+        let chain_a = {
+            let broken_on = broken_on.clone();
+            let results_on = results_on.clone();
+            let browser_failed_set = browser_failed_set.clone();
+            let budget = window_budget;
+            thread::spawn(move || {
+                let mut broken_off: HashSet<String> = HashSet::new();
+                let mut dns_off: HashSet<String> = HashSet::new();
+                let mut dead_off: HashSet<String> = HashSet::new();
+                for (h, off) in analyzer_probe::probe_off(&broken_on) {
+                    match off {
+                        analyzer_probe::OffProbe::Ok => {}
+                        analyzer_probe::OffProbe::Dns => {
+                            dns_off.insert(h);
+                        }
+                        analyzer_probe::OffProbe::Broken => {
+                            broken_off.insert(h);
+                        }
+                        // Без обхода сервер вообще не отвечает: домен недоступен
+                        // сам по себе, ни обход, ни исключения тут не при чём.
+                        analyzer_probe::OffProbe::Dead => {
+                            dead_off.insert(h);
+                        }
+                    }
                 }
-                analyzer_probe::OffProbe::Broken => {
-                    broken_off.insert(h);
-                }
-                // Без обхода сервер вообще не отвечает: домен недоступен сам
-                // по себе, ни обход, ни исключения тут не при чём.
-                analyzer_probe::OffProbe::Dead => {
-                    dead_off.insert(h);
-                }
-            }
-        }
 
-        let mut classification = analyzer_probe::classify_dual(
-            results_on.clone(),
-            &broken_off,
-            &dns_off,
-            &dead_off,
-            &browser_failed_set,
-        );
+                // Контрольная точка отмены (поток не может выйти через `?`
+                // наружу — Err уедет в join и честно упадёт анализ).
+                ensure_active()?;
+                let classification = analyzer_probe::classify_dual(
+                    results_on,
+                    &broken_off,
+                    &dns_off,
+                    &dead_off,
+                    &browser_failed_set,
+                );
 
-        // Фактовая диагностика главного домена — в чистом окне без обхода.
-        // DoH-ответы грузятся ОДИН раз и расходуются и на пробу домена,
-        // и на проверку «подмены DNS» (раньше resolve_doh_all вызывался
-        // дважды — лишний проход с дедлайном 9 с).
+                // Лёгкая подмена DNS для «не резолвящихся» (до 5) — из остатка
+                // бюджета (низкий приоритет: фоновые домены).
+                let t_dnsfail = std::time::Instant::now();
+                let dns_fail_sub = dns_fail_sub_parallel(&classification.dns_fail, 5, budget);
+                Ok::<_, String>((classification, dns_fail_sub, t_dnsfail.elapsed()))
+            })
+        };
+        let chain_b = {
+            let main_host = main_host.clone();
+            let app = app.clone();
+            let budget = window_budget;
+            thread::spawn(move || {
+                // DoH-ответы главного домена: бюджетированный резолв (дедлайн
+                // min(9 с, остаток окна)) — фаза больше не перерасходует окно
+                // через «свой» 9-с таймаут резолва (кейс googlevideo 00:40).
+                let t_probe = std::time::Instant::now();
+                let main_doh_answers =
+                    crate::diagnostics_probe::resolve_doh_all_within(&main_host, budget);
+                // ВСЁ параллельно, СРАЗУ после DoH-резолва: диагностика
+                // главного домена, подмена DNS и CIDR-скан — три потока на
+                // общем бюджете окна. Прежний порядок «probe → потом подмена»
+                // сожрал бюджет пробой (34.9 с probe при бюджете 20 с; probe
+                // сам бюджет уважает частично) — подмена всегда получала
+                // обрезок «не проверено» (кейс googlevideo 01:33 11.11.26).
+                // Айпишник ищем всегда: подмена — отдельные пробы по адресам
+                // DoH-канала, её результат не зависит от вердикта probe.
+                let main_probe_handle = {
+                    let host = main_host.clone();
+                    let answers = main_doh_answers.clone();
+                    thread::spawn(move || {
+                        site_probe::probe_domain_with_doh(&host, &answers, budget)
+                    })
+                };
+                let sub_handle = {
+                    let host = main_host.clone();
+                    let answers = main_doh_answers.clone();
+                    thread::spawn(move || {
+                        site_probe::dns_substitutions_from(&host, &answers, true, budget)
+                    })
+                };
+                let block_handle = {
+                    let host = main_host.clone();
+                    thread::spawn(move || {
+                        crate::ip_range_scan::block_diagnose(&app, &host, budget)
+                    })
+                };
+                let main_probe = main_probe_handle
+                    .join()
+                    .map_err(|_| "поток диагностики главного домена упал".to_string())?;
+                let main_dns_sub = sub_handle
+                    .join()
+                    .map_err(|_| "поток подмены DNS упал".to_string())?;
+                let block_scan_raw = block_handle
+                    .join()
+                    .map_err(|_| "поток CIDR-скана (block_diagnose) упал".to_string())?;
+                // CIDR-скан осмыслен только для сломанного сайта: при открытом
+                // сайте или WwwOnly-вердикте результат скана не показываем
+                // (гейт использования; запуск всегда — иначе скан, стартующий
+                // после probe, входил с исчерпанным бюджетом и целиком
+                // превращался в «не проверено»).
+                let block_scan = if main_probe.verdict.site_broken()
+                    && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
+                {
+                    Some(block_scan_raw)
+                } else {
+                    None
+                };
+                let t_probe_elapsed = t_probe.elapsed();
+
+                Ok::<_, String>((
+                    main_probe,
+                    main_doh_answers,
+                    main_dns_sub,
+                    block_scan,
+                    t_probe_elapsed,
+                ))
+            })
+        };
+
+        // Join цепочек: паника потока = честная ошибка анализа (обход
+        // восстановит OffWindowGuard::Drop при выходе из области).
+        let res_a = chain_a
+            .join()
+            .map_err(|_| "поток пробы #2 (чистое окно) упал".to_string())?;
+        let (mut classification, dns_fail_sub, t_dnsfail) = res_a?;
+        let res_b = chain_b
+            .join()
+            .map_err(|_| "поток диагностики главного домена упал".to_string())?;
+        let (main_probe, main_doh_answers, main_dns_sub, block_scan, t_probe_elapsed) = res_b?;
+
         ensure_active()?;
-        let t_probe = std::time::Instant::now();
-        let main_doh_answers = site_probe::resolve_doh_answers(&main_host);
-        let main_probe = site_probe::probe_domain_with_doh(&main_host, &main_doh_answers, window_budget);
-        timings.push(("probe_domain (диагностика главного домена)", t_probe.elapsed()));
+        timings.push(("главный домен (DoH-резолв ∥ проба ∥ подмена ∥ CIDR-скан)", t_probe_elapsed));
+        timings.push(("dns_fail_sub (фоновые DoH-проверки)", t_dnsfail));
 
         // Арбитраж (кейс eu.aptabase.com): если сайт доказанно открывается без
         // обхода, а классификация зовёт его в обход — верен вывод «обход его
@@ -488,76 +622,66 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
             main_probe.verdict == crate::site_verdict::Verdict::Open,
         );
 
-        // Автопроверка «подмены DNS». Обычный DNS (системный/публичные UDP:53) может
-        // быть отравлен или перехвачен, и тогда сайт не открывается, хотя сам не
-        // заблокирован. Если главный домен не открывается — резолвим его через
-        // DoH-сервисы и ищем рабочий IP для подмены.
-        // При WwwOnly проверка бессмысленна: рабочее имя уже найдено.
-        // DoH-ответы переиспользуются из пробы домена (одна загрузка на анализ).
-        let main_dns_sub = if main_probe.verdict.site_broken()
-            && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
-        {
-            site_probe::dns_substitutions_from(&main_host, &main_doh_answers, true, window_budget)
-        } else {
-            Vec::new()
-        };
-
-        // Разбор первопричины для главного домена: разновидности 403 (чужой VIP /
-        // WAF-гео / голый отказ), транспорт-блок цензором и — только если транспорт
-        // к родным IP не работает — скан CIDR-диапазонов с поиском рабочего IP.
-        // Условие совпадает с блоком подмены DNS: сайт открывается или найдено
-        // рабочее имя (WwwOnly) — разбирать нечего.
-        ensure_active()?;
-        let t_block = std::time::Instant::now();
-        let block_scan = if main_probe.verdict.site_broken()
-            && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
-        {
-            Some(crate::ip_range_scan::block_diagnose(app, &main_host, window_budget))
-        } else {
-            None
-        };
-        timings.push(("block_diagnose (CIDR-скан)", t_block.elapsed()));
-
-        // Авто-восстановление обхода прежним профилем (общая логика SSOT) —
-        // только после того, как все фактовые пробы собрались в чистом окне.
-        // Сюда же — лёгкая подмена DNS для «не резолвящихся» доменов (до 5):
-        // их TCP-пробы тоже не должны идти через активный обход.
-        // Домены проверяются параллельно: последовательный .map тянул до
-        // 9 с дедлайна DoH на каждый (до 45 с на пятерку).
-        ensure_active()?;
-        let t_dnsfail = std::time::Instant::now();
-        let dns_fail_sub = dns_fail_sub_parallel(&classification.dns_fail, 5, window_budget);
-        timings.push(("dns_fail_sub (фоновые DoH-проверки)", t_dnsfail.elapsed()));
-
         timings.push((
-            "окно без обхода (проба #2 + ретраи)",
+            "окно без обхода (проба #2 + ретраи + главный домен)",
             t_off.elapsed(),
         ));
 
         restore_note = off_window.close();
 
-        // === Контрольная проба С обходом (кейс Patreon 01.11.26) ===
-        // Все фактовые пробы выше шли в чистом окне и честно видели RST (DPI
-        // режет TLS). Но отказ самого сайта (гео-блок/WAF — Cloudflare 1009)
-        // проявляется только С обходом: TLS проходит, и сервер отвечает сам.
-        // Обход только что восстановлен — пробуем главный домен по настоящему
-        // DoH-адресу, как ходит браузер юзера. GeoBlocked/ServiceRestricted
-        // пропускаем: отказ сайта уже виден в чистом окне, отчёт печатает его
-        // без контрольной пробы.
+        // === Фаза ON: DoH-резолв и подмена DNS С ОБХОДОМ ===
+        // РКН блокирует сами DoH-сервисы: в чистом окне часть списка горит
+        // таймаутами, с обходом отвечает (как у браузера юзера). Поэтому список
+        // резолвится ещё раз С активным обходом, ответы сливаются с OFF-фазой
+        // (merge_doh_answers), и полная подмена DNS идёт по объединению — каждый
+        // сервис SSOT-файла проверен в ОБОИХ состояниях обхода. Условие запуска —
+        // прежняя контрольная проба: GeoBlocked/ServiceRestricted пропускаем
+        // (отказ сайта уже виден в чистом окне, повторять нечего).
         ensure_active()?;
-        let t_ctrl = std::time::Instant::now();
-        let bypass_on_http = if main_probe.verdict.site_broken()
+        let main_dns_sub_on = if main_probe.verdict.site_broken()
             && main_probe.verdict != crate::site_verdict::Verdict::WwwOnly
             && main_probe.verdict != crate::site_verdict::Verdict::GeoBlocked
             && main_probe.verdict != crate::site_verdict::Verdict::ServiceRestricted
         {
-            site_probe::bypass_on_control_probe(&main_host, &main_doh_answers)
+            let t_on = std::time::Instant::now();
+            let budget_on = StageBudget::new_with_cancel(
+                ON_WINDOW_BUDGET,
+                || cancel::is_cancelled(cancel::SITE_ANALYSIS),
+            );
+            let answers_on =
+                crate::diagnostics_probe::resolve_doh_all_within(&main_host, budget_on);
+            let merged =
+                crate::diagnostics_probe::merge_doh_answers(&main_doh_answers, &answers_on);
+            let subs_on = site_probe::dns_substitutions_from(&main_host, &merged, true, budget_on);
+            timings.push(("фаза с обходом (DoH-резолв + подмена DNS)", t_on.elapsed()));
+            subs_on
         } else {
-            None
+            Vec::new()
         };
-        timings.push(("контроль с обходом (главный домен)", t_ctrl.elapsed()));
 
-        (classification, Some(main_probe), main_dns_sub, dns_fail_sub, block_scan, bypass_on_http)
+        // Рабочий IP из ON-колонки — роль прежней контрольной пробы с обходом,
+        // но из полного перебора всех сервисов, а не одного первого IP:
+        // предпочитаем подтверждённый Ok/Unverified, иначе первый типизированный
+        // отказ (Forbidden/BlockPage — «сайт сам ограничивает», кейс Patreon).
+        let bypass_on_http = {
+            let mut chosen: Option<(IpAddr, crate::diagnostics_probe::HttpResult)> = None;
+            let mut fallback: Option<(IpAddr, crate::diagnostics_probe::HttpResult)> = None;
+            for s in &main_dns_sub_on {
+                let Some(http) = &s.http else { continue };
+                let Some(ip_str) = &s.working_ip else { continue };
+                let Ok(ip) = ip_str.parse::<IpAddr>() else { continue };
+                if s.http_ok {
+                    chosen = Some((ip, http.clone()));
+                    break;
+                }
+                if fallback.is_none() {
+                    fallback = Some((ip, http.clone()));
+                }
+            }
+            chosen.or(fallback)
+        };
+
+        (classification, Some(main_probe), main_dns_sub, main_dns_sub_on, dns_fail_sub, block_scan, bypass_on_http)
     } else {
         // Обход был выключен изначально — весь анализ и так шёл в чистом окне.
         let classification =
@@ -566,7 +690,8 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         // DoH-ответы грузятся ОДИН раз (см. ветку обхода выше).
         ensure_active()?;
         let t_probe = std::time::Instant::now();
-        let main_doh_answers = site_probe::resolve_doh_answers(&main_host);
+        let main_doh_answers =
+            crate::diagnostics_probe::resolve_doh_all_within(&main_host, window_budget);
         let main_probe = site_probe::probe_domain_with_doh(&main_host, &main_doh_answers, window_budget);
         timings.push(("probe_domain (диагностика главного домена)", t_probe.elapsed()));
         let main_dns_sub = if main_probe.verdict.site_broken()
@@ -592,7 +717,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         let dns_fail_sub = dns_fail_sub_parallel(&classification.dns_fail, 5, window_budget);
         timings.push(("dns_fail_sub (фоновые DoH-проверки)", t_dnsfail.elapsed()));
 
-        (classification, Some(main_probe), main_dns_sub, dns_fail_sub, block_scan, None)
+        (classification, Some(main_probe), main_dns_sub, Vec::new(), dns_fail_sub, block_scan, None)
     };
 
     // SSOT: карта списков обхода загружается РАЗ на анализ и едет в meta —
@@ -645,6 +770,7 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
         had_browser_failures,
         main_probe,
         main_dns_sub,
+        main_dns_sub_on,
         dns_fail_sub,
         block_scan,
         bypass_map,
@@ -661,6 +787,11 @@ fn analyze_domain(app: &AppHandle, url: &str, main_host: String) -> Result<Domai
     report.push_str(&site_solution::report_block(&solution));
     // Тайминги этапов: где анализ провёл время (видно пользователю в логе).
     report.push_str(&timing_block(&timings, t_total.elapsed()));
+
+    // Отчёт анализа в лог — единожды отсюда (SSOT бэкенда). Фронт-эхо
+    // (SiteFixTab appendLog) убрано: мультистроку плагин сам разрежет на
+    // записи (контракт «одна строка = одна запись»), хвост больше не режется.
+    crate::events::app_log(app, report.clone());
 
     Ok(DomainAnalysisOutcome { report, solution })
 }
@@ -719,3 +850,32 @@ fn timing_block(timings: &[(&str, std::time::Duration)], total: std::time::Durat
     s
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Восстановление обхода после окна (sc stop WinDivert + пауза выгрузки
+    /// драйвера) — в дедлайне очереди учтено константой теста.
+    const RESTORE_GRACE: Duration = Duration::from_secs(2);
+
+    /// Дедлайн очереди (инцидент 09.11.26: анализ горел 300+ с и умирал без
+    /// отчёта): сумма бюджетов фаз обязана влезать в ANALYSIS_DEADLINE с
+    /// запасом на перерасход probe (окно живёт max(потоки), probe частично
+    /// вне бюджета) и на контрольные точки между фазами.
+    #[test]
+    fn window_budgets_fit_analysis_deadline() {
+        let total = CHROME_BUDGET + WINDOW_BUDGET + RESTORE_GRACE + ON_WINDOW_BUDGET;
+        let deadline = crate::analysis_queue::ANALYSIS_DEADLINE;
+        assert!(
+            total < deadline,
+            "сумма бюджетов {:?} должна быть меньше дедлайна {:?}",
+            total,
+            deadline
+        );
+        assert!(
+            deadline - total >= Duration::from_secs(10),
+            "запас после бюджета {} с — меньше 10 с на перерасход probe",
+            (deadline - total).as_secs()
+        );
+    }
+}

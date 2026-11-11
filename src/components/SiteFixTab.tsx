@@ -69,7 +69,7 @@ export default function SiteFixTab({ url, setUrl, isTesting, setIsTesting, solut
   // «Стоп» нажат: Err-ответ бэкенда трактуем как ожидаемую остановку,
   // а не ошибку (сам цикл здесь фронт не крутит — рулит бэкенд).
   const stopRef = useRef(false);
-  const { appendEntry, appendLog } = useTestingLog();
+  const { appendEntry } = useTestingLog();
 
   // Кнопка «Стоп»: сигнал бэкенду остановить операцию в ближайшей
   // контрольной точке (анализ — между фазами, подбор DNS — между фазами
@@ -88,14 +88,16 @@ export default function SiteFixTab({ url, setUrl, isTesting, setIsTesting, solut
     setIsTesting(true);
     stopRef.current = false;
     setSolution(null); // старое решение к новому анализу неприменимо
-    appendEntry(`[Анализ] Запуск анализа для: ${url}...`, "info");
-    appendEntry("Идёт анализ: пробы соединения (с обходом/без), поиск кандидатов в списках (до ~30 сек)...", "info");
+    // Одна стартовая строка: старт дублировался двумя FE-записями + бэкенд-дубль
+    // очереди (правило «в лог не дублируем» — PRP «Читаемый лог»).
+    appendEntry(`[Анализ] Запуск анализа: ${url} (до ~30 сек)...`, "info");
 
     try {
       // Бэкенд возвращает { report, solution }: текст отчёта уже содержит
       // блок «ИТОГ АНАЛИЗА» (те же данные, что в solution).
       const outcome: { report: string; solution: SiteSolution } = await invoke("run_domain_analysis", { url });
-      appendLog(outcome.report);
+      // Отчёт в лог кладёт бэкенд (analyze_domain / analyze_url — SSOT);
+      // здесь эхо не нужно: плагин уже разрезал отчёт на записи построчно.
       setSolution(outcome.solution ?? null);
     } catch (e: any) {
       if (stopRef.current) {
@@ -255,7 +257,7 @@ export default function SiteFixTab({ url, setUrl, isTesting, setIsTesting, solut
           isOk ? "ok" : isRst ? "fail" : "info"
         );
         if (isRst) {
-          appendLog("💡 Напоминание: при RST сброс идёт на уровне SNI/DPI — подмена в hosts не открывает сайт. Используйте обход (winws).");
+          appendEntry("💡 Напоминание: при RST сброс идёт на уровне SNI/DPI — подмена в hosts не открывает сайт. Используйте обход (winws).", "info");
         }
       } catch (err: any) {
         appendEntry(`[hosts] Ошибка авто-проверки: ${err}`, "fail");

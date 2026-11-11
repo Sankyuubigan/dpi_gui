@@ -220,19 +220,29 @@ pub fn decide(meta: &ReportMeta, c: &Classification) -> SiteSolution {
     //    только когда обход главному домену НЕ предлагается (иначе обход —
     //    приоритетное лечение, и hosts «подменять правильный адрес» не нужен).
     let mut hosts_from_sub: Option<(String, String)> = None;
+    // Адрес из ON-колонки (фаза с обходом) жив только при активном winws —
+    // для честной пометки в summary. Приоритет у OFF-адреса: он работает
+    // и без обхода.
+    let mut hosts_from_sub_on = false;
     if hosts_from_probe.is_none()
         && !matches!(main_verdict, Some(v) if v.bypass_relevant())
     {
         if let Some(verdict) = main_verdict {
             if verdict.site_broken() {
-                if let Some(sub) = meta
+                let off = meta
                     .main_dns_sub
                     .iter()
-                    .find(|s| s.http_ok && s.working_ip.is_some())
-                {
-                    if let (Some(ip), Some(host)) = (sub.working_ip.clone(), main_host.clone()) {
-                        hosts_from_sub = Some((ip, host));
-                    }
+                    .find(|s| s.http_ok && s.working_ip.is_some());
+                let on = meta
+                    .main_dns_sub_on
+                    .iter()
+                    .find(|s| s.http_ok && s.working_ip.is_some());
+                let picked = off
+                    .and_then(|s| s.working_ip.clone().map(|ip| (ip, false)))
+                    .or_else(|| on.and_then(|s| s.working_ip.clone().map(|ip| (ip, true))));
+                if let (Some((ip, from_on)), Some(host)) = (picked, main_host.clone()) {
+                    hosts_from_sub_on = from_on;
+                    hosts_from_sub = Some((ip, host));
                 }
             }
         }
@@ -243,12 +253,20 @@ pub fn decide(meta: &ReportMeta, c: &Classification) -> SiteSolution {
         let http_ctx = meta
             .main_dns_sub
             .iter()
+            .chain(meta.main_dns_sub_on.iter())
             .find(|s| s.working_ip.as_deref() == Some(ip.as_str()))
             .map(|s| format!(" ({})", s.http_note))
             .unwrap_or_default();
+        // Адрес из ON-колонки жив только при активном winws: честная пометка
+        // вместо молчаливого hosts-совета, который без обхода не откроет сайт.
+        let bypass_ctx = if hosts_from_sub_on {
+            " — работает только при включённом обходе (winws)"
+        } else {
+            ""
+        };
         summaries.push(format!(
-            "записать в hosts {} → {} (адрес проверен DoH-каналом и HTTPS-пробой){}",
-            ip, host, http_ctx
+            "записать в hosts {} → {} (адрес проверен DoH-каналом и HTTPS-пробой){}{}",
+            ip, host, http_ctx, bypass_ctx
         ));
         actions.push(SolutionAction::WriteHosts { ip, domain: host });
     }
@@ -316,7 +334,14 @@ fn hosts_pin_solution(meta: &ReportMeta, pin: &site_probe::HostsPin) -> SiteSolu
             .iter()
             .find(|s| s.http_ok)
             .and_then(|s| s.working_ip.clone());
-        from_probe.or(from_sub)
+        // ON-колонка (фаза с обходом) как последний резерв: РКН режет сами
+        // DoH-сервисы, адрес может найтись только при активном winws.
+        let from_sub_on = meta
+            .main_dns_sub_on
+            .iter()
+            .find(|s| s.http_ok)
+            .and_then(|s| s.working_ip.clone());
+        from_probe.or(from_sub).or(from_sub_on)
     });
 
     let dns_path_open = meta
@@ -749,7 +774,7 @@ mod tests {
     use crate::analyzer_report::ReportMeta;
     use crate::diagnostics_probe::{DnsInfo, HttpResult};
     use crate::site_probe::{DomainProbe, IpSource};
-    use crate::site_verdict::{CauseContext, Verdict};
+    use crate::site_verdict::{CauseContext, DohFailLayer, Verdict};
 
     fn empty_classification() -> Classification {
         Classification {
@@ -773,6 +798,7 @@ mod tests {
                 same_host_alt_ip_works: doh_working_ip.is_some(),
                 isp_redirect: None,
                 doh_http80_hint: false,
+                doh_fail_layer: DohFailLayer::Unconfirmed,
                 doh_candidates: Vec::new(),
                 probe_fail_note: None,
             },
@@ -817,6 +843,7 @@ mod tests {
             had_browser_failures: false,
             main_probe: Some(p),
             main_dns_sub: Vec::new(),
+            main_dns_sub_on: Vec::new(),
             dns_fail_sub: Vec::new(),
             block_scan: None,
             bypass_map: std::collections::HashMap::new(),
@@ -973,6 +1000,7 @@ mod tests {
             working_ip: ip.map(|i| i.to_string()),
             http_note: note.to_string(),
             http_ok: ok,
+            http: if ok { Some(HttpResult::Ok(200)) } else { None },
         }
     }
 
@@ -1102,6 +1130,39 @@ mod tests {
                 .any(|a| matches!(a, SolutionAction::WriteHosts { .. })),
             "TCP-ответ без HTTPS-пробы — не основание для hosts: {:?}",
             s.actions
+        );
+    }
+
+    /// Живой адрес нашёлся только в ON-колонке (РКН режет сами DoH — без
+    /// обхода сервисы горели таймаутом): hosts-решение появляется с честной
+    /// пометкой, что адрес работает только при включённом обходе.
+    #[test]
+    fn solution_uses_on_phase_working_ip_when_off_failed() {
+        let mut c = empty_classification();
+        c.need_bypass = vec!["sub.vercel.app".to_string()];
+        let mut m = bypass_meta(
+            probe(Verdict::IpUnreachable, Some(HttpResult::Timeout), None),
+            &["vercel.app"],
+        );
+        m.main_dns_sub = vec![dns_sub(None, "ошибка DoH: не ответил", false)];
+        m.main_dns_sub_on = vec![dns_sub(
+            Some("203.0.113.50"),
+            "HTTPS через 203.0.113.50: HTTP 200",
+            true,
+        )];
+        let s = decide(&m, &c);
+        assert!(s.found, "{:?}", s);
+        assert_eq!(
+            s.actions,
+            vec![SolutionAction::WriteHosts {
+                ip: "203.0.113.50".to_string(),
+                domain: "example.com".to_string()
+            }]
+        );
+        assert!(
+            s.summary.contains("работает только при включённом обходе"),
+            "{}",
+            s.summary
         );
     }
 
