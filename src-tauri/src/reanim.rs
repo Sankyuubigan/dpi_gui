@@ -26,7 +26,14 @@ use crate::win_divert::WinDivertAddress;
 /// Висящее рукопожатие: ClientHello ушёл, входящих данных нет `HANDSHAKE_T`.
 pub const HANDSHAKE_T: Duration = Duration::from_secs(5);
 /// Установленный поток: входящие DATA молчат `SILENCE_T` при дупретрансах.
-pub const SILENCE_T: Duration = Duration::from_secs(25);
+/// Единственный потребитель — reanim_stall_check (domain_monitor), который
+/// огорожен is_googlevideo: на не-video флоу порог не действует. 12 с: инжекция
+/// RST обязана опередить `--socket-timeout 20` скачалки (yt-dlp, bookmarks_pro
+/// last_logs.txt) — тогда обрыв читается сразу («connection reset», мгновенный
+/// ретрай на свежем флоу), а не после полного 20-с таймаута чтения; при этом
+/// запас над QUIC_SILENCE_T=10 c — не путаем здоровые паузы с зависанием.
+/// Инвариант закреплён тестом silence_threshold_beats_socket_timeout.
+pub const SILENCE_T: Duration = Duration::from_secs(12);
 /// Не чаще одной инжекции на 4-tuple за `COOLDOWN_T`.
 pub const COOLDOWN_T: Duration = Duration::from_secs(30);
 /// Максимум инжекций на один 4-tuple — дальше честное «не реанимировалось».
@@ -349,6 +356,27 @@ mod tests {
         // Пример из RFC 1071: 00 01 f2 03 f4 f5 f6 f7 → 0x220d.
         let data = [0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7];
         assert_eq!(rfc1071_checksum(&data), 0x220d);
+    }
+
+    /// SILENCE_T обязан опережать `--socket-timeout 20` скачалки (yt-dlp,
+    /// bookmarks_pro/last_logs.txt): RST Реаниматора даёт мгновенный ретрай на
+    /// свежем флоу, тогда как таймаут сокета съедает 20 с на каждое чтение.
+    /// Одновременно порог не должен прижиматься к QUIC_SILENCE_T — иначе
+    /// здоровые паузы потока начнут считаться зависанием.
+    #[test]
+    fn silence_threshold_beats_socket_timeout() {
+        const YT_DLP_SOCKET_TIMEOUT: Duration = Duration::from_secs(20);
+        assert!(
+            SILENCE_T < YT_DLP_SOCKET_TIMEOUT,
+            "порог тишины {:?} ≥ socket-timeout скачалки — инжекция не успеет дать мгновенный ретрай",
+            SILENCE_T
+        );
+        assert!(
+            SILENCE_T > QUIC_SILENCE_T,
+            "порог тишины TCP {:?} ≤ QUIC_SILENCE_T {:?} — здоровые паузы ложно считаются зависанием",
+            SILENCE_T,
+            QUIC_SILENCE_T
+        );
     }
 
     #[test]

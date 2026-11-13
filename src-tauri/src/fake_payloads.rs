@@ -37,15 +37,35 @@ pub struct FakeBlob {
 /// инертен (все пакеты считаются реальными, поведение как до фильтра).
 pub struct FakeBlobs {
     blobs: Vec<FakeBlob>,
+    /// Фейк-хосты hostfakesplit из `--dpi-desync-hostfakesplit-mod=host=X`
+    /// (тот же SSOT final_args, что у блобов). Zapret генерит подставной хост
+    /// как `<случайные [a-z0-9]>.<X>` либо хвост `<X>` (та же длина слота), и
+    /// сборка ClientHello у сниффера завершается на фейке — по этому списку
+    /// SniCollector отличает фейк-хост от реального.
+    fake_hosts: Vec<String>,
 }
 
 impl FakeBlobs {
-    /// Собирает блобы из аргументов запуска winws. Возвращает набор и список
-    /// человекочитаемых предупреждений (файл не прочитан / пуст / без пути) —
-    /// молчаливых ошибок нет (core §2.2).
+    /// Собирает блобы и фейк-хосты из аргументов запуска winws. Возвращает
+    /// набор и список человекочитаемых предупреждений (файл не прочитан /
+    /// пуст / без пути) — молчаливых ошибок нет (core §2.2).
     pub fn from_winws_args(args: &[String]) -> (Self, Vec<String>) {
         let mut blobs: Vec<FakeBlob> = Vec::new();
+        let mut fake_hosts: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
+        for arg in args {
+            let Some(value) = arg.strip_prefix("--dpi-desync-hostfakesplit-mod=") else {
+                continue;
+            };
+            for part in value.split(',') {
+                if let Some(host) = part.strip_prefix("host=") {
+                    let host = host.trim();
+                    if !host.is_empty() && !fake_hosts.iter().any(|h| h == host) {
+                        fake_hosts.push(host.to_string());
+                    }
+                }
+            }
+        }
         for arg in args {
             if !is_fake_payload_arg(arg) {
                 continue;
@@ -78,7 +98,7 @@ impl FakeBlobs {
                 Err(e) => warnings.push(format!("фейк не прочитан {}: {}", path, e)),
             }
         }
-        (Self { blobs }, warnings)
+        (Self { blobs, fake_hosts }, warnings)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -108,6 +128,18 @@ impl FakeBlobs {
         self.blobs
             .iter()
             .any(|b| has_common_prefix_at_least(&b.bytes, payload, MIN_FAKE_MATCH_LEN))
+    }
+
+    /// Похож ли hostname на подставной хост hostfakesplit (из конфига winws):
+    /// сам хост модификатора или его «поддомен» — zapret генерит
+    /// `<случайные [a-z0-9]>.<host>` либо хвост `<host>` (сохраняя длину
+    /// слота хоста ClientHello), и сборка ClientHello у сниффера завершается
+    /// на фейке: сборка завершается на фейке, реальный хост живёт в
+    /// конфликтных перезаписях merge_at (см. SniCollector::candidate_hosts).
+    pub fn is_fake_hostname(&self, host: &str) -> bool {
+        self.fake_hosts
+            .iter()
+            .any(|f| host == f || host.ends_with(&format!(".{f}")))
     }
 }
 
@@ -152,10 +184,49 @@ mod tests {
         v
     }
 
+    /// Хостfakesplit-модификатор из final_args обязан попадать в фейк-хосты:
+    /// по ним SniCollector отличает фейк-хост от реального (кейс слепоты
+    /// Реаниматора 11.11.26: сборка ClientHello завершается на фейке
+    /// `<случайные>.www.google.com`, реальный хост живёт в перезаписях).
+    #[test]
+    fn hostfakesplit_mod_args_yield_fake_hosts() {
+        let (fakes, warns) = FakeBlobs::from_winws_args(&[
+            "--filter-tcp=443".to_string(),
+            "--dpi-desync-hostfakesplit-mod=host=www.google.com".to_string(),
+            "--dpi-desync-hostfakesplit-mod=host=mail.ru,altorder=1".to_string(),
+        ]);
+        assert!(warns.is_empty(), "файловые аргументы отсутствуют — предупреждений нет");
+        assert_eq!(
+            fakes.fake_hosts,
+            vec!["www.google.com".to_string(), "mail.ru".to_string()]
+        );
+        // Zapret-генерация: случайный префикс + точка + хост модификатора.
+        assert!(fakes.is_fake_hostname("q7x2m9w4z1n5v8c3pd.www.google.com"));
+        assert!(fakes.is_fake_hostname("www.google.com"));
+        assert!(fakes.is_fake_hostname("qq22xx44zz66ww88yy00aa11b.mail.ru"));
+        assert!(fakes.is_fake_hostname("mail.ru"));
+        // Реальные хосты — не фейки.
+        assert!(!fakes.is_fake_hostname("rr3---sn-ixh7yn7e.googlevideo.com"));
+        assert!(!fakes.is_fake_hostname("youtube.com"));
+        assert!(!fakes.is_fake_hostname("example.org"));
+    }
+
+    /// Без hostfakesplit-модификатора в конфиге фейк-хостов нет — селектор
+    /// hostname инертен (старое поведение целиком).
+    #[test]
+    fn no_hostfakesplit_mod_yields_empty_fake_hosts() {
+        let (fakes, warns) = FakeBlobs::from_winws_args(&[
+            "--dpi-desync-fake-tls=C:/nonexistent/fake.bin".to_string(),
+        ]);
+        assert_eq!(fakes.fake_hosts.len(), 0);
+        assert_eq!(warns.len(), 1, "файловый аргумент с несуществующим путём даёт предупреждение");
+        assert!(!fakes.is_fake_hostname("www.google.com"));
+    }
+
     #[test]
     fn full_fake_and_seqovl_prefixes_are_fake() {
         let fake = synthetic_tls_fake(0xAB, 664);
-        let blobs = FakeBlobs { blobs: vec![FakeBlob { source: "t.bin".into(), bytes: fake.clone() }] };
+        let blobs = FakeBlobs { fake_hosts: Vec::new(), blobs: vec![FakeBlob { source: "t.bin".into(), bytes: fake.clone() }] };
         // Полная подставная копия (фейк-пакет).
         assert!(blobs.is_fake_payload(&fake));
         // Чистый seqovl-паттерн (префикс файла).
@@ -169,7 +240,7 @@ mod tests {
     #[test]
     fn short_real_segments_and_real_hello_are_not_fake() {
         let fake = synthetic_tls_fake(0xAB, 664);
-        let blobs = FakeBlobs { blobs: vec![FakeBlob { source: "t.bin".into(), bytes: fake }] };
+        let blobs = FakeBlobs { fake_hosts: Vec::new(), blobs: vec![FakeBlob { source: "t.bin".into(), bytes: fake }] };
         // Короткие split-сегменты (split-pos=1 и похожие) — не фильтруются.
         assert!(!blobs.is_fake_payload(&[0x16]));
         assert!(!blobs.is_fake_payload(&[0x16, 0x03, 0x01, 0x01, 0x00]));
@@ -186,7 +257,7 @@ mod tests {
     #[test]
     fn quic_fake_matches_real_initial_with_own_dcid_does_not() {
         let fake = synthetic_quic_fake(0x42);
-        let blobs = FakeBlobs { blobs: vec![FakeBlob { source: "q.bin".into(), bytes: fake.clone() }] };
+        let blobs = FakeBlobs { fake_hosts: Vec::new(), blobs: vec![FakeBlob { source: "q.bin".into(), bytes: fake.clone() }] };
         assert!(blobs.is_fake_payload(&fake));
         // Реальный Initial: тот же flags/version/DCID-len, но свой DCID.
         let mut real = vec![0xC3, 0x00, 0x00, 0x00, 0x01, 0x14];
@@ -197,7 +268,7 @@ mod tests {
 
     #[test]
     fn empty_blobs_never_filter() {
-        let blobs = FakeBlobs { blobs: Vec::new() };
+        let blobs = FakeBlobs { fake_hosts: Vec::new(), blobs: Vec::new() };
         assert!(blobs.is_empty());
         assert!(!blobs.is_fake_payload(&vec![0x16; 1200]));
     }

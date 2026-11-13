@@ -163,10 +163,18 @@ struct SniCollector {
     pending: HashMap<u32, Vec<u8>>,
     attempts: u8,
     done: Option<String>,
+    /// Конфликтные записи слота хоста (hostfakesplit): (offset, варианты
+    /// байтов). Zapret шлёт фейк-хост ДВАЖДЫ — вокруг реального (altorder=0:
+    /// before, fake, real, fake, after) или после after_host (altorder=1) —
+    /// сборка ClientHello завершается на фейке, реальный хост живёт здесь.
+    alternates: Vec<(usize, Vec<Vec<u8>>)>,
 }
 
 impl SniCollector {
     const MAX_ATTEMPTS: u8 = 2;
+    const MAX_ALT_SETS: usize = 3;
+    const MAX_ALT_VALS: usize = 4;
+    const MAX_CANDIDATES: usize = 8;
 
     fn new() -> Self {
         Self {
@@ -175,6 +183,7 @@ impl SniCollector {
             pending: HashMap::new(),
             attempts: 0,
             done: None,
+            alternates: Vec::new(),
         }
     }
 
@@ -182,6 +191,7 @@ impl SniCollector {
         self.base_seq = None;
         self.collected.clear();
         self.pending.clear();
+        self.alternates.clear();
         self.attempts = Self::MAX_ATTEMPTS; // больше попыток нет
     }
 
@@ -195,8 +205,10 @@ impl SniCollector {
         match parse_client_hello(&self.collected) {
             CliHelloStatus::Found(h) => {
                 self.done = Some(h);
-                // Освобождаем буферы — домен уже извлечён.
-                self.collected.clear();
+                // Освобождаем pending — домен извлечён. collected НЕ чистим:
+                // hostfakesplit завершает сборку на фейк-хосте, а конфликтные
+                // записи слота хоста приходят ПОСЛЕ первой сборки — без базы
+                // candidate_hosts не соберёт кандидатов (см. merge_at).
                 self.pending.clear();
             }
             CliHelloStatus::Incomplete => {}
@@ -214,8 +226,61 @@ impl SniCollector {
         }
     }
 
+    /// Все хостнеймы, восстановимые из сборки: сама сборка плюс варианты
+    /// конфликтных перезаписей слота хоста. hostfakesplit завершает сборку
+    /// на фейк-хосте (слот пишется фейком последним перед after_host либо
+    /// after_host завершает сборку до реального хоста) — реальный хост
+    /// обязан выбираться отсюда, а не из done.
+    fn candidate_hosts(&self) -> Vec<String> {
+        if self.alternates.is_empty() {
+            return match parse_client_hello(&self.collected) {
+                CliHelloStatus::Found(h) => vec![h],
+                _ => Vec::new(),
+            };
+        }
+        // Перечисление: база (текущие байты) + сплайс каждой альтернативы.
+        let mut bufs: Vec<Vec<u8>> = vec![self.collected.clone()];
+        for (off, vals) in &self.alternates {
+            let mut grown: Vec<Vec<u8>> = Vec::new();
+            for b in &bufs {
+                for v in vals {
+                    if off + v.len() <= b.len() && &b[*off..*off + v.len()] != v.as_slice() {
+                        let mut c = b.clone();
+                        c[*off..*off + v.len()].copy_from_slice(v);
+                        grown.push(c);
+                        if bufs.len() + grown.len() >= Self::MAX_CANDIDATES {
+                            break;
+                        }
+                    }
+                }
+                if bufs.len() + grown.len() >= Self::MAX_CANDIDATES {
+                    break;
+                }
+            }
+            bufs.extend(grown);
+            if bufs.len() >= Self::MAX_CANDIDATES {
+                bufs.truncate(Self::MAX_CANDIDATES);
+                break;
+            }
+        }
+        let mut hosts: Vec<String> = Vec::new();
+        for b in &bufs {
+            if let CliHelloStatus::Found(h) = parse_client_hello(b) {
+                if !hosts.contains(&h) {
+                    hosts.push(h);
+                }
+            }
+        }
+        hosts
+    }
+
     fn feed(&mut self, seq: u32, payload: &[u8]) {
-        if self.done.is_some() || self.attempts >= Self::MAX_ATTEMPTS || payload.is_empty() {
+        // done больше НЕ блокирует приём: hostfakesplit завершает сборку на
+        // фейк-хосте, а реальные части идут ПОСЛЕ (altorder=1) либо затираются
+        // вторым фейком до after_host (altorder=0) — без дальнейшего приёма
+        // конфликты не попадут в alternates. Лочение hostname решает
+        // record_outgoing по не-фейковым кандидатам.
+        if self.attempts >= Self::MAX_ATTEMPTS || payload.is_empty() {
             return;
         }
         let start = match self.base_seq {
@@ -268,7 +333,27 @@ impl SniCollector {
     }
 
     /// Перезапись байтов внутри УЖЕ собранного диапазона (никогда не расширяет).
+    /// Отличающиеся same-length записи запоминаются как альтернативы слота —
+    /// без них реальный хост hostfakesplit теряется (затирается вторым фейком).
     fn merge_at(&mut self, offset: usize, payload: &[u8]) {
+        let end = (offset + payload.len()).min(self.collected.len());
+        if offset + payload.len() <= self.collected.len()
+            && self.collected[offset..end] != payload[..end - offset]
+        {
+            let pre = self.collected[offset..end].to_vec();
+            let want_len = pre.len();
+            if let Some((_, vals)) = self
+                .alternates
+                .iter_mut()
+                .find(|(o, vs)| *o == offset && vs[0].len() == want_len)
+            {
+                if vals.len() < Self::MAX_ALT_VALS && !vals.iter().any(|v| *v == pre) {
+                    vals.push(pre);
+                }
+            } else if self.alternates.len() < Self::MAX_ALT_SETS {
+                self.alternates.push((offset, vec![pre]));
+            }
+        }
         for (i, byte) in payload.iter().enumerate() {
             let abs = offset + i;
             if abs >= self.collected.len() {
@@ -309,6 +394,9 @@ struct FlowKey {
 struct FlowState {
     sni: SniCollector,
     hostname: Option<String>,
+    /// Фейк-хосты конфига winws (hostfakesplit) — выбор реального hostname
+    /// среди кандидатов сборки (группы ALT13 шлют фейк-хост вокруг реального).
+    fakes: Arc<crate::fake_payloads::FakeBlobs>,
     /// Кто стучался (ШАГ E, PRP §7.6): имя процесса-владельца сокета.
     /// Кэш на флоу: запрашиваем ТОЛЬКО на исходящем пакете (соединение живо),
     /// пока None — к моменту RST таблица Windows уже пуста для этого сокета.
@@ -345,10 +433,11 @@ struct FlowState {
 impl FlowState {
     const RETX_FLAGGED: u8 = 0x80;
 
-    fn new() -> Self {
+    fn new(fakes: Arc<crate::fake_payloads::FakeBlobs>) -> Self {
         Self {
             sni: SniCollector::new(),
             hostname: None,
+            fakes,
             proc: None,
             proc_path: None,
             retx: HashMap::new(),
@@ -451,10 +540,21 @@ impl FlowState {
     fn record_outgoing(&mut self, seq: u32, payload: &[u8]) -> Option<(&'static str, String)> {
         self.last_seen = Instant::now();
 
-        // Сборка потока → hostname.
-        self.sni.feed(seq, payload);
+        // Сборка потока → hostname. После лочения сборка не нужна.
         if self.hostname.is_none() {
-            if let Some(h) = self.sni.done.clone() {
+            self.sni.feed(seq, payload);
+            // hostfakesplit завершает сборку на ФЕЙК-хосте (слот хоста перед
+            // after_host пишется фейком, либо after_host завершает сборку до
+            // прихода реального хоста) — берём первого кандидата, НЕ
+            // совпадающего с фейк-хостами конфига winws (тот же SSOT final_args,
+            // что у блоб-фильтра). Без фейк-конфига — первый кандидат (как
+            // раньше). Идентичные ретрансы альтернатив не создают.
+            let host = self
+                .sni
+                .candidate_hosts()
+                .into_iter()
+                .find(|h| !self.fakes.is_fake_hostname(h));
+            if let Some(h) = host {
                 self.hostname = Some(h);
             }
         }
@@ -497,16 +597,19 @@ impl FlowState {
 
 struct FlowTracker {
     flows: HashMap<FlowKey, FlowState>,
+    /// Фейк-хосты hostfakesplit из конфига winws (SSOT) — для выбора
+    /// реального hostname среди кандидатов сборки (см. record_outgoing).
+    fakes: Arc<crate::fake_payloads::FakeBlobs>,
 }
 
 impl FlowTracker {
-    fn new() -> Self {
-        Self { flows: HashMap::new() }
+    fn new(fakes: Arc<crate::fake_payloads::FakeBlobs>) -> Self {
+        Self { flows: HashMap::new(), fakes }
     }
 
     fn get_or_create(&mut self, key: FlowKey) -> &mut FlowState {
         if !self.flows.contains_key(&key as &FlowKey) {
-            self.flows.insert(key.clone(), FlowState::new());
+            self.flows.insert(key.clone(), FlowState::new(self.fakes.clone()));
         }
         self.flows.get_mut(&key).unwrap()
     }
@@ -1659,7 +1762,7 @@ fn worker(
         quarantines: HashMap::new(),
     });
     let mut ctx = WorkerCtx {
-        tracker: FlowTracker::new(),
+        tracker: FlowTracker::new(fakes.clone()),
         quic: QuicTracker::new(),
         dedup: Dedupe::new(),
         rate: RateLimiter::new(),
@@ -1829,7 +1932,7 @@ mod tests {
 
     #[test]
     fn retransmit_produces_event_after_3() {
-        let mut st = FlowState::new();
+        let mut st = FlowState::new(Arc::new(FakeBlobs::from_winws_args(&[]).0));
         st.hostname = Some("example.com".to_string());
         let payload = vec![1u8, 2, 3, 4];
         assert!(st.record_outgoing(0, &payload).is_none());
@@ -1842,12 +1945,173 @@ mod tests {
 
     #[test]
     fn retransmit_without_hostname_is_quiet() {
-        let mut st = FlowState::new();
+        let mut st = FlowState::new(Arc::new(FakeBlobs::from_winws_args(&[]).0));
         let payload = vec![1u8, 2, 3, 4];
         for _ in 0..3 {
             st.record_outgoing(0, &payload);
         }
         assert!(st.record_outgoing(0, &payload).is_none(), "без домена событие НЕ отдали");
+    }
+
+    // --- Hostfakesplit: слепота Реаниматора (кейс yt-dlp 11.11.26) -----------
+    // Провод hostfakesplit (zapret desync.c): слот хоста ClientHello пишется
+    // ТРИ раза — fake_host, real_host, fake_host(второй, altorder=0). Фейк-хост
+    // = случайные [a-z0-9] + "." + хост из --dpi-desync-hostfakesplit-mod —
+    // ВАЛИДНЫЙ hostname, is_googlevideo = false. Сборка завершается на
+    // after_host, когда в слоте последний ФЕЙК → done лочился фейком →
+    // Реаниматор слеп (прод: ClientHello TCP:443 — 0 во всех строках
+    // статистики). Реальный хост обязан восстанавливаться из конфликтных
+    // перезаписей слота.
+    const HS_POS: usize = 58; // rec5+hs4+ver2+rand32+sid1+ciphers2+comps1+extlen2+type2+len2+list2+nametype1+hostlen2
+
+    /// ClientHello с хвостовым расширением (как у реальных) — чтобы
+    /// after_host-часть была непустой и сборка завершалась на after_host.
+    fn ch_with_tail(host: &[u8]) -> Vec<u8> {
+        let mut sni = Vec::new();
+        sni.extend(((host.len() as u32 + 3) as u16).to_be_bytes());
+        sni.push(0u8); // name_type
+        sni.extend((host.len() as u16).to_be_bytes());
+        sni.extend(host);
+
+        let mut ext = Vec::new();
+        ext.extend(0x0000u16.to_be_bytes()); // server_name
+        ext.extend((sni.len() as u16).to_be_bytes());
+        ext.extend(&sni);
+        // Хвост после хоста: ec_point_formats-заглушка (6 байт).
+        ext.extend(0x000bu16.to_be_bytes());
+        ext.extend(2u16.to_be_bytes());
+        ext.extend([0x01u8, 0x00]);
+
+        let mut body = Vec::new();
+        body.extend([3u8, 3]); // версия TLS1.2
+        body.extend([0u8; 32]); // random
+        body.push(0u8); // session_id len=0
+        body.extend(0u16.to_be_bytes()); // ciphers len=0
+        body.push(0u8); // comps len=0
+        body.extend((ext.len() as u16).to_be_bytes());
+        body.extend(&ext);
+
+        let mut hs = Vec::new();
+        hs.push(0x01u8);
+        hs.push((body.len() >> 16) as u8);
+        hs.push((body.len() >> 8) as u8);
+        hs.push(body.len() as u8);
+        hs.extend(&body);
+
+        let mut rec = Vec::new();
+        rec.push(0x16u8);
+        rec.extend([3u8, 1]);
+        rec.extend((hs.len() as u16).to_be_bytes());
+        rec.extend(&hs);
+        rec
+    }
+
+    /// FlowState с фейк-конфигом всех hostfakesplit-групп ALT13 (как в
+    /// final_args прода: группа 4 без altorder + группы 5-7 с altorder=1).
+    fn hostfakesplit_state() -> FlowState {
+        let (fakes, warns) = FakeBlobs::from_winws_args(&[
+            "--dpi-desync-hostfakesplit-mod=host=www.google.com".to_string(),
+            "--dpi-desync-hostfakesplit-mod=host=mail.ru,altorder=1".to_string(),
+        ]);
+        assert!(warns.is_empty());
+        FlowState::new(Arc::new(fakes))
+    }
+
+    /// Провод altorder=0 (группа 4: googlevideo): before, fake, real, fake, after.
+    #[test]
+    fn hostfakesplit_altorder0_recovers_real_host() {
+        let mut st = hostfakesplit_state();
+        let host = b"rr3---sn-ixh7yn7e.googlevideo.com";
+        let ch = ch_with_tail(host);
+        assert_eq!(&ch[HS_POS..HS_POS + host.len()], &host[..], "хост-слот по фикс. смещению");
+        // Фейк-хост zapret: 18 случайных [a-z0-9] + "." + "www.google.com" (=33).
+        let fake1 = b"q7x2m9w4z1n5v8c3pd.www.google.com";
+        let fake2 = b"k1p6t3y8r5h2j7s4f0.www.google.com";
+        assert_eq!(fake1.len(), host.len());
+        st.record_outgoing(1000, &ch[..HS_POS]);
+        st.record_outgoing(1058, fake1);
+        st.record_outgoing(1058, &ch[HS_POS..HS_POS + host.len()]);
+        st.record_outgoing(1058, fake2);
+        st.record_outgoing(1091, &ch[HS_POS + host.len()..]);
+        assert_eq!(
+            st.hostname.as_deref(),
+            Some("rr3---sn-ixh7yn7e.googlevideo.com"),
+            "реальный хост обязан восстановиться из перезаписей слота"
+        );
+    }
+
+    /// Провод altorder=1 (группы 5-7, mail.ru): before, fake, after, real —
+    /// сборка завершается на фейке ДО прихода реального хоста.
+    #[test]
+    fn hostfakesplit_altorder1_recovers_real_host() {
+        let mut st = hostfakesplit_state();
+        let host = b"rr3---sn-ixh7yn7e.googlevideo.com";
+        let ch = ch_with_tail(host);
+        // Фейк zapret для mail.ru: 25 случайных + "." + "mail.ru" (=33).
+        let fake = b"qq22xx44zz66ww88yy00aa11b.mail.ru";
+        assert_eq!(fake.len(), host.len());
+        st.record_outgoing(1000, &ch[..HS_POS]);
+        st.record_outgoing(1058, fake);
+        st.record_outgoing(1091, &ch[HS_POS + host.len()..]);
+        st.record_outgoing(1058, &ch[HS_POS..HS_POS + host.len()]);
+        assert_eq!(
+            st.hostname.as_deref(),
+            Some("rr3---sn-ixh7yn7e.googlevideo.com"),
+            "реальный хост приходит последним — обязан перезаписать фейк"
+        );
+    }
+
+    /// Чистый флоу без конфига фейков: старое поведение — первый распарсенный
+    /// hostname; идентичные ретрансы альтернатив не создают и не ломают.
+    #[test]
+    fn plain_flow_and_identical_retrans() {
+        let mut st = FlowState::new(Arc::new(FakeBlobs::from_winws_args(&[]).0));
+        let host = b"example.org";
+        let ch = ch_with_tail(host);
+        st.record_outgoing(2000, &ch[..HS_POS]);
+        // Идентичный ретранс ДО завершения сборки — конфликт не регистрируется.
+        st.record_outgoing(2000, &ch[..HS_POS]);
+        st.record_outgoing((2000 + HS_POS) as u32, &ch[HS_POS..]);
+        assert_eq!(
+            st.hostname.as_deref(),
+            Some("example.org"),
+            "чистый флоу лочит первый распарсенный hostname"
+        );
+        assert!(st.sni.alternates.is_empty(), "идентичные байты — не конфликт");
+        // Ретранс после лочения — hostname не меняется.
+        st.record_outgoing(2000, &ch[..HS_POS]);
+        assert_eq!(st.hostname.as_deref(), Some("example.org"));
+    }
+
+    /// Конечная цель фикса: после провода hostfakesplit reanim_stall_check
+    /// видит googlevideo-флоу и отдаёт кандидата (кейс 1 — рукопожатие).
+    #[test]
+    fn stall_check_fires_after_hostfakesplit_recovery() {
+        let mut st = hostfakesplit_state();
+        let host = b"rr3---sn-ixh7yn7e.googlevideo.com";
+        let ch = ch_with_tail(host);
+        let fake1 = b"q7x2m9w4z1n5v8c3pd.www.google.com";
+        st.record_outgoing(1000, &ch[..HS_POS]);
+        st.record_outgoing(1058, fake1);
+        st.record_outgoing(1058, &ch[HS_POS..HS_POS + host.len()]);
+        st.record_outgoing(1091, &ch[HS_POS + host.len()..]);
+        assert_eq!(st.hostname.as_deref(), Some("rr3---sn-ixh7yn7e.googlevideo.com"));
+
+        let t0 = Instant::now() - Duration::from_secs(6);
+        st.first_out_at = Some(t0);
+        st.client_ip = Some(Ipv4Addr::new(192, 168, 1, 5));
+        st.rcv_nxt = Some(5000);
+        st.snd_nxt = Some(1234);
+        let key = FlowKey {
+            remote_ip: IpAddr::V4(Ipv4Addr::new(74, 125, 104, 232)),
+            remote_port: 443,
+            local_port: 51000,
+        };
+        let cand = st
+            .reanim_stall_check(&key, Instant::now())
+            .expect("после восстановления хоста флоу обязан попасть в кандидаты");
+        assert_eq!(cand.host, "rr3---sn-ixh7yn7e.googlevideo.com");
+        assert_eq!(cand.reason, "handshake");
     }
 
     // --- Дедуп/раз rate -----------------------------------------------------

@@ -1894,6 +1894,37 @@ mod tests {
         );
     }
 
+    /// Живой замер скачальных rr*-хостов googlevideo (кейс yt-dlp 11.11.26:
+    /// фрагменты 0-13 скачались за ~10-20 с, поток стабильно умирал на
+    /// фрагменте 13/14 у двух разных CDN-хостов). Замеряем СЛОЙ СОЕДИНЕНИЯ
+    /// (системный DNS + TCP + TLS + ответ края) в текущем состоянии сети
+    /// (как есть: при включённом winws проба идёт через desync) — mid-flow
+    /// порог этим тестом не воспроизводится. Ассерты структурные.
+    #[test]
+    #[ignore = "requires network"]
+    fn live_probe_googlevideo_rr_hosts() {
+        use std::net::ToSocketAddrs;
+        let hosts = [
+            "rr8---sn-xguxaxjvh-bvwe.googlevideo.com",
+            "rr3---sn-ixh7yn7e.googlevideo.com",
+        ];
+        for host in hosts {
+            let mut ips: Vec<IpAddr> = (host, 443u16)
+                .to_socket_addrs()
+                .expect("системный DNS обязан резолвить rr*-хост — yt-dlp резолвит им же")
+                .map(|a| a.ip())
+                .collect();
+            ips.sort();
+            ips.dedup();
+            eprintln!("[live-rr] {host}: системный DNS -> {} адресов", ips.len());
+            assert!(!ips.is_empty(), "{host}: системный DNS не дал адресов");
+            for ip in ips.into_iter().take(4) {
+                let (res, cert) = http_via_ip_with_cert(host, ip, 443);
+                eprintln!("[live-rr] {host} через {ip}: {res:?} cert={cert:?}");
+            }
+        }
+    }
+
     /// Сколько реально отвечают DoH-сервисы из списка — проверка самого списка,
     /// чтобы молча отвалившийся резолвер не остался в коде навсегда.
     #[test]
