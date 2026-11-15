@@ -273,18 +273,18 @@ fn verify_site_via_ip(host: String, ip: String) -> Result<String, String> {
 fn main() {
     // Единый конвейер логов (08.11.26): краш-лог с первой миллисекунды,
     // до старта Tauri. SSOT подключения — docs/README.md плагина logs.
-    tauri_plugin_logs::early_init("dpi_gui.log");
-    tauri_plugin_logs::early_log("INFO", "запуск DPI_GUI…");
+    plugin_log_collector::early_init("dpi_gui.log");
+    plugin_log_collector::early_log("INFO", "запуск DPI_GUI…");
     // Лог уровня INFO (плагин ставит DEBUG): DEBUG-шум tao («NewEvents emitted…»
     // на каждый redraw) захламлял вкладку «Логи». Наши строки — INFO и выше.
     log::set_max_level(log::LevelFilter::Info);
     tauri::Builder::default()
-        .plugin(tauri_plugin_logs::init())
+        .plugin(plugin_log_collector::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_about_updates::init())
+        .plugin(plugin_about_updates::init())
         // Лог уровня INFO — ПОСЛЕ инициализации плагинов: tauri-plugin-logs при
         // init() сам ставит глобальный уровень DEBUG, и ранний
         // set_max_level(Info) в main() перекрывался — вкладка «Логи» тонула в

@@ -10,8 +10,8 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@my-tauri-plugins/plugin-about-updates": "file:../cross-app-plugins/tauri-plugin-about-updates",
-    "@my-tauri-plugins/plugin-logs": "file:../cross-app-plugins/tauri-plugin-logs",
+    "@my-tauri-plugins/plugin-about-updates": "file:../cross-app-plugins/plugin-about-updates",
+    "@my-tauri-plugins/plugin-logs": "file:../cross-app-plugins/plugin-log-collector",
     "@tauri-apps/api": "2.0.0",
     "@tauri-apps/plugin-dialog": "^2.8.4",
     "@tauri-apps/plugin-process": "2.0.0",

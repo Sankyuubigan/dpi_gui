@@ -18,10 +18,10 @@ tauri-plugin-process = "2"
 tauri-plugin-dialog = "2"
 # Единый конвейер логов (08.11.26): log::Log → exe-файл + событие logs:message
 # для общей лог-области на всех вкладках; SSOT подключения — docs/README.md плагина.
-tauri-plugin-logs = { path = "../../cross-app-plugins/tauri-plugin-logs" }
+plugin-log-collector = { path = "../../cross-app-plugins/plugin-log-collector" }
 log = "0.4"
 # Модуль «О приложении / Обновления»: история релизов GitHub + откат (общий репозиторий cross-app-plugins).
-tauri-plugin-about-updates = { path = "../../cross-app-plugins/tauri-plugin-about-updates" }
+plugin-about-updates = { path = "../../cross-app-plugins/plugin-about-updates" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 reqwest = { version = "0.12", features = ["blocking"] }
