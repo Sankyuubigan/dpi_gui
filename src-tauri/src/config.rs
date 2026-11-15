@@ -311,6 +311,18 @@ pub fn open_file_in_editor(file_type: &str) -> Result<(), std::io::Error> {
 mod tests {
     use super::*;
 
+    /// M3 v2 (13.11.26): UDP:443-секция профилей матчится по list-general —
+    /// без googlevideo.com подменный QUIC Initial для медиа не отправлялся
+    /// вовсе, и Chrome застревал на мёртвом TCP к googlevideo-IP.
+    #[test]
+    fn default_general_list_has_googlevideo() {
+        let list = include_str!("../defaults/list-general.txt");
+        assert!(
+            list.lines().any(|l| l.trim() == "googlevideo.com"),
+            "googlevideo.com обязан быть в дефолтном general-списке"
+        );
+    }
+
     #[test]
     fn accepts_full_url_and_bare_host() {
         // Полный URL и bare host одного сервера нормализуются к одному хосту

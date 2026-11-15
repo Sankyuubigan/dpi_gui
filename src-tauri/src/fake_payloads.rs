@@ -141,6 +141,32 @@ impl FakeBlobs {
             .iter()
             .any(|f| host == f || host.ends_with(&format!(".{f}")))
     }
+
+    /// Содержит ли payload подставной хост hostfakesplit — паттерн
+    /// `<что-то>.<fake_host>` (вхождение байтов fake_host, перед которым
+    /// стоит точка). Zapret пишет подставной хост как
+    /// `<случайные [a-z0-9]>.<host>` либо хвост, сохраняя длину слота
+    /// ClientHello. Голое вхождение host без предшествующей точки НЕ
+    /// считается: это может быть реальный SNI (mail.ru и его поддомены —
+    /// дезинк-исключены, проверка обязана их не трогать). Сегменты с
+    /// подставным хостом winws повторяет на каждом дезинкнутом флоу
+    /// (--dpi-desync-repeats=5/11); без отсева счётчик ретрансмиссий
+    /// монитора считал их ретрансмиссиями реального флоу — фантомные
+    /// «сервер молчит» на настоящем hostname (волна 00:56 12.11.26:
+    /// пул DoH, twitch, discord). Сравнение байтовое: конфиг (host= из
+    /// final_args) и провод согласованы.
+    pub fn payload_carries_fake_host(&self, payload: &[u8]) -> bool {
+        self.fake_hosts.iter().any(|f| {
+            let f = f.as_bytes();
+            if f.is_empty() || payload.len() <= f.len() {
+                return false;
+            }
+            payload
+                .windows(f.len())
+                .enumerate()
+                .any(|(pos, w)| w == f && payload[pos - 1] == b'.')
+        })
+    }
 }
 
 /// Аргумент winws, задающий файл с подставным payload. Префиксные проверки
@@ -221,6 +247,40 @@ mod tests {
         assert_eq!(fakes.fake_hosts.len(), 0);
         assert_eq!(warns.len(), 1, "файловый аргумент с несуществующим путём даёт предупреждение");
         assert!(!fakes.is_fake_hostname("www.google.com"));
+    }
+
+    /// Признак подставного сегмента hostfakesplit: паттерн `<x>.<fake_host>`.
+    /// Репро фантома «сервер молчит» (волна 00:56 12.11.26).
+    #[test]
+    fn payload_carries_fake_host_detects_rnd_subdomain() {
+        let (fakes, warns) = FakeBlobs::from_winws_args(&[
+            "--dpi-desync-hostfakesplit-mod=host=www.google.com".to_string(),
+            "--dpi-desync-hostfakesplit-mod=host=mail.ru,altorder=1".to_string(),
+        ]);
+        assert!(warns.is_empty());
+        // Фейк-сегменты zapret (те же строки, что в фикстурах domain_monitor).
+        assert!(fakes.payload_carries_fake_host(b"qq22xx44zz66ww88yy00aa11b.mail.ru"));
+        assert!(fakes.payload_carries_fake_host(b"q7x2m9w4z1n5v8c3pd.www.google.com"));
+        // Хвост слота, подрезанный сплитом: подставной хост целиком в сегменте.
+        let mut seg = b"\x00\x1b".to_vec();
+        seg.extend_from_slice(b"w2.mail.ru");
+        assert!(fakes.payload_carries_fake_host(&seg));
+        assert!(!fakes.payload_carries_fake_host(b""));
+    }
+
+    /// Голый хост без предшествующей точки — НЕ признак фейка: это может быть
+    /// реальный SNI (mail.ru и поддомены дезинк-исключены; поддомен с точкой —
+    /// допущенный недоб счёта: ложные срабатывания хуже пропусков).
+    #[test]
+    fn payload_carries_fake_host_ignores_bare_host_and_structure() {
+        let (fakes, _) =
+            FakeBlobs::from_winws_args(&["--dpi-desync-hostfakesplit-mod=host=mail.ru".to_string()]);
+        assert!(!fakes.payload_carries_fake_host(b"mail.ru"));
+        // Структурный before-сегмент ClientHello без хоста.
+        assert!(!fakes.payload_carries_fake_host(&[0x16, 0x03, 0x01, 0x01, 0x00]));
+        // Пустой конфиг фейк-хостов — инертен целиком.
+        let (none, _) = FakeBlobs::from_winws_args(&[]);
+        assert!(!none.payload_carries_fake_host(b"qq22xx44zz66ww88yy00aa11b.mail.ru"));
     }
 
     #[test]

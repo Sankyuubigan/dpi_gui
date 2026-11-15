@@ -215,48 +215,97 @@ pub fn decide(meta: &ReportMeta, c: &Classification) -> SiteSolution {
         }
     }
 
-    // 4. Hosts по DoH-подмене: проба главного домена живого адреса не нашла,
+    // 4. Hosts по DoH-подмене: проба главного домена живого адреса не нашla,
     //    но DoH-сервисы отдали адрес с живым HTTPS-ответом. Меняет исход
     //    только когда обход главному домену НЕ предлагается (иначе обход —
     //    приоритетное лечение, и hosts «подменять правильный адрес» не нужен).
-    let mut hosts_from_sub: Option<(String, String)> = None;
+    let mut hosts_from_sub: Option<(String, String, String)> = None;
     // Адрес из ON-колонки (фаза с обходом) жив только при активном winws —
     // для честной пометки в summary. Приоритет у OFF-адреса: он работает
     // и без обхода.
     let mut hosts_from_sub_on = false;
+    // Честные оговорки о доменах, которым решение не досталось из-за
+    // исключений: молчание здесь снова превратилось бы в ложь
+    // («починено», а домен остался сломан). Объявлено до hosts-блока, чтобы
+    // гейт уже-резолвимых адресов дописал сюда свою честную оговорку.
+    let mut caveats: Vec<String> = Vec::new();
     if hosts_from_probe.is_none()
         && !matches!(main_verdict, Some(v) if v.bypass_relevant())
     {
         if let Some(verdict) = main_verdict {
             if verdict.site_broken() {
-                let off = meta
+                // Честность §1.9 (инцидент 12.11.26): адрес, который DNS отдаёт
+                // и так, hosts-пином не лечится — пин не меняет маршрут, имя уже
+                // резолвится в тот же узел. Продать такой пин = заставить
+                // «Починку» бить в флапающий узел, куда DNS и без пина ходит.
+                let resolvable = crate::analyzer_report::already_resolvable_ips(meta);
+                let mut picked: Option<&site_probe::DnsSubstitution> = None;
+                let mut picked_from_on = false;
+                let mut gated_ips: Vec<String> = Vec::new();
+                for (sub, from_on) in meta
                     .main_dns_sub
                     .iter()
-                    .find(|s| s.http_ok && s.working_ip.is_some());
-                let on = meta
-                    .main_dns_sub_on
-                    .iter()
-                    .find(|s| s.http_ok && s.working_ip.is_some());
-                let picked = off
-                    .and_then(|s| s.working_ip.clone().map(|ip| (ip, false)))
-                    .or_else(|| on.and_then(|s| s.working_ip.clone().map(|ip| (ip, true))));
-                if let (Some((ip, from_on)), Some(host)) = (picked, main_host.clone()) {
-                    hosts_from_sub_on = from_on;
-                    hosts_from_sub = Some((ip, host));
+                    .map(|s| (s, false))
+                    .chain(meta.main_dns_sub_on.iter().map(|s| (s, true)))
+                {
+                    if !(sub.http_ok && sub.working_ip.is_some()) {
+                        continue;
+                    }
+                    let ip = sub.working_ip.as_deref().unwrap_or_default();
+                    if resolvable.iter().any(|k| k == ip) {
+                        gated_ips.push(ip.to_string());
+                        continue;
+                    }
+                    picked = Some(sub);
+                    picked_from_on = from_on;
+                    break;
+                }
+                if let Some(sub) = picked {
+                    hosts_from_sub_on = picked_from_on;
+                    if let Some(host) = main_host.clone() {
+                        hosts_from_sub = Some((
+                            sub.working_ip.clone().unwrap_or_default(),
+                            host,
+                            sub.http_note.clone(),
+                        ));
+                    }
+                } else if !gated_ips.is_empty() {
+                    // Все проверенные DoH-адреса — те же, что отдаёт DNS: пин
+                    // ничего не изменит, решение честно называет это в причине
+                    // отсутствия (caveats попадают в none_reason).
+                    caveats.push(format!(
+                        "адреса {} уже отдаёт DNS — hosts-запись не изменит исход \
+                         (имя резолвится в тот же узел, проблема в достижимости)",
+                        gated_ips.join(", ")
+                    ));
                 }
             }
         }
     }
-    for (ip, host) in hosts_from_probe.into_iter().chain(hosts_from_sub) {
+    // Пины собираются в один список с заметкой-источником: у sub-пина заметка
+    // — из того же суба, что дал IP; re-find по working_ip цеплял чужой суб
+    // при совпадении IP у двух сервисов (инцидент 12.11.26: выбранный суб
+    // отдал «HTTP 200», а в строке решения красовался чужой «таймаут»).
+    let mut pinned: Vec<(String, String, Option<String>)> = Vec::new();
+    if let Some((ip, host)) = hosts_from_probe {
+        pinned.push((ip, host, None));
+    }
+    if let Some((ip, host, note)) = hosts_from_sub {
+        pinned.push((ip, host, Some(note)));
+    }
+    for (ip, host, sub_note) in pinned {
         // Код ответа виден пользователю: «живой ответ» бывает и 404 (адрес
         // живой, страницу могли не отдать) — молчать об этом была бы ложь.
-        let http_ctx = meta
-            .main_dns_sub
-            .iter()
-            .chain(meta.main_dns_sub_on.iter())
-            .find(|s| s.working_ip.as_deref() == Some(ip.as_str()))
-            .map(|s| format!(" ({})", s.http_note))
-            .unwrap_or_default();
+        let http_ctx = match sub_note {
+            Some(note) => format!(" ({})", note),
+            None => meta
+                .main_dns_sub
+                .iter()
+                .chain(meta.main_dns_sub_on.iter())
+                .find(|s| s.working_ip.as_deref() == Some(ip.as_str()))
+                .map(|s| format!(" ({})", s.http_note))
+                .unwrap_or_default(),
+        };
         // Адрес из ON-колонки жив только при активном winws: честная пометка
         // вместо молчаливого hosts-совета, который без обхода не откроет сайт.
         let bypass_ctx = if hosts_from_sub_on {
@@ -270,11 +319,6 @@ pub fn decide(meta: &ReportMeta, c: &Classification) -> SiteSolution {
         ));
         actions.push(SolutionAction::WriteHosts { ip, domain: host });
     }
-
-    // Честные оговорки о доменах, которым решение не досталось из-за
-    // исключений: молчание здесь снова превратилось бы в ложь
-    // («починено», а домен остался сломан).
-    let mut caveats: Vec<String> = Vec::new();
     if !already_excluded.is_empty() {
         caveats.push(format!(
             "уже в исключениях — повторное добавление ничего не изменит: {}",
@@ -1162,6 +1206,57 @@ mod tests {
         assert!(
             s.summary.contains("работает только при включённом обходе"),
             "{}",
+            s.summary
+        );
+    }
+
+    /// Инцидент 12.11.26 (rr7 googlevideo): DoH-адрес, который DNS и так
+    /// отдаёт, не является «решением» — hosts лишь заморозит узел, к которому
+    /// имя уже резолвится. Пин не предлагается, оговорка честно называет
+    /// причину: достижимость, а не имя.
+    #[test]
+    fn hosts_pin_of_dns_known_ip_is_not_offered() {
+        let mut c = empty_classification();
+        let mut m = meta(probe(Verdict::IpUnreachable, Some(HttpResult::Timeout), None));
+        // DoH-адрес == адрес системного DNS (primary_ips фикстуры — "1.2.3.4").
+        m.main_dns_sub_on = vec![dns_sub(Some("1.2.3.4"), "HTTPS через 1.2.3.4: HTTP 200", true)];
+        let s = decide(&m, &c);
+        assert!(
+            !s.actions
+                .iter()
+                .any(|a| matches!(a, SolutionAction::WriteHosts { .. })),
+            "пин адреса, который DNS отдаёт и так, — нулевой эффект: {:?}",
+            s.actions
+        );
+        let reason = s.none_reason.expect("решения нет — причина обязана быть");
+        assert!(
+            reason.contains("не изменит исход"),
+            "честная оговорка про бесполезность пина: {}",
+            reason
+        );
+    }
+
+    /// Заметка в строке решения — из ТОЙ ЖЕ DoH-записи, что дала IP, а не от
+    /// первого совпавшего по адресу сервиса (инцидент 12.11.26: в строке
+    /// «решения» красовался чужой «таймаут» при ok-пробе того же адреса).
+    #[test]
+    fn solution_note_comes_from_the_same_sub() {
+        let mut c = empty_classification();
+        let mut m = meta(probe(Verdict::IpUnreachable, Some(HttpResult::Timeout), None));
+        m.main_dns_sub_on = vec![
+            dns_sub(Some("203.0.113.50"), "HTTPS через 203.0.113.50: таймаут", false),
+            dns_sub(Some("203.0.113.50"), "HTTPS через 203.0.113.50: HTTP 200", true),
+        ];
+        let s = decide(&m, &c);
+        assert!(s.found, "{:?}", s);
+        assert!(
+            s.summary.contains("HTTP 200"),
+            "заметка обязана быть от ok-суба, давшего IP: {}",
+            s.summary
+        );
+        assert!(
+            !s.summary.contains("таймаут"),
+            "чужая заметка таймаута в строке решения — та же ложь: {}",
             s.summary
         );
     }

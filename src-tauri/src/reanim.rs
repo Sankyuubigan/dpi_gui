@@ -66,6 +66,12 @@ pub const QUAR_MAX_CONCURRENT: usize = 2;
 /// Период строки отчёта о транспорте (M2): исходящие ClientHello TCP:443
 /// против новых QUIC-потоков к googlevideo.
 pub const STATS_WINDOW: Duration = Duration::from_secs(300);
+/// Свипка реаниматора по времени (v2): свипка обязана тикать даже при
+/// почти нулевом трафике 443 — иначе TCP-детект не стреляет, пока флоу молчит
+/// (Chrome после ClientHello не шлёт пакетов до ретранса ~45 с, а детект был
+/// привязан только к исходящим пакетам флоу). Меньше 2 с не разгоняем:
+/// трекеры-чистки (maintain) при каждом тике — дёшево, но шум логов растёт.
+pub const SWEEP_T: Duration = Duration::from_secs(2);
 
 /// Целевой хост-суффикс: видео-CDN, который ТСПУ душит по IP.
 pub const GOOGLEVIDEO_SUFFIX: &str = "googlevideo.com";

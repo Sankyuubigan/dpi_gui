@@ -696,11 +696,90 @@ fn attach_probes(
     class.entries
 }
 
+/// Список ВСЕХ сервисов по честным уровням для строки «Итог: …» (кейс
+/// 13.11.26: из построчной каши вердиктов юзер не видел, какие DNS в
+/// итоге рабочие). Честность (core rules §1.9): «рабочие» — только те,
+/// кого сквозная проба подтвердила (Open / GatewayAlive); GatewayPartial,
+/// Unverified и «проба не успела» — отдельными уровнями, рабочими их
+/// называть нельзя. SiteBlocked/DpiBlocked/Unreachable в список не идут —
+/// их исход объясняет сам вердикт перед итогом.
+fn build_final_list(entries: &[DnsPickEntry]) -> String {
+    let mut working: Vec<String> = Vec::new();
+    let mut partial: Vec<String> = Vec::new();
+    let mut unverified: Vec<String> = Vec::new();
+    let mut unprobed: Vec<String> = Vec::new();
+    let mut dead: Vec<String> = Vec::new();
+    for e in entries {
+        match e.probe {
+            Some(ProbeVerdict::Open) | Some(ProbeVerdict::GatewayAlive) => {
+                working.push(e.service.clone());
+            }
+            Some(ProbeVerdict::GatewayPartial) => {
+                if e.fronting_ips.is_empty() {
+                    partial.push(e.service.clone());
+                } else {
+                    // Подтверждённые пробой шлюзы — SSOT для «Применить»;
+                    // в итоге они же подсказывают, какой IP реальный.
+                    let ips: Vec<String> =
+                        e.fronting_ips.iter().map(|i| i.to_string()).collect();
+                    partial.push(format!("{} (шлюзы: {})", e.service, ips.join(", ")));
+                }
+            }
+            Some(ProbeVerdict::Unverified) => unverified.push(e.service.clone()),
+            Some(ProbeVerdict::GatewayDead) => dead.push(e.service.clone()),
+            None if e.kind == ResolverKind::Dead => dead.push(e.service.clone()),
+            // Живой резолвер, чей сет не попал в лимит проб (attach_probes
+            // оставил probe = None с пометкой про лимит) — не мёртвый и не
+            // рабочий: отдельный уровень.
+            None => unprobed.push(e.service.clone()),
+            Some(_) => {}
+        }
+    }
+    let mut segs: Vec<String> = Vec::new();
+    if working.is_empty() {
+        segs.push("полностью подтверждённых рабочих нет".to_string());
+    } else {
+        segs.push(format!("рабочие — {}", working.join(", ")));
+    }
+    if !partial.is_empty() {
+        segs.push(format!("частичный фронтинг — {}", partial.join(", ")));
+    }
+    if !unverified.is_empty() {
+        segs.push(format!(
+            "резолвят верно, доступность не подтверждена — {}",
+            unverified.join(", ")
+        ));
+    }
+    if !unprobed.is_empty() {
+        segs.push(format!(
+            "проба не успела (бюджет окна) — {}",
+            unprobed.join(", ")
+        ));
+    }
+    if !dead.is_empty() {
+        segs.push(format!("мёртвые — {}", dead.join(", ")));
+    }
+    segs.join("; ")
+}
+
+/// Итоговая строка отчёта: вердикт core + «Итог: …» со списком всех
+/// сервисов по уровням. SSOT — бэк: фронт (SiteFixTab) и браузерный мост
+/// (browser_ctx_action) показывают/логируют summary целиком, поэтому
+/// список попадает и в UI, и в dpi_gui.log без дублирования.
+fn build_summary(host: &str, entries: &[DnsPickEntry]) -> (String, &'static str) {
+    let (text, level) = build_summary_core(host, entries);
+    let list = build_final_list(entries);
+    if list.is_empty() {
+        return (text, level);
+    }
+    (format!("{}. Итог: {}", text, list), level)
+}
+
 /// Итоговая строка + уровень по приоритету честных исходов:
 /// открылся пробой > фронтинг подтверждён (≥ половины пула) > фронтинг
 /// частичный (warn) > оболочка (не подтверждено) > отказ сайта (VPN) >
 /// DPI > ничего. Чистая функция — покрыта тестами.
-fn build_summary(host: &str, entries: &[DnsPickEntry]) -> (String, &'static str) {
+fn build_summary_core(host: &str, entries: &[DnsPickEntry]) -> (String, &'static str) {
     if let Some(e) = entries.iter().find(|e| e.probe == Some(ProbeVerdict::Open)) {
         return (
             format!(
@@ -1176,6 +1255,78 @@ mod tests {
         let (s, level) = build_summary("example.com", &entries);
         assert_eq!(level, "ok");
         assert!(s.contains("Рабочий DNS: svc-a") && s.contains("https://svc-a/dns-query"), "{}", s);
+        assert!(s.contains("Итог: рабочие — svc-a"), "{}", s);
+    }
+
+    /// Итог-список: пустой уровень «рабочие» звучит честно, частичный
+    /// фронтинг называет сервис и подтверждённые пробой шлюзы (кейс
+    /// aistudio 13.11.26: 1 из 7 шлюзов eu.geohide.ru).
+    #[test]
+    fn summary_itog_honest_when_only_partial_fronting() {
+        let entries = vec![DnsPickEntry {
+            service: "eu.geohide.ru".into(),
+            resolved: vec!["5.175.161.40".into()],
+            kind: ResolverKind::Gateway,
+            note: "отдаёт собственные шлюзы".into(),
+            probe: Some(ProbeVerdict::GatewayPartial),
+            probe_note: "фронтинг подтверждён пробой: 1 из 7 шлюзов".into(),
+            fronting_ips: vec![ip("37.221.93.141")],
+        }];
+        let (s, level) = build_summary("aistudio.google.com", &entries);
+        assert_eq!(level, "warn");
+        assert!(s.contains("Итог: полностью подтверждённых рабочих нет"), "{}", s);
+        assert!(
+            s.contains("частичный фронтинг — eu.geohide.ru (шлюзы: 37.221.93.141)"),
+            "{}",
+            s
+        );
+    }
+
+    /// Итог-список раскладывает смешанный прогон (как в логе 13.11.26) по
+    /// всем уровням: частичный фронтинг / Unverified / проба не успела /
+    /// мёртвые — и не называет никого «рабочим».
+    #[test]
+    fn summary_itog_mixed_run_lists_all_tiers() {
+        let mk = |service: &str,
+                  kind: ResolverKind,
+                  probe: Option<ProbeVerdict>,
+                  fronting: Vec<IpAddr>|
+         -> DnsPickEntry {
+            DnsPickEntry {
+                service: service.into(),
+                resolved: vec!["1.2.3.4".into()],
+                kind,
+                note: "note".into(),
+                probe,
+                probe_note: "probe".into(),
+                fronting_ips: fronting,
+            }
+        };
+        let entries = vec![
+            mk(
+                "eu.geohide.ru",
+                ResolverKind::Gateway,
+                Some(ProbeVerdict::GatewayPartial),
+                vec![ip("37.221.93.141")],
+            ),
+            mk("dns.google", ResolverKind::Resolves, Some(ProbeVerdict::Unverified), Vec::new()),
+            mk("cloudflare-dns.com", ResolverKind::Diverges, None, Vec::new()),
+            mk("xbox-dns.ru", ResolverKind::Dead, None, Vec::new()),
+        ];
+        let (s, _) = build_summary("aistudio.google.com", &entries);
+        assert!(s.contains("полностью подтверждённых рабочих нет"), "{}", s);
+        assert!(s.contains("частичный фронтинг — eu.geohide.ru"), "{}", s);
+        assert!(
+            s.contains("резолвят верно, доступность не подтверждена — dns.google"),
+            "{}",
+            s
+        );
+        assert!(
+            s.contains("проба не успела (бюджет окна) — cloudflare-dns.com"),
+            "{}",
+            s
+        );
+        assert!(s.contains("мёртвые — xbox-dns.ru"), "{}", s);
     }
 
     /// Итог «живой фронтинг-шлюз» → ok (кейс aistudio).

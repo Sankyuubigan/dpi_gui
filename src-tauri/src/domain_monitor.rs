@@ -38,7 +38,7 @@ use crate::reanim::{
     build_inbound_rst, is_googlevideo, make_send_address_ifidx, FlowKeyLite, InjectionDecision,
     ReanimCandidate, ReanimLedger, RstParams, HANDSHAKE_T, MAX_QUAR, MAX_RST,
     QUAR_COOLDOWN_T, QUARANTINE_T, QUAR_MAX_CONCURRENT, QUIC_DATA_MIN, QUIC_RETRANS_FRESH_T,
-    QUIC_SILENCE_T, SILENCE_T, STATS_WINDOW, SUCCESS_WINDOW,
+    QUIC_SILENCE_T, SILENCE_T, STATS_WINDOW, SUCCESS_WINDOW, SWEEP_T,
 };
 use crate::win_divert::{
     open_capture_handle, open_send_handle, open_sniff_handle, CaptureHandle, SendHandle,
@@ -559,6 +559,20 @@ impl FlowState {
             }
         }
 
+        // hostfakesplit: сегменты с подставным хостом (`<rnd>.<host>` из мода)
+        // winws повторяет на каждом дезинкнутом флоу (repeats=5/11), а блоб-фильтр
+        // их не отсеивает — фейки генерируются динамически, под статические .bin
+        // не подходят. Без отсева счётчик считал их ретрансмиссиями реального
+        // флоу: провод altorder=0 кладёт в один seq fake+real+fake (сам по себе
+        // порог 3), repeats добавляет копии → ложное «сервер молчит» на
+        // НАСТОЯЩЕМ hostname (волна 00:56 12.11.26: пул DoH, twitch, discord).
+        // В sni.feed выше фейк-сегменты попадают как раньше — восстановление
+        // hostname из alternates не трогается; честные ретрансы реальных
+        // сегментов считаются как раньше.
+        if self.fakes.payload_carries_fake_host(payload) {
+            return None;
+        }
+
         // Ретрансмиссии: тот же seq и та же длина payload повторилось ≥ порога.
         if payload.is_empty() {
             return None;
@@ -1026,6 +1040,15 @@ fn make_tcp<'a>(
 // ---------------------------------------------------------------------------
 // Агрегатор состояния рабочего потока.
 // ---------------------------------------------------------------------------
+/// Домен — хост или поддомен одного из DoH-сервисов из doh-services.txt
+/// (та же семантика сопоставления, что у is_fake_hostname: точное имя или
+/// поддомен). SSOT списка — config::read_doh_services().
+fn is_doh_service_host(doh_hosts: &[String], domain: &str) -> bool {
+    doh_hosts
+        .iter()
+        .any(|h| domain == h || domain.ends_with(&format!(".{h}")))
+}
+
 struct WorkerCtx {
     tracker: FlowTracker,
     /// QUIC (UDP:443) поток-трекер (PRP 23.10.26, шаг 3).
@@ -1036,10 +1059,17 @@ struct WorkerCtx {
     lists: ListIndex,
     /// Байты фейков активной стратегии winws (инцидент 27.10.26).
     fakes: Arc<FakeBlobs>,
+    /// Хосты DoH-сервисов из doh-services.txt (SSOT config::read_doh_services):
+    /// события на них в «Ошибки сети» не пишутся — шум собственных проб
+    /// (волна 00:56 12.11.26), решения по ним невозможны (уже в списке обхода).
+    doh_hosts: Vec<String>,
     no_domain_count: u64,
     /// Честное предупреждение не молчит, но и не шумит: один лог за сессию.
     ipv6_warned: bool,
     packets_since_maintain: u64,
+    /// Свипка по времени (v2): тик даже при почти нулевом трафике 443 — TCP-детект
+    /// не должен ждать ни 512 пакетов, ни исходящего пакета зависшего флоу.
+    last_maintain: Option<Instant>,
     /// Реаниматор (M1): None = выключен (media_reanim_mode=off) или send-хендл
     /// не открылся (причина — в логе старта).
     reanim: Option<ReanimRuntime>,
@@ -1073,7 +1103,20 @@ impl WorkerCtx {
             return;
         };
         let now = Instant::now();
-        match rt.ledger.decide(&lite, now) {
+        // M2 v2: карантин TCP к этому IP уже активен — capture-хендл изымает и
+        // наши инжектированные RST (фильтр IP-уровня ловит оба направления),
+        // инжекция бесполезна: не жжём лимит леджера и не шумим в лог.
+        let ip_only = FlowKeyLite {
+            remote_ip: cand.params.server_ip,
+            remote_port: 0,
+            local_port: 0,
+        };
+        if rt.quarantines.contains_key(&ip_only) {
+            return;
+        }
+        // Решение ДО match: не держим &mut rt.ledger живым через ветки.
+        let decision = rt.ledger.decide(&lite, now);
+        match decision {
             InjectionDecision::Cooldown => {} // недавно уже сбрасывали — тишина
             InjectionDecision::Limit => {
                 if rt.limit_logged.insert(lite) {
@@ -1084,6 +1127,76 @@ impl WorkerCtx {
                             cand.params.server_ip, cand.host, MAX_RST
                         ),
                     );
+                }
+                // M2 v2: три RST по 4-tuple не оживили медиа — Chrome ретраит на
+                // новых портах ТОГО ЖЕ мёртвого IP (факты 13.11.26), QUIC-фолбэк
+                // Chrome срабатывает только при ошибке TCP-КОННЕКТА, а SYN-ACK
+                // проходит и коннект «успешен», висит уже запрос. Гасим TCP к
+                // IP целиком (оба направления, все порты) на QUARANTINE_T:
+                // SYN/ClientHello/ретрансы изымаются → коннекты фейлят быстро →
+                // Chrome ретраит на QUIC (фейк M3 уже пропускает Initial) или
+                // другой IP. Ключ леджера — «нулевой» 4-tuple с этим IP.
+                let ip_lite = FlowKeyLite {
+                    remote_ip: cand.params.server_ip,
+                    remote_port: 0,
+                    local_port: 0,
+                };
+                // Деструктуризация рантайма: раздельные заимствования полей.
+                // (Активный карантин этого IP уже отсечён верхним guard.)
+                let ReanimRuntime { ledger, quarantines, limit_logged, .. } = rt;
+                if quarantines.len() >= QUAR_MAX_CONCURRENT {
+                    if limit_logged.insert(ip_lite) {
+                        app_log(
+                            app,
+                            format!(
+                                "[Реаниматор] {}:443 — слоты карантина заняты (максимум {}), IP-карантин отложен",
+                                cand.params.server_ip, QUAR_MAX_CONCURRENT
+                            ),
+                        );
+                    }
+                    return;
+                }
+                match ledger.decide_with(&ip_lite, now, QUAR_COOLDOWN_T, MAX_QUAR) {
+                    InjectionDecision::Cooldown => {} // IP недавно гасили — тишина
+                    InjectionDecision::Limit => {
+                        if limit_logged.insert(ip_lite) {
+                            app_log(
+                                app,
+                                format!(
+                                    "[Реаниматор] не реанимировалось: {} — лимит {} карантинов на IP исчерпан",
+                                    cand.params.server_ip, MAX_QUAR
+                                ),
+                            );
+                        }
+                    }
+                    InjectionDecision::Allow => {
+                        let filter = quarantine_filter_tcp(cand.params.server_ip);
+                        match open_capture_handle(&filter) {
+                            Ok(qh) => {
+                                spawn_quarantine_thread(qh.raw());
+                                quarantines.insert(ip_lite, (qh, now + QUARANTINE_T));
+                                ledger.note_injected(ip_lite, now);
+                                app_log(
+                                    app,
+                                    format!(
+                                        "[Реаниматор] карантин TCP к {}: {} сбросов не оживили медиа — гашу все TCP-сокеты к IP на {} с, Chrome переключит транспорт",
+                                        cand.params.server_ip,
+                                        MAX_RST,
+                                        QUARANTINE_T.as_secs()
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                app_log(
+                                    app,
+                                    format!(
+                                        "[Реаниматор] ошибка открытия capture-хендла (IP {}) для {}: {}",
+                                        filter, cand.params.server_ip, e
+                                    ),
+                                );
+                            }
+                        }
+                    }
                 }
             }
             InjectionDecision::Allow => {
@@ -1133,6 +1246,26 @@ impl WorkerCtx {
     /// Периодическая свипка реаниматора (каждые 512 пакетов): истечение
     /// pending без подтверждения + строка отчёта о транспорте (M2).
     fn reanim_sweep(&mut self, app: &AppHandle, now: Instant) {
+        // M1 v2: TCP-флои детектятся СВИПКОЙ, а не только на исходящих пакетах
+        // флоу (детект жил в handle_packet): Chrome после ClientHello молчит —
+        // до первого ретранса ~45 с, и RST уходил в 9 раз позже порога
+        // HANDSHAKE_T=5 с (лог 13.11.26: все инжекции «45.05s назад»).
+        // Свипка вызывает reanim_stall_check для каждого флоя по таймеру.
+        // Двухфазно: сбор кандидатов (immutable borrow трекера) → инжекция
+        // (mut). Блок ДО взятия rt: reanim_inject сам берёт &mut self.reanim —
+        // держать rt живым на время его вызова нельзя (E0499).
+        if self.reanim.is_some() {
+            let tcp_cands: Vec<(FlowKey, ReanimCandidate)> = self
+                .tracker
+                .flows
+                .iter()
+                .filter_map(|(key, st)| st.reanim_stall_check(key, now).map(|c| (key.clone(), c)))
+                .collect();
+            for (key, cand) in tcp_cands {
+                self.reanim_inject(app, &key, cand);
+            }
+        }
+
         let Some(rt) = self.reanim.as_mut() else { return };
         if let Some(expired) = rt.ledger.expire_pending(now) {
             app_log(
@@ -1166,14 +1299,24 @@ impl WorkerCtx {
         for lite in expired {
             if let Some((qh, _)) = rt.quarantines.remove(&lite) {
                 drop(qh); // WinDivertClose → blocked recv треда выйдет
-                app_log(
-                    app,
-                    format!(
-                        "[Реаниматор] карантин {}:{} снят — поток отпущен, исходное соединение Chrome уже переоткрыл",
-                        lite.remote_ip,
-                        lite.local_port
-                    ),
-                );
+                if lite.local_port == 0 && lite.remote_port == 0 {
+                    app_log(
+                        app,
+                        format!(
+                            "[Реаниматор] карантин TCP к {} снят — IP отпущен, Chrome может ретраить",
+                            lite.remote_ip
+                        ),
+                    );
+                } else {
+                    app_log(
+                        app,
+                        format!(
+                            "[Реаниматор] карантин {}:{} снят — поток отпущен, исходное соединение Chrome уже переоткрыл",
+                            lite.remote_ip,
+                            lite.local_port
+                        ),
+                    );
+                }
             }
         }
         let cands = rt.stall.candidates(now);
@@ -1280,6 +1423,31 @@ fn quarantine_filter(server_ip: Ipv4Addr, local_port: u16) -> String {
     )
 }
 
+/// М2 v2: фильтр IP-карантина TCP — гасим ВСЕ TCP-сокеты к googlevideo-IP
+/// (оба направления, любые порты): Chrome ретраит на НОВЫХ локальных портах
+/// того же IP, карантин по 4-tuple их не задевал. Только TCP: UDP/QUIC не
+/// трогаем — QUIC-фолбэк Chrome с фейком (M3) обязан проходить мимо карантина.
+fn quarantine_filter_tcp(server_ip: Ipv4Addr) -> String {
+    format!(
+        "(outbound and ip.DstAddr == {ip} and tcp.DstPort == 443) or \
+         (inbound and ip.SrcAddr == {ip} and tcp.SrcPort == 443)",
+        ip = server_ip
+    )
+}
+
+/// Свипка реаниматора срабатывает по 512 пакетам ИЛИ по таймеру SWEEP_T
+/// (v2: при нулевом трафике 443 пакетный счётчик не тикает — детект висящих
+/// флоев обязан идти по времени, иначе RST уходит в 9 раз позже порога).
+fn sweep_due(packets_since: u64, last: Option<Instant>, now: Instant) -> bool {
+    if packets_since >= 512 {
+        return true;
+    }
+    match last {
+        None => true,
+        Some(t) => now.duration_since(t) >= SWEEP_T,
+    }
+}
+
 /// М4: тред карантина — recv-цикл на capture-хендле. Полученный пакет НЕ
 /// реинжектится = изъятие (дроп): Chrome не видит ни одного пакета флоу.
 /// Завершение — по закрытию хендла родителем (WinDivertClose при Drop → recv
@@ -1317,10 +1485,13 @@ fn handle_packet(app: &AppHandle, ctx: &mut WorkerCtx, bytes: &[u8], addr: &WinD
     // Шлюз периодики — общий для TCP и UDP (М4): UDP-трафик видео обязан
     // питать свипку реаниматора. До правки UDP-ветка выходила ДО шлюза —
     // при QUIC-просмотре свипка голодала (тест юзера: 1 прогон за 9 мин).
+    // v2: добавлен ТЕМПОРАЛЬНЫЙ тик (SWEEP_T): при почти нулевом трафике 443
+    // (висящая вкладка шлёт ноль пакетов) свипка по 512 не срабатывала минутами.
     ctx.packets_since_maintain += 1;
-    if ctx.packets_since_maintain >= 512 {
+    let now = Instant::now();
+    if sweep_due(ctx.packets_since_maintain, ctx.last_maintain, now) {
         ctx.packets_since_maintain = 0;
-        let now = Instant::now();
+        ctx.last_maintain = Some(now);
         ctx.tracker.maintain(now);
         ctx.quic.maintain(now);
         ctx.reanim_sweep(app, now);
@@ -1589,6 +1760,14 @@ impl WorkerCtx {
         proc_path: Option<String>,
         l7proto: &'static str,
     ) {
+        // DoH-сервисы (пул doh-services.txt) — не ошибки сети: сервисы уже в
+        // списке обхода и решения по ним нет; волны «Массового анализа»/
+        // «Подбора DNS» прозванивают весь пул и писали его пачками (волна
+        // 00:56 12.11.26). Дроп ДО дедупа и рейт-лимита.
+        if is_doh_service_host(&self.doh_hosts, &domain) {
+            log::debug!("[Автомонитор] событие на DoH-сервис {} не пишется (doh-services.txt)", domain);
+            return;
+        }
         let now = Instant::now();
         if !self.dedup.allow(&domain, reason, now) {
             return;
@@ -1711,13 +1890,34 @@ pub fn start_domain_monitor(app: AppHandle, winws_args: &[String]) -> Result<(),
         app_log(&app, format!("[Автомонитор] список не прочитан: {}", warn));
     }
 
+    // DoH-сервисы (SSOT config::read_doh_services): события на них в «Ошибки
+    // сети» не пишутся — шум собственных проб (волна 00:56 12.11.26), решения
+    // по ним невозможны (они уже в списке обхода). Файл не найден → пустой
+    // список, фильтр инертен — честно в лог, не молчаливо (core §2.2).
+    let doh_read = crate::config::read_doh_services();
+    for warn in &doh_read.warnings {
+        app_log(&app, format!("[Автомонитор] doh-services.txt: {}", warn));
+    }
+    if !doh_read.file_found {
+        app_log(&app, "[Автомонитор] doh-services.txt не найден — события на DoH пишутся как обычные");
+    } else {
+        app_log(
+            &app,
+            format!(
+                "[Автомонитор] DoH-сервисы ({} шт. из doh-services.txt) в «Ошибки сети» не пишутся",
+                doh_read.hosts.len()
+            ),
+        );
+    }
+    let doh_hosts = doh_read.hosts;
+
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let app_thread = app.clone();
     let thread = std::thread::Builder::new()
         .name("domain-monitor".into())
         .spawn(move || {
-            worker(app_thread, handle, stop_thread, lists, fakes, reanim_handle);
+            worker(app_thread, handle, stop_thread, lists, fakes, reanim_handle, doh_hosts);
         })
         .map_err(|e| format!("[Автомонитор] старт потока не удался: {}", e))?;
 
@@ -1750,6 +1950,7 @@ fn worker(
     lists: ListIndex,
     fakes: Arc<FakeBlobs>,
     reanim_handle: Option<SendHandle>,
+    doh_hosts: Vec<String>,
 ) {
     let reanim = reanim_handle.map(|h| ReanimRuntime {
         handle: h,
@@ -1768,18 +1969,23 @@ fn worker(
         rate: RateLimiter::new(),
         lists,
         fakes,
+        doh_hosts,
         no_domain_count: 0,
         ipv6_warned: false,
         packets_since_maintain: 0,
+        last_maintain: Some(Instant::now()),
         reanim,
     };
     if ctx.reanim.is_some() {
         app_log(
             &app,
             format!(
-                "[Реаниматор] активен: рукопожатие без ответа {} с / тишина {} с → RST; карантин QUIC-стола: медиа-данных нет {} с → гашу поток на {} с (Chrome переоткроет сам)",
+                "[Реаниматор] активен: рукопожатие без ответа {} с / тишина {} с → RST (свипка по таймеру {} с); после {} сбросов без успеха — карантин TCP к IP на {} с; карантин QUIC-стола: медиа-данных нет {} с → гашу поток на {} с (Chrome переоткроет сам)",
                 HANDSHAKE_T.as_secs(),
                 SILENCE_T.as_secs(),
+                SWEEP_T.as_secs(),
+                MAX_RST,
+                QUARANTINE_T.as_secs(),
                 QUIC_SILENCE_T.as_secs(),
                 QUARANTINE_T.as_secs()
             ),
@@ -2112,6 +2318,162 @@ mod tests {
             .expect("после восстановления хоста флоу обязан попасть в кандидаты");
         assert_eq!(cand.host, "rr3---sn-ixh7yn7e.googlevideo.com");
         assert_eq!(cand.reason, "handshake");
+    }
+
+    // --- v2 13.11.26: свипка по таймеру + IP-карантин TCP -------------------
+
+    /// Шлюз свипки: 512 пакетов ИЛИ 2 с с прошлой свипки (SWEEP_T).
+    #[test]
+    fn sweep_due_by_packets_and_time() {
+        let t0 = Instant::now();
+        // Пакетный порог (512) — свипка обязана сработать.
+        assert!(sweep_due(512, Some(t0), t0));
+        // None = свипки ещё не было — первый тик сразу.
+        assert!(sweep_due(0, None, t0));
+        // До 2 с при нулевом трафике — тишина.
+        assert!(!sweep_due(0, Some(t0), t0 + Duration::from_millis(1999)));
+        // v2-суть: по таймеру свипка тикает при НУЛЕВОМ трафике 443 —
+        // висящая вкладка шлёт ноль пакетов (факты 13.11.26).
+        assert!(sweep_due(0, Some(t0), t0 + SWEEP_T));
+    }
+
+    /// IP-карантин гасит ТОЛЬКО TCP:443 в обе стороны: UDP (QUIC-фейк M3)
+    /// обязан проходить мимо; привязки к локальному порту нет — Chrome
+    /// ретраит на НОВЫХ портах того же IP.
+    #[test]
+    fn quarantine_filter_tcp_is_tcp_only_both_directions() {
+        let f = quarantine_filter_tcp(Ipv4Addr::new(74, 125, 104, 232));
+        assert!(f.contains("outbound and ip.DstAddr == 74.125.104.232 and tcp.DstPort == 443"));
+        assert!(f.contains("inbound and ip.SrcAddr == 74.125.104.232 and tcp.SrcPort == 443"));
+        assert!(
+            !f.contains("udp"),
+            "QUIC не глушим — QUIC-фолбэк Chrome обязан проходить мимо карантина"
+        );
+    }
+
+    /// M1 v2: детект зависшего рукопожатия по ТАЙМЕРУ свипки — новых пакетов
+    /// флоу не нужно (Chrome молчит после ClientHello). Метаданные собираются
+    /// штатным note_outgoing_meta; addr нулевой — ifidx не влияет на кандидата.
+    #[test]
+    fn stall_check_fires_from_sweep_silence() {
+        let mut st = hostfakesplit_state();
+        let host = b"rr3---sn-ixh7yn7e.googlevideo.com";
+        let ch = ch_with_tail(host);
+        st.record_outgoing(1000, &ch);
+        assert_eq!(st.hostname.as_deref(), Some("rr3---sn-ixh7yn7e.googlevideo.com"));
+
+        let addr = WinDivertAddress {
+            timestamp: 0,
+            bitfields: 0,
+            reserved2: 0,
+            union_data: [0u8; 64],
+        };
+        st.note_outgoing_meta(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
+            1000 + ch.len() as u32,
+            5000,
+            FLAG_ACK,
+            ch.len(),
+            &addr,
+        );
+        let key = FlowKey {
+            remote_ip: IpAddr::V4(Ipv4Addr::new(74, 125, 104, 232)),
+            remote_port: 443,
+            local_port: 51000,
+        };
+        // Свипка пришла на 6 с позже ClientHello — флоу всё это время молчал
+        // (ни одного нового исходящего пакета), детект обязан стрелять.
+        let cand = st
+            .reanim_stall_check(&key, Instant::now() + Duration::from_secs(6))
+            .expect("детект по таймеру обязан стрелять без новых пакетов флоу");
+        assert_eq!(cand.reason, "handshake");
+        assert_eq!(cand.params.server_ip, Ipv4Addr::new(74, 125, 104, 232));
+        assert_eq!(cand.params.client_port, 51000);
+        assert_eq!(cand.host, "rr3---sn-ixh7yn7e.googlevideo.com");
+    }
+
+    /// Фантом «сервер молчит» (волна 00:56 12.11.26): повторы фейк-сегмента
+    /// hostfakesplit (repeats=5) не считаются ретрансмиссиями и не лочат
+    /// stalled_retrans; hostname при этом восстанавливается как раньше.
+    #[test]
+    fn hostfakesplit_fake_repeats_do_not_trip_retrans() {
+        let mut st = hostfakesplit_state();
+        let host = b"rr3---sn-ixh7yn7e.googlevideo.com";
+        let ch = ch_with_tail(host);
+        let fake = b"qq22xx44zz66ww88yy00aa11b.mail.ru";
+        st.record_outgoing(1000, &ch[..HS_POS]);
+        for _ in 0..5 {
+            assert_eq!(st.record_outgoing(1058, fake), None, "фейк-сегмент — не ретранс");
+        }
+        st.record_outgoing(1091, &ch[HS_POS + host.len()..]);
+        st.record_outgoing(1058, &ch[HS_POS..HS_POS + host.len()]);
+        assert_eq!(
+            st.hostname.as_deref(),
+            Some("rr3---sn-ixh7yn7e.googlevideo.com"),
+            "восстановление hostname не пострадало"
+        );
+        // Фейк-копия ПОСЛЕ лочения hostname: старый код отдавал здесь
+        // («retrans», реальный хост) — фантом на живом флоу.
+        assert_eq!(st.record_outgoing(1058, fake), None);
+        assert!(!st.stalled_retrans, "фейк-повторы не выставляют stalled_retrans");
+    }
+
+    /// Точный репро фантома altorder=0: fake+real+fake в одном seq — старый
+    /// код набирал RETRANS_THRESHOLD прямо на проводе.
+    #[test]
+    fn hostfakesplit_altorder0_wire_does_not_emit_retrans() {
+        let mut st = hostfakesplit_state();
+        let host = b"rr3---sn-ixh7yn7e.googlevideo.com";
+        let ch = ch_with_tail(host);
+        let fake1 = b"q7x2m9w4z1n5v8c3pd.www.google.com";
+        let fake2 = b"k1p6t3y8r5h2j7s4f0.www.google.com";
+        st.record_outgoing(1000, &ch[..HS_POS]);
+        st.record_outgoing(1058, fake1);
+        st.record_outgoing(1058, &ch[HS_POS..HS_POS + host.len()]);
+        st.record_outgoing(1058, fake2);
+        st.record_outgoing(1091, &ch[HS_POS + host.len()..]);
+        assert_eq!(st.hostname.as_deref(), Some("rr3---sn-ixh7yn7e.googlevideo.com"));
+        // Повтор фейка при залоченном hostname и заполненном счётчике: старый
+        // код отдавал («retrans», реальный хост) на ЖИВОМ флоу.
+        assert_eq!(st.record_outgoing(1058, fake1), None);
+        assert!(!st.stalled_retrans);
+    }
+
+    /// Честный сигнал жив: три РЕАЛЬНЫЕ копии реального сегмента (hostname
+    /// залочен) дают событие retrans с настоящим hostname.
+    #[test]
+    fn real_retrans_still_fires_after_fake_filter() {
+        let mut st = hostfakesplit_state();
+        let host = b"rr3---sn-ixh7yn7e.googlevideo.com";
+        let ch = ch_with_tail(host);
+        let real_seg = &ch[HS_POS..HS_POS + host.len()];
+        st.record_outgoing(1000, &ch[..HS_POS]);
+        st.record_outgoing(1058, real_seg);
+        st.record_outgoing(1058, real_seg);
+        assert_eq!(
+            st.record_outgoing(1058, real_seg),
+            None,
+            "hostname ещё не залочен — события нет (счётчик прижат)"
+        );
+        st.record_outgoing(1091, &ch[HS_POS + host.len()..]);
+        assert_eq!(st.hostname.as_deref(), Some("rr3---sn-ixh7yn7e.googlevideo.com"));
+        assert_eq!(
+            st.record_outgoing(1058, real_seg),
+            Some(("retrans", "rr3---sn-ixh7yn7e.googlevideo.com".to_string())),
+            "честный ретранс реального сегмента обязан дать событие"
+        );
+    }
+
+    /// Фильтр DoH-хостов (шум собственных проб): точное имя и поддомен —
+    /// DoH; чужие корни и пустой список — нет.
+    #[test]
+    fn doh_service_host_exact_and_subdomain() {
+        let hosts = vec!["dns.comss.one".to_string(), "geohide.ru".to_string()];
+        assert!(is_doh_service_host(&hosts, "dns.comss.one"));
+        assert!(is_doh_service_host(&hosts, "eu.geohide.ru"));
+        assert!(!is_doh_service_host(&hosts, "usher.ttvnw.net"));
+        assert!(!is_doh_service_host(&hosts, "notgeohide.ru"));
+        assert!(!is_doh_service_host(&Vec::new(), "dns.comss.one"));
     }
 
     // --- Дедуп/раз rate -----------------------------------------------------

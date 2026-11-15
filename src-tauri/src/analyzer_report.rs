@@ -89,6 +89,23 @@ impl ReportMeta {
     }
 }
 
+/// Адреса главного домена, которые разрешаются и так (системный DNS + DoH
+/// главного пробника). hosts-пин такого адреса ничего не добавляет: имя уже
+/// резолвится в тот же узел, проблема — в достижимости, а не в имени
+/// (инцидент 12.11.26: анализ продал hosts-пин GGC-узла googlevideo, который
+/// DNS отдаёт и сейчас; concurrent-проба через него же была «таймаут»).
+/// SSOT для решения («Починить сайт») и отчёта — иначе они расходились бы.
+pub fn already_resolvable_ips(meta: &ReportMeta) -> Vec<String> {
+    let Some(p) = &meta.main_probe else {
+        return Vec::new();
+    };
+    p.primary_ips
+        .iter()
+        .chain(p.doh_ips.iter())
+        .cloned()
+        .collect()
+}
+
 pub fn build_report(meta: &ReportMeta, c: &Classification) -> String {
     let mut log = String::new();
     log.push_str(&format!("=== АНАЛИЗ ДОМЕНОВ: {} ===\n\n", meta.target_url));
@@ -839,11 +856,24 @@ fn write_dns_substitution(log: &mut String, meta: &ReportMeta) {
             crate::site_verdict::hosts_lines(&meta.main_host_name(), Some(ip))
         });
         if let Some(lines) = on_entries.filter(|l| !l.is_empty()) {
-            log.push_str("  → ПРОВЕРЕННЫЙ АДРЕС НАЙДЕН (работает только С ВКЛЮЧЁННЫМ обходом — hosts-запись без активного winws сайт не оживит):\n");
-            for line in &lines {
-                log.push_str(&format!("      {}\n", line));
+            // Честность §1.9 (инцидент 12.11.26): адрес, который DNS отдаёт и
+            // так, не продаём как «проверенный» — hosts-пин не меняет маршрут,
+            // имя уже резолвится в этот же узел. Продать такой пин = заставить
+            // «Починку» бить в флапающий узел, куда DNS и без пина ходит.
+            let ip = on_ip.as_deref().unwrap_or_default();
+            if already_resolvable_ips(meta).iter().any(|k| k == ip) {
+                log.push_str(&format!(
+                    "  → С ОБХОДОМ ОТВЕТИЛ ТОТ ЖЕ АДРЕС: {} — тот же адрес, что отдаёт DNS. \
+hosts-запись его не изменит: имя уже резолвится в этот узел, проблема в достижимости, а не в имени.\n",
+                    ip
+                ));
+            } else {
+                log.push_str("  → ПРОВЕРЕННЫЙ АДРЕС НАЙДЕН (работает только С ВКЛЮЧЁННЫМ обходом — hosts-запись без активного winws сайт не оживит):\n");
+                for line in &lines {
+                    log.push_str(&format!("      {}\n", line));
+                }
+                log.push_str("    Затем выполните: ipconfig /flushdns\n");
             }
-            log.push_str("    Затем выполните: ipconfig /flushdns\n");
         } else if has_any_completed_check(&meta.main_dns_sub)
             || has_any_completed_check(&meta.main_dns_sub_on)
         {
@@ -1232,6 +1262,53 @@ mod tests {
             http_ok: ok,
             http: if ok { Some(HttpResult::Ok(200)) } else { None },
         }
+    }
+
+    /// Честность §1.9 (инцидент 09.11.26): пометка «не проверено» — не провал.
+    /// Отчёт не имеет права писать «ПОДМЕНА DNS НЕ ПОМОГЛА», когда ни одна
+    /// проверка не состоялась, — это ложь.
+    #[test]
+    fn on_phase_same_as_dns_ip_is_not_sold_as_verified() {
+        let mut p = broken_probe();
+        p.verdict = Verdict::IpUnreachable;
+        let mut m = meta_with(p);
+        // ON-проба прошла через адрес системного DNS (primary_ips = "1.2.3.4").
+        m.main_dns_sub_on = vec![dns_sub(
+            "doh-on",
+            Some("1.2.3.4"),
+            "HTTPS через 1.2.3.4: HTTP 200",
+            true,
+        )];
+        let log = build_report(&m, &empty_classification());
+        assert!(
+            !log.contains("ПРОВЕРЕННЫЙ АДРЕС НАЙДЕН (работает только С ВКЛЮЧЁННЫМ обходом)"),
+            "пин адреса, который DNS отдаёт и так, — не «проверенный адрес»: {}",
+            log
+        );
+        assert!(log.contains("тот же адрес, что отдаёт DNS"), "{}", log);
+    }
+
+    /// Регресс: ON-проба через НОВЫЙ адрес (DNS его не отдаёт) — блок
+    /// «ПРОВЕРЕННЫЙ АДРЕС НАЙДЕН (с обходом)» обязан остаться.
+    #[test]
+    fn on_phase_fresh_ip_still_reported_as_verified() {
+        let mut p = broken_probe();
+        p.verdict = Verdict::IpUnreachable;
+        let mut m = meta_with(p);
+        m.main_dns_sub_on = vec![dns_sub(
+            "doh-on",
+            Some("203.0.113.50"),
+            "HTTPS через 203.0.113.50: HTTP 200",
+            true,
+        )];
+        let log = build_report(&m, &empty_classification());
+        assert!(
+            // В реальной строке после «обходом» идет « — hosts-запись...», а не
+            // закрывающая скобка: ищем префикс без ")" (дефект ассерта, 12.11.26).
+            log.contains("ПРОВЕРЕННЫЙ АДРЕС НАЙДЕН (работает только С ВКЛЮЧЁННЫМ обходом"),
+            "{}",
+            log
+        );
     }
 
     /// Честность §1.9 (инцидент 09.11.26): пометка «не проверено» — не провал.

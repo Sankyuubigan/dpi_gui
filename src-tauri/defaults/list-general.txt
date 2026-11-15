@@ -57,3 +57,7 @@ betterttv.net
 localizeapi.com
 klipy.com
 live-video.net
+# youtube video (v2 13.11.26): QUIC-фейк для медиа — ТСПУ режет Initial по SNI,
+# подменный www.google.com пропускается; без этого Chrome застревает на мёртвом
+# TCP к googlevideo-IP (IP-блок), см. tasks/13.11.26 Реаниматор v2
+googlevideo.com
