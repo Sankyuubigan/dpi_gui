@@ -131,27 +131,6 @@ pub struct DnsPickOutcome {
     pub verdict_level: String,
 }
 
-/// Последний результат подбора — SSOT для «Применить» во вкладке Браузер
-/// (PRP-3): команда принимает только force, outcome берёт отсюда, чтобы
-/// не протаскивать DnsPickOutcome через invoke (CommandArg не реализуется
-/// для сложных структур без Deserialize). Обновляется ТОЛЬКО при Some(app)
-/// — живой эталон-тест (app = None) не должен подменять продуктовый
-/// результат подбора.
-pub static LAST_PICK: std::sync::Mutex<Option<DnsPickOutcome>> = std::sync::Mutex::new(None);
-
-pub fn set_last_pick(o: DnsPickOutcome) {
-    if let Ok(mut g) = LAST_PICK.lock() {
-        *g = Some(o);
-    }
-}
-
-pub fn last_pick() -> Option<DnsPickOutcome> {
-    LAST_PICK
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|o| o.clone()))
-}
-
 /// Результат чистой классификации ответов: entries + что и как проверять.
 #[derive(Debug)]
 pub struct Classification {
@@ -763,9 +742,9 @@ fn build_final_list(entries: &[DnsPickEntry]) -> String {
 }
 
 /// Итоговая строка отчёта: вердикт core + «Итог: …» со списком всех
-/// сервисов по уровням. SSOT — бэк: фронт (SiteFixTab) и браузерный мост
-/// (browser_ctx_action) показывают/логируют summary целиком, поэтому
-/// список попадает и в UI, и в dpi_gui.log без дублирования.
+/// сервисов по уровням. SSOT — бэк: фронт (SiteFixTab) показывает/логирует
+/// summary целиком, поэтому список попадает и в UI, и в dpi_gui.log без
+/// дублирования.
 fn build_summary(host: &str, entries: &[DnsPickEntry]) -> (String, &'static str) {
     let (text, level) = build_summary_core(host, entries);
     let list = build_final_list(entries);
@@ -1022,11 +1001,6 @@ pub fn run_pick(app: Option<&AppHandle>, url: &str) -> Result<DnsPickOutcome, St
         summary,
         verdict_level: level.to_string(),
     };
-    // SSOT для «Применить» во вкладке Браузер (PRP-3): запоминаем только
-    // продуктовый запуск (Some(app)); эталон-тест None не трогает состояние.
-    if app.is_some() {
-        set_last_pick(outcome.clone());
-    }
     Ok(outcome)
 }
 

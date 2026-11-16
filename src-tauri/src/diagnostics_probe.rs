@@ -430,8 +430,9 @@ pub const DOH_RESOLVERS_FALLBACK: &[&str] = &[
 /// - нормальный случай → содержимое файла + warnings с проигнорированными
 ///   мусорными строками, если были.
 ///
-/// Публично и для Tauri-команды `get_doh_services` (UI-дропдаун) — чтобы
-/// fallback-логика была ровно одна, а не копия в main.rs.
+/// Публично для dns_pick и массового анализа — fallback-логика ровно одна
+/// (Tauri-команда `get_doh_services` удалена вместе с вкладкой «Браузер»,
+/// 16.11.26).
 pub fn load_doh_resolvers() -> (Vec<String>, Vec<String>, Option<String>) {
     let fallback: Vec<String> = DOH_RESOLVERS_FALLBACK
         .iter()

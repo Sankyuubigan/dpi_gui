@@ -33,7 +33,6 @@ mod tls_sni;
 mod quic_sniff;
 mod list_index;
 mod dns_pick;
-mod browser;
 mod browser_cookies;
 mod cert_info;
 mod process_owner;
@@ -315,16 +314,6 @@ fn main() {
             remove_hosts_entry,
             hosts_entries_for_domains,
             verify_site_via_ip,
-            browser::browser_open,
-            browser::browser_close,
-            browser::browser_status,
-            browser::browser_set_bounds,
-            browser::browser_hide,
-            browser::browser_show,
-            browser::browser_apply_mapping,
-            browser::browser_apply_pick,
-            browser::browser_ctx_action,
-            browser::get_doh_services,
             browser_cookies::cookies_browsers,
             browser_cookies::grab_cookies,
             browser_cookies::cookies_status
@@ -332,8 +321,7 @@ fn main() {
         .on_window_event(|window, event| {
             // При закрытии окна гасим обход и выгружаем драйвер WinDivert,
             // чтобы он не оставался в памяти и не блокировал файлы при обновлении.
-            // ТОЛЬКО label "main": это единственное окно (браузер — embedded
-            // webview того же окна, 08.11.26).
+            // ТОЛЬКО label "main": это единственное окно приложения.
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 if window.label() == "main" {
                     let _ = process::stop_winws();

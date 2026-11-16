@@ -31,12 +31,6 @@
     "allow-remove-hosts-entry",
     "allow-hosts-entries-for-domains",
     "allow-verify-site-via-ip",
-    "allow-browser-open",
-    "allow-browser-close",
-    "allow-browser-status",
-    "allow-browser-apply-mapping",
-    "allow-browser-apply-pick",
-    "allow-get-doh-services",
     "allow-grab-cookies",
     "allow-cookies-status",
     "allow-cookies-browsers"

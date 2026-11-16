@@ -4,10 +4,10 @@ import { Activity, Stethoscope, Globe, FolderOpen, Square } from "lucide-react";
 import { useTestingLog } from "./useTestingLog";
 import { OP_DIAGNOSTICS, OP_PROFILE_TEST, runOp } from "../ops";
 
-/// Вкладка «Профили обхода»: всё, что касается профилей, в одном месте —
-/// открытие profiles.json, тест всех профилей по домену и диагностика
-/// с генерацией авто-профиля.
-export default function ProfilesTab({ profiles, setProfiles, config, url, setUrl, isTesting, setIsTesting, activeOp, setActiveOp }: {
+/// Секция «Профили обхода» раздела «Настройки» (16.11.26: отдельная вкладка
+/// «Профили обхода» убрана): открытие profiles.json, тест всех профилей по
+/// домену и диагностика с генерацией авто-профиля.
+export default function ProfilesSection({ profiles, setProfiles, config, url, setUrl, isTesting, setIsTesting, activeOp, setActiveOp }: {
   profiles: any[];
   setProfiles: Dispatch<SetStateAction<any[]>>;
   config: any;

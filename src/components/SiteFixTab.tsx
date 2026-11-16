@@ -5,12 +5,47 @@ import { Search, Globe, FileEdit, Trash2, Wrench, Square, Cookie, FolderOpen } f
 import { open } from "@tauri-apps/plugin-dialog";
 import { useTestingLog } from "./useTestingLog";
 import { OP_DNS_PICK, OP_SITE_ANALYSIS, runOp } from "../ops";
-import type { SiteSolution } from "../App";
+import type { DnsPickResult, SiteSolution } from "../App";
+
+/// Формирование строки результата «Подбора DNS» — SSOT для лога (runDnsPick)
+/// и области результатов: текст и цвет везде одинаковые. Тексты пометок
+/// синхронизированы с вердиктами бэкенда (dns_pick.rs).
+function dnsPickRow(e: DnsPickResult["entries"][number]): { text: string; kind: "ok" | "warn" | "fail" | "info" } {
+  const mark =
+    e.kind === "gateway"
+      ? e.probe === "gatewayAlive" ? "🛰 СВОИ ШЛЮЗЫ (ФРОНТИНГ ПОДТВЕРЖДЁН)"
+        : e.probe === "gatewayPartial" ? "🛰 СВОИ ШЛЮЗЫ (ФРОНТИНГ ЧАСТИЧНЫЙ)"
+          : e.probe === "gatewayDead" ? "🛰 СВОИ ШЛЮЗЫ (ФРОНТИНГ НЕ ПОДТВЕРЖДЁН)"
+            : "🛰 СВОИ ШЛЮЗЫ (ФРОНТИНГ)"
+      : e.kind === "resolves"
+        ? e.probe === "unverified" ? "⚪ РЕЗОЛВИТ (доступность не подтверждена)"
+          : e.probe === null ? "⚪ GeoDNS: свои адреса (консенсус невозможен, проба не выполнялась)"
+            : "✅ РЕЗОЛВИТ ВЕРНО"
+        : e.kind === "diverges" ? "⚠️ РАСХОДИТСЯ С ДРУГИМИ"
+          : "❌ МЁРТВ";
+  const level =
+    (e.kind === "resolves" && e.probe === "open") ||
+      (e.kind === "gateway" && e.probe === "gatewayAlive") ? "ok"
+      : e.kind === "gateway" && e.probe === "gatewayPartial" ? "warn"
+        : e.kind === "dead" ||
+            (e.kind === "gateway" && e.probe === "gatewayDead") ? "fail"
+          : "info";
+  const probeSuffix = e.probe ? `; проба: ${e.probeNote}` : "";
+  return { text: `${mark} — ${e.service}: ${e.note}${probeSuffix}`, kind: level };
+}
+
+/// Цвет текста по уровню записи (область результатов).
+const LEVEL_TEXT_CLS: Record<string, string> = {
+  ok: "text-green-700",
+  warn: "text-amber-600",
+  fail: "text-red-600",
+  info: "text-gray-600",
+};
 
 /// Вкладка «Починка сайтов»: анализ одного домена (с опциональным
 /// принудительным подбором DNS-адреса) и точечная правка hosts. Тесты
-/// профилей и диагностика живут на отдельной вкладке «Профили обхода».
-export default function SiteFixTab({ url, setUrl, isTesting, setIsTesting, solution, setSolution, activeOp, setActiveOp }: {
+/// профилей и диагностика живут в разделе «Настройки» (ProfilesSection).
+export default function SiteFixTab({ url, setUrl, isTesting, setIsTesting, solution, setSolution, activeOp, setActiveOp, analysisResult, setAnalysisResult, dnsPick, setDnsPick }: {
   url: string;
   setUrl: Dispatch<SetStateAction<string>>;
   isTesting: boolean;
@@ -22,6 +57,15 @@ export default function SiteFixTab({ url, setUrl, isTesting, setIsTesting, solut
   /// когда оно совпадает с операцией этой вкладки.
   activeOp: string | null;
   setActiveOp: Dispatch<SetStateAction<string | null>>;
+  /// Последний результат «Анализа сайта» ({домен запуска, полный отчёт}).
+  /// null — анализ ещё не запускался / запущен заново. Живёт в App —
+  /// переживает смену вкладок.
+  analysisResult: { domain: string; report: string } | null;
+  setAnalysisResult: Dispatch<SetStateAction<{ domain: string; report: string } | null>>;
+  /// Последний результат «Подбора DNS». null — подбор не запускался /
+  /// запущен заново. Живёт в App — переживает смену вкладок.
+  dnsPick: DnsPickResult | null;
+  setDnsPick: Dispatch<SetStateAction<DnsPickResult | null>>;
 }) {
   const [hostsIp, setHostsIp] = useState("");
 
@@ -88,6 +132,7 @@ export default function SiteFixTab({ url, setUrl, isTesting, setIsTesting, solut
     setIsTesting(true);
     stopRef.current = false;
     setSolution(null); // старое решение к новому анализу неприменимо
+    setAnalysisResult(null); // старый отчёт к новому анализу неприменим
     // Одна стартовая строка: старт дублировался двумя FE-записями + бэкенд-дубль
     // очереди (правило «в лог не дублируем» — PRP «Читаемый лог»).
     appendEntry(`[Анализ] Запуск анализа: ${url} (до ~30 сек)...`, "info");
@@ -98,7 +143,9 @@ export default function SiteFixTab({ url, setUrl, isTesting, setIsTesting, solut
       const outcome: { report: string; solution: SiteSolution } = await invoke("run_domain_analysis", { url });
       // Отчёт в лог кладёт бэкенд (analyze_domain / analyze_url — SSOT);
       // здесь эхо не нужно: плагин уже разрезал отчёт на записи построчно.
+      // Полный текст отчёта — в область результатов вкладки (state в App).
       setSolution(outcome.solution ?? null);
+      setAnalysisResult({ domain: url, report: outcome.report ?? "" });
     } catch (e: any) {
       if (stopRef.current) {
         appendEntry("[Анализ] Остановлен пользователем.", "warn");
@@ -142,6 +189,7 @@ export default function SiteFixTab({ url, setUrl, isTesting, setIsTesting, solut
     }
     setIsTesting(true);
     stopRef.current = false;
+    setDnsPick(null); // старый результат к новому перебору неприменим
     appendEntry(`[Подбор DNS] Перебор списка DoH-сервисов для ${domain}...`, "info");
     try {
       const out = await invoke<{
@@ -151,29 +199,12 @@ export default function SiteFixTab({ url, setUrl, isTesting, setIsTesting, solut
         verdictLevel: "ok" | "warn" | "fail";
       }>("pick_dns", { url: domain });
       for (const e of out.entries) {
-        const mark =
-          e.kind === "gateway"
-            ? e.probe === "gatewayAlive" ? "🛰 СВОИ ШЛЮЗЫ (ФРОНТИНГ ПОДТВЕРЖДЁН)"
-              : e.probe === "gatewayPartial" ? "🛰 СВОИ ШЛЮЗЫ (ФРОНТИНГ ЧАСТИЧНЫЙ)"
-                : e.probe === "gatewayDead" ? "🛰 СВОИ ШЛЮЗЫ (ФРОНТИНГ НЕ ПОДТВЕРЖДЁН)"
-                  : "🛰 СВОИ ШЛЮЗЫ (ФРОНТИНГ)"
-            : e.kind === "resolves"
-              ? e.probe === "unverified" ? "⚪ РЕЗОЛВИТ (доступность не подтверждена)"
-                : e.probe === null ? "⚪ GeoDNS: свои адреса (консенсус невозможен, проба не выполнялась)"
-                  : "✅ РЕЗОЛВИТ ВЕРНО"
-              : e.kind === "diverges" ? "⚠️ РАСХОДИТСЯ С ДРУГИМИ"
-                : "❌ МЁРТВ";
-        const level =
-          (e.kind === "resolves" && e.probe === "open") ||
-            (e.kind === "gateway" && e.probe === "gatewayAlive") ? "ok"
-            : e.kind === "gateway" && e.probe === "gatewayPartial" ? "warn"
-              : e.kind === "dead" ||
-                  (e.kind === "gateway" && e.probe === "gatewayDead") ? "fail"
-                : "info";
-        const probeSuffix = e.probe ? `; проба: ${e.probeNote}` : "";
-        appendEntry(`${mark} — ${e.service}: ${e.note}${probeSuffix}`, level);
+        const row = dnsPickRow(e);
+        appendEntry(row.text, row.kind);
       }
       appendEntry(`[Подбор DNS] ${out.summary}`, out.verdictLevel);
+      // Последний результат — в область результатов вкладки (state в App).
+      setDnsPick(out);
     } catch (e: any) {
       if (stopRef.current) {
         appendEntry("[Подбор DNS] Остановлен пользователем.", "warn");
@@ -463,6 +494,44 @@ export default function SiteFixTab({ url, setUrl, isTesting, setIsTesting, solut
           </div>
         </div>
       </div>
+
+      {/* Область результатов (16.11.26): последний результат «Анализа сайта»
+          и «Подбора DNS» прямо на вкладке — не надо бежать во вкладку «Логи».
+          Рендер только при наличии данных (пустых заглушек нет); state живёт
+          в App, поэтому результаты переживают смену вкладок. Лог не
+          дублируем: история всех запусков остаётся в лог-панели. */}
+      {(analysisResult || dnsPick) && (
+        <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 flex flex-col gap-5">
+          {analysisResult && (
+            <div>
+              <h3 className="font-bold text-gray-800 mb-2">
+                Результат анализа — {analysisResult.domain}
+              </h3>
+              <pre className="whitespace-pre-wrap font-mono text-xs text-gray-700 bg-gray-50 border border-gray-200 rounded-lg p-3 max-h-96 overflow-auto">
+                {analysisResult.report}
+              </pre>
+            </div>
+          )}
+          {dnsPick && (
+            <div>
+              <h3 className="font-bold text-gray-800 mb-2">
+                Результат подбора DNS — {dnsPick.domain}
+              </h3>
+              <div className="flex flex-col gap-1 text-sm">
+                {dnsPick.entries.map((e) => {
+                  const row = dnsPickRow(e);
+                  return (
+                    <p key={e.service} className={LEVEL_TEXT_CLS[row.kind]}>{row.text}</p>
+                  );
+                })}
+              </div>
+              <p className={`font-bold mt-2 ${LEVEL_TEXT_CLS[dnsPick.verdictLevel]}`}>
+                {dnsPick.summary}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

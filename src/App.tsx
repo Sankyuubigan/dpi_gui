@@ -3,9 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import ControlTab from "./components/ControlTab";
 import SettingsTab from "./components/SettingsTab";
-import ProfilesTab from "./components/ProfilesTab";
 import SiteFixTab from "./components/SiteFixTab";
-import BrowserTab from "./components/BrowserTab";
+import ProfilesSection from "./components/ProfilesSection";
 import LogsPanel from "./components/LogsPanel";
 import { logFront, onLogMessage, readLogTail, initFrontendErrorCapture } from "@my-tauri-plugins/plugin-logs";
 
@@ -43,6 +42,24 @@ export interface SiteSolution {
   noneReason: string | null;
 }
 
+/// Результат «Подбора DNS» (SSOT контракта — serde DnsPickOutcome в
+/// dns_pick.rs, поля camelCase). Живёт в App: результат должен переживать
+/// смену вкладок, а «Починка сайтов» рисует его в своей области результатов.
+export interface DnsPickResult {
+  domain: string;
+  entries: {
+    service: string;
+    resolved: string[];
+    kind: string;
+    note: string;
+    probe: string | null;
+    probeNote: string;
+  }[];
+  summary: string;
+  /// "ok" | "warn" | "fail"
+  verdictLevel: "ok" | "warn" | "fail";
+}
+
 /// Статус анализа домена из «Ошибок сети» (события analysis_progress бэкенда).
 /// Ключ карты — домен. Данные для бейджа в списке ошибок и кнопки «Починить».
 export interface AnalysisStatus {
@@ -70,6 +87,13 @@ export default function App() {
   // Решение последнего анализа (кнопка «Починить сайт»). null = анализа ещё
   // не было / решение неприменимо. Живёт здесь же, чтобы переживать смену вкладки.
   const [siteSolution, setSiteSolution] = useState<SiteSolution | null>(null);
+  // Результаты «Починки сайтов» для области внизу вкладки (16.11.26):
+  // отчёт «Анализа сайта» ({домен запуска, полный текст}) и результат
+  // «Подбора DNS». null = не запускалось / запущено заново. Живут в App, а не
+  // в SiteFixTab: вкладка размонтируется при переключении, а результаты
+  // должны переживать её смену (та же причина, что у siteSolution выше).
+  const [analysisResult, setAnalysisResult] = useState<{ domain: string; report: string } | null>(null);
+  const [dnsPick, setDnsPick] = useState<DnsPickResult | null>(null);
 
   // Лог и список подозрений живут ЗДЕСЬ, в App, а НЕ в ControlTab:
   // App никогда не размонтируется при смене вкладок, поэтому лог сохраняется
@@ -265,18 +289,6 @@ export default function App() {
           Починка сайтов
         </button>
         <button
-          className={`px-4 py-3 font-semibold ${activeTab === "browser" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
-          onClick={() => setActiveTab("browser")}
-        >
-          Браузер
-        </button>
-        <button
-          className={`px-4 py-3 font-semibold ${activeTab === "profiles" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
-          onClick={() => setActiveTab("profiles")}
-        >
-          Профили обхода
-        </button>
-        <button
           className={`px-4 py-3 font-semibold ${activeTab === "settings" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
           onClick={() => setActiveTab("settings")}
         >
@@ -315,23 +327,30 @@ export default function App() {
             setSolution={setSiteSolution}
             activeOp={activeOp}
             setActiveOp={setActiveOp}
+            analysisResult={analysisResult}
+            setAnalysisResult={setAnalysisResult}
+            dnsPick={dnsPick}
+            setDnsPick={setDnsPick}
           />
         )}
-        {activeTab === "browser" && <BrowserTab />}
-        {activeTab === "profiles" && (
-          <ProfilesTab
-            profiles={profiles}
-            setProfiles={setProfiles}
-            config={config}
-            url={testingUrl}
-            setUrl={setTestingUrl}
-            isTesting={testingIsTesting}
-            setIsTesting={setTestingIsTesting}
-            activeOp={activeOp}
-            setActiveOp={setActiveOp}
-          />
+        {activeTab === "settings" && (
+          <div className="flex flex-col gap-4">
+            <SettingsTab />
+            {/* Секция «Профили обхода» (16.11.26: вкладка «Профили обхода»
+                убрана) — плашка целиком живёт в «Настройках» снизу. */}
+            <ProfilesSection
+              profiles={profiles}
+              setProfiles={setProfiles}
+              config={config}
+              url={testingUrl}
+              setUrl={setTestingUrl}
+              isTesting={testingIsTesting}
+              setIsTesting={setTestingIsTesting}
+              activeOp={activeOp}
+              setActiveOp={setActiveOp}
+            />
+          </div>
         )}
-        {activeTab === "settings" && <SettingsTab />}
         {activeTab === "logs" && (
           <div className="h-full flex flex-col">
             <LogsPanel lines={logs} onClear={() => setLogs([])} full />
