@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import ControlTab from "./components/ControlTab";
+import ChannelTab from "./components/ChannelTab";
 import SettingsTab from "./components/SettingsTab";
 import SiteFixTab from "./components/SiteFixTab";
 import ProfilesSection from "./components/ProfilesSection";
@@ -283,6 +284,12 @@ export default function App() {
           Управление
         </button>
         <button
+          className={`px-4 py-3 font-semibold ${activeTab === "channel" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
+          onClick={() => setActiveTab("channel")}
+        >
+          Канал
+        </button>
+        <button
           className={`px-4 py-3 font-semibold ${activeTab === "sitefix" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
           onClick={() => setActiveTab("sitefix")}
         >
@@ -316,6 +323,9 @@ export default function App() {
             logMsg={logMsg}
             onFixDomain={sendToSiteFix}
           />
+        )}
+        {activeTab === "channel" && (
+          <ChannelTab logMsg={logMsg} />
         )}
         {activeTab === "sitefix" && (
           <SiteFixTab

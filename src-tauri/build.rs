@@ -75,6 +75,17 @@ fn main() {
                 "grab_cookies",
                 "cookies_status",
                 "cookies_browsers",
+                // Вкладка «Канал» (PRP 18.11.26, редизайн: каналы юзера).
+                // channel_set принимает id канала из реестра (файл yaml или
+                // «__wg__»), не «paid»/«reserve» — хардкод-режимы убраны.
+                "channel_status",
+                "channel_set",
+                "paid_profiles_list",
+                "paid_profile_add",
+                "paid_profile_delete",
+                "wg_creds_status",
+                "wg_creds_import",
+                "wg_creds_reset",
             ])),
     )
     .expect("failed to run tauri-build");

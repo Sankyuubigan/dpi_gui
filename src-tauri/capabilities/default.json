@@ -2,7 +2,9 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default capabilities for DPI GUI",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "updater:default",
@@ -33,6 +35,14 @@
     "allow-verify-site-via-ip",
     "allow-grab-cookies",
     "allow-cookies-status",
-    "allow-cookies-browsers"
+    "allow-cookies-browsers",
+    "allow-channel-status",
+    "allow-channel-set",
+    "allow-paid-profiles-list",
+    "allow-paid-profile-add",
+    "allow-paid-profile-delete",
+    "allow-wg-creds-status",
+    "allow-wg-creds-import",
+    "allow-wg-creds-reset"
   ]
 }

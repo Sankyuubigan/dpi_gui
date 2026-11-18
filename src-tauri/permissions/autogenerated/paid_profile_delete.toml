@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-paid-profile-delete"
+description = "Enables the paid_profile_delete command without any pre-configured scope."
+commands.allow = ["paid_profile_delete"]
+
+[[permission]]
+identifier = "deny-paid-profile-delete"
+description = "Denies the paid_profile_delete command without any pre-configured scope."
+commands.deny = ["paid_profile_delete"]

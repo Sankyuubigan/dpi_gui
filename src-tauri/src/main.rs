@@ -39,6 +39,8 @@ mod process_owner;
 mod analysis_queue;
 mod mass_analysis;
 mod probe_budget;
+mod proxy_core;
+mod reserve;
 
 use tauri::AppHandle;
 
@@ -49,6 +51,10 @@ fn init_app(app: AppHandle) -> Result<(), String> {
     // не показывал «ПРОЦЕСС АКТИВЕН» на мёртвом обходе.
     process::cleanup_stale_windivert(&app);
     config::ensure_directories_and_files().map_err(|e| e.to_string())?;
+    // Файлы прокси-движка: шаблон запасного + пул нод (жёсткая перезапись из
+    // встроенных defaults — контракт владельца) + тихая миграция личных данных
+    // прошлых версий в списки вкладки «Канал» (PRP 18.11.26).
+    proxy_core::ensure_proxy_files(&app).map_err(|e| e.to_string())?;
     // Автозабор кукисов (PRP 09.11.26): фоновой задачей — старт приложения
     // не ждёт чтения чужих кукис-баз; итог придёт событием cookies-updated.
     tauri::async_runtime::spawn(browser_cookies::auto_grab_on_startup(app.clone()));
@@ -88,6 +94,52 @@ fn stop_bypass() -> Result<String, String> {
 #[tauri::command]
 fn check_status() -> bool {
     process::is_winws_running()
+}
+
+/// Статус интернет-канала (proxy-only движок mihomo, PRP «18.11.26»).
+#[tauri::command]
+fn channel_status() -> serde_json::Value {
+    proxy_core::status()
+}
+
+/// Переключение канала: off | id канала из реестра (файл yaml или «__wg__»).
+/// Бизнес-логика в proxy_core.
+#[tauri::command]
+fn channel_set(app: AppHandle, mode: String) -> Result<String, String> {
+    proxy_core::channel_set(&app, &mode)
+}
+
+// ==== Вкладка «Канал» (PRP 18.11.26): личные каналы юзера + WG-креды ====
+// Личное живёт ТОЛЬКО в AppData и попадает туда только импортом на машине юзера.
+
+#[tauri::command]
+fn paid_profiles_list() -> serde_json::Value {
+    proxy_core::paid_profiles_list()
+}
+
+#[tauri::command]
+fn paid_profile_add(app: AppHandle, path: String, name: String) -> Result<serde_json::Value, String> {
+    proxy_core::paid_profile_add(&path, &name, &app)
+}
+
+#[tauri::command]
+fn paid_profile_delete(app: AppHandle, file_id: String) -> Result<serde_json::Value, String> {
+    proxy_core::paid_profile_delete(&file_id, &app)
+}
+
+#[tauri::command]
+fn wg_creds_status() -> serde_json::Value {
+    crate::reserve::wg_creds_status()
+}
+
+#[tauri::command]
+fn wg_creds_import(app: AppHandle, path: String, name: String) -> Result<serde_json::Value, String> {
+    crate::reserve::wg_creds_import(&path, &name, &app)
+}
+
+#[tauri::command]
+fn wg_creds_reset(app: AppHandle) -> Result<String, String> {
+    crate::reserve::wg_creds_reset(&app)
 }
 
 // Оборачиваем долгие команды в асинхронные таски, чтобы не вешать UI-поток.
@@ -302,6 +354,14 @@ fn main() {
             start_bypass,
             stop_bypass,
             check_status,
+            channel_status,
+            channel_set,
+            paid_profiles_list,
+            paid_profile_add,
+            paid_profile_delete,
+            wg_creds_status,
+            wg_creds_import,
+            wg_creds_reset,
             run_domain_analysis,
             cancel_operation,
             run_mass_analysis,
@@ -324,6 +384,10 @@ fn main() {
             // ТОЛЬКО label "main": это единственное окно приложения.
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 if window.label() == "main" {
+                    // Прокси-канал гасим наравне с обходом: прокси живёт с
+                    // процессом GUI (честный нюанс PRP v3), сирота на 7897
+                    // собьёт с толку следующий запуск.
+                    proxy_core::shutdown_for_exit();
                     let _ = process::stop_winws();
                 }
             }

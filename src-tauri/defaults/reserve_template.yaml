@@ -1,0 +1,52 @@
+# Шаблон запасного канала DPI GUI (PRP 18.11.26 «Вкладка Канал»).
+# ПУБЛИЧНЫЙ файл: едет в бандле всем юзерам, СЕКРЕТОВ НЕ СОДЕРЖИТ —
+# плейсхолдеры __...__ подставляются из wg_creds.json (импорт WG .conf юзера).
+# Механика валидирована стендом wg_test 18.11.26: fallback-группа TR (пул нод)
+# + Proton WireGuard outbound через dialer-proxy; выход NL.
+# WG-эксперимент 18.11.26: Proton WireGuard outbound через dialer-proxy.
+# Цель: доказать/опровергнуть замену openvpn+gost+маршрутов одним процессом mihomo.
+# Порты 7899/9099 — изолированные, боевой 7897 и оракул 7898 не задеваются.
+mixed-port: 7897
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+external-controller: 127.0.0.1:9097
+
+dns:
+  enable: true
+  enhanced-mode: redir-host
+  default-nameserver: [1.1.1.1, 8.8.8.8]
+  nameserver: [https://dns.google/dns-query, https://1.1.1.1/dns-query]
+
+proxy-providers:
+  igareck-vless:
+    type: file
+    path: "./providers/igareck_vless.yaml"
+    health-check: {enable: true, url: "https://www.youtube.com/generate_204", expected-status: 204, interval: 600, timeout: 4000, lazy: true}
+  igareck-ss:
+    type: file
+    path: "./providers/igareck_ss.yaml"
+    health-check: {enable: true, url: "https://www.youtube.com/generate_204", expected-status: 204, interval: 600, timeout: 4000, lazy: true}
+
+proxies:
+  - name: "PROTON-WG"
+    type: wireguard
+    server: __SERVER__
+    port: __PORT__
+    private-key: "__PRIVATE_KEY__"
+    public-key: "__PUBLIC_KEY__"
+    ip: __ADDRESS__
+    allowed-ips: ["0.0.0.0/0"]
+    udp: true
+    mtu: 1420
+    dialer-proxy: "TR"
+    persistent-keepalive: __KEEPALIVE__
+
+proxy-groups:
+  - name: "TR"
+    type: select
+    use: [igareck-vless, igareck-ss]
+
+rules:
+  - MATCH,PROTON-WG

@@ -49,7 +49,24 @@ async function main() {
         console.log('  Останавливаем мешающие процессы перед сборкой...');
         killProcess('winws.exe');
         killProcess('dpi_gui.exe');
+        killProcess('mihomo.exe');
         console.log('========================================');
+
+        // Ядро прокси-движка (PRP «18.11.26 Кнопка запасного канала» v3):
+        // mihomo.exe должен лежать в bin/ рядом с winws.exe. Если его нет —
+        // берём из sidecar установленной Koala Clash (машино-специфичный
+        // путь §1.4; на другой машине положить mihomo.exe в bin/ вручную).
+        const mihomoDst = path.join(scriptDir, 'bin', 'mihomo.exe');
+        if (!fs.existsSync(mihomoDst)) {
+            const koalaSidecar = 'D:\\Programs\\Koala Clash\\resources\\sidecar\\mihomo.exe';
+            if (fs.existsSync(koalaSidecar)) {
+                fs.copyFileSync(koalaSidecar, mihomoDst);
+                console.log('  mihomo.exe скопирован из sidecar Koala Clash в bin/.');
+            } else {
+                console.warn('  WARNING: bin/mihomo.exe не найден и Koala sidecar отсутствует —');
+                console.warn('  прокси-движок будет честно ошибаться без этого файла.');
+            }
+        }
 
         console.log('========================================');
         console.log('[1/6] Obnovlenie versii (build counter)...');
