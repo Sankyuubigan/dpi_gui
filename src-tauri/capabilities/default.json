@@ -38,6 +38,7 @@
     "allow-cookies-browsers",
     "allow-channel-status",
     "allow-channel-set",
+    "allow-channel-fix-system",
     "allow-paid-profiles-list",
     "allow-paid-profile-add",
     "allow-paid-profile-delete",

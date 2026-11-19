@@ -8,7 +8,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -41,6 +41,18 @@ static CHANNEL: Mutex<ChannelState> = Mutex::new(ChannelState {
 
 /// Флаг гарда запасного канала (reserve.rs): true = цикл здоровья работает.
 pub static GUARD_ON: AtomicBool = AtomicBool::new(false);
+
+/// Служба-сторож FlClashX/Koala (AUTO_START, LocalSystem): рестартит sidecar
+/// mihomo после нашего taskkill. Инцидент 19.11.26: мы погасили Koala при
+/// переключении канала, сторож воскресил её через минуту, а fake-ip-хвосты
+/// (маршруты 198.18.x + DNS-кэш Windows) парализовали весь системный трафик.
+const KOALA_WATCHDOG_SERVICE: &str = "FlClashHelperService";
+
+/// Кэш детекта перехвата: фронт опрашивает статус каждые 3с, полный проход
+/// (таблица маршрутов + системный резолв) — не чаще 1 раза в 10с.
+static HIJACK_TS: AtomicU64 = AtomicU64::new(0);
+static HIJACK_DETECTED: AtomicBool = AtomicBool::new(false);
+static HIJACK_DETAIL: Mutex<String> = Mutex::new(String::new());
 
 /// Каталог прокси-движка в AppData: источники конфигов + сгенерированный paid.yaml.
 pub(crate) fn proxy_dir() -> PathBuf {
@@ -342,6 +354,7 @@ pub fn status() -> serde_json::Value {
     } else {
         entry_name_by_file(&read_registry(), &mode).unwrap_or_else(|| mode.clone())
     };
+    let (hijack, hijack_detail) = hijack_check();
     json!({
         "mode": if mode.is_empty() { "off".to_string() } else { mode },
         "mode_name": mode_name,
@@ -349,6 +362,10 @@ pub fn status() -> serde_json::Value {
         "proxy_alive": port_alive,
         "proxy_port": PROXY_PORT,
         "reserve": crate::reserve::guard_status(),
+        // §честность: зелёный «порт жив» при перехваченном системном
+        // трафике — ложь, поэтому детект перехвата едет рядом с портом.
+        "hijack": hijack,
+        "hijack_detail": hijack_detail,
     })
 }
 
@@ -356,8 +373,186 @@ fn emit_log(app: &AppHandle, msg: String) {
     let _ = app.emit("log", format!("[Канал] {}", msg));
 }
 
+// ===================== Системный перехват: сторож, мины, честный детект =====================
+// Инцидент 19.11.26: системный трафик целиком уходил в чужой fake-ip TUN
+// (198.18.0.x — трассировка «1 хоп <1мс»), а наш статус рисовал зелёный
+// «порт жив». Наш движок proxy-only (TUN всегда off, DNS на 53 не слушает),
+// поэтому ЛЮБОЙ след 198.18.0.0/15 в системе — чужой перехватчик, о котором
+// софт обязан говорить прямо (§честность) и предлагать починку.
+
+/// Сторож-служба FlClashX: остановить и отключить, иначе она воскресит
+/// sidecar после нашего taskkill (инцидент: воскресла через минуту).
+/// Koala GUI при ЯВНОМ запуске юзером включит службу сама — её выбор,
+/// а тихого воскресения за нашей спиной больше не будет.
+fn stop_koala_watchdog() -> Vec<String> {
+    let mut log = Vec::new();
+    let stop = Command::new("sc")
+        .args(["stop", KOALA_WATCHDOG_SERVICE])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let cfg = Command::new("sc")
+        .args(["config", KOALA_WATCHDOG_SERVICE, "start=", "disabled"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    if let (Ok(s), Ok(c)) = (stop, cfg) {
+        if c.status.success() {
+            log.push(format!(
+                "Сторож-служба {} остановлена ({}) и отключена — Koala не воскреснет за нами.",
+                KOALA_WATCHDOG_SERVICE,
+                if s.status.success() { "была жива" } else { "не была запущена" }
+            ));
+            thread::sleep(Duration::from_millis(600));
+        } else if s.status.success() {
+            log.push(format!(
+                "Сторож-служба {} остановлена, но отключить не удалось (проверь вручную: sc qc {}).",
+                KOALA_WATCHDOG_SERVICE, KOALA_WATCHDOG_SERVICE
+            ));
+        }
+        // Обе команды с ошибкой = службы в системе нет: шум не логируем.
+    }
+    log
+}
+
+/// Маршруты-мины 198.18.0.0/15 в таблице маршрутов Windows: (назначение, маска).
+fn fakeip_routes_in_table() -> Vec<(String, String)> {
+    let out = match Command::new("route")
+        .args(["print", "-4"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(_) => return Vec::new(),
+    };
+    parse_fakeip_routes(&out)
+}
+
+/// Чистый парс вывода route print -4 (тестируемый без живой системы).
+/// OEM-кодировка заголовков не важна: парсятся только ASCII-поля IP.
+fn parse_fakeip_routes(text: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 2 {
+            continue;
+        }
+        let dest = match f[0].parse::<std::net::Ipv4Addr>() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if f[1].parse::<std::net::Ipv4Addr>().is_err() {
+            continue;
+        }
+        let o = dest.octets();
+        // 198.18.0.0/15 (RFC 2544; диапазон fake-ip mihomo/clash 198.18.0.1/16 внутри).
+        if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+            found.push((f[0].to_string(), f[1].to_string()));
+        }
+    }
+    found
+}
+
+/// Снятие маршрутов-мин из таблицы. DNS-кэш здесь не трогаем — решение
+/// за вызывающим (channel_set сбрасывает только при снятых минах, фикс — всегда).
+pub fn cleanup_stale_fakeip() -> Vec<String> {
+    let mut removed = Vec::new();
+    for (dest, mask) in fakeip_routes_in_table() {
+        let del = Command::new("route")
+            .args(["delete", &dest, "mask", &mask])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        if del.map(|o| o.status.success()).unwrap_or(false) {
+            removed.push(format!("{}/{}", dest, mask));
+        }
+    }
+    removed
+}
+
+/// Сброс DNS-кэша Windows: резолвер мог насвиновать fake-ip-ответами,
+/// которые переживут смерть перехватчика (кейс 198.18.0.98 в tracert).
+fn flush_dns() {
+    let _ = Command::new("ipconfig")
+        .args(["/flushdns"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+/// Системный резолв контрольного домена без прокси: Ok(Some(ip)) — резолв
+/// отдаёт fake-ip (перехват DNS-слоя); Ok(None) — чисто; Err — не ответил
+/// за 3с (это не вердикт перехвата, сеть может быть просто мертва).
+fn system_resolve_fakeip() -> Result<Option<String>, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let bad = ("github.com", 0)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|it| {
+                it.filter_map(|sa| match sa {
+                    std::net::SocketAddr::V4(v4) => Some(*v4.ip()),
+                    std::net::SocketAddr::V6(_) => None,
+                })
+                .find(|ip| {
+                    let o = ip.octets();
+                    o[0] == 198 && (o[1] == 18 || o[1] == 19)
+                })
+                .map(|ip| ip.to_string())
+            });
+        let _ = tx.send(bad);
+    });
+    match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(res) => Ok(res),
+        Err(_) => Err(String::from("системный резолв не ответил за 3с")),
+    }
+}
+
+/// Детект перехвата с троттлингом: (обнаружен, человеческое пояснение).
+/// Перехват = маршруты-мины в 198.18.0.0/15 ИЛИ fake-ip в системном резолве.
+fn hijack_check() -> (bool, String) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = HIJACK_TS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 10 {
+        let detail = HIJACK_DETAIL.lock().map(|g| g.clone()).unwrap_or_default();
+        return (HIJACK_DETECTED.load(Ordering::Relaxed), detail);
+    }
+    HIJACK_TS.store(now, Ordering::Relaxed);
+
+    let routes = fakeip_routes_in_table().len();
+    let (detected, detail) = match system_resolve_fakeip() {
+        Ok(Some(ip)) => (
+            true,
+            format!(
+                "системный резолв отдаёт fake-ip {} (чужой перехватчик){}",
+                ip,
+                if routes > 0 { format!(", маршрутов-мин: {}", routes) } else { String::new() }
+            ),
+        ),
+        Ok(None) if routes > 0 => (
+            true,
+            format!("в таблице маршрутов {} мин(ы) 198.18.0.0/15 — остатки чужого TUN", routes),
+        ),
+        Ok(None) => (false, String::new()),
+        Err(e) if routes > 0 => (
+            true,
+            format!("в таблице маршрутов {} мин(ы) 198.18.0.0/15 — остатки чужого TUN; {}", routes, e),
+        ),
+        Err(_) => (false, String::new()),
+    };
+    HIJACK_DETECTED.store(detected, Ordering::Relaxed);
+    if let Ok(mut g) = HIJACK_DETAIL.lock() {
+        *g = detail.clone();
+    }
+    (detected, detail)
+}
+
 /// Гасим Koala Clash, если она держит канал (taskkill; отсутствие процесса — норма).
+/// СНАЧАЛА сторож-служба: без её гашения Koala воскресит sidecar через
+/// минуту после taskkill (инцидент 19.11.26) и оставит мины в сети.
 fn kill_koala(app: &AppHandle) {
+    for line in stop_koala_watchdog() {
+        emit_log(app, line);
+    }
     let out = Command::new("taskkill")
         .args(["/F", "/IM", KOALA_PROCESS])
         .creation_flags(CREATE_NO_WINDOW)
@@ -495,10 +690,65 @@ fn start_mihomo(app: &AppHandle, config_path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+/// Чистый патч строк yaml-профиля (тестируемый без ФС; инвариант proxy-only).
+/// 1) TUN off: в tun-блоке (от `tun:` до следующего ключа первого уровня)
+///    `enable: true` с ЛЮБЫМ отступом → `enable: false` (старый матч через
+///    trim_end() не снимал ведущий отступ — матч не срабатывал никогда, TUN
+///    поднимался на yaml-каналах: весь трафик системы уходил в наш mihomo
+///    через TUN + auto-route + dns-hijack any:53, инцидент 19.11.26); если
+///    enable в блоке нет вообще — вставляется `enable: false` сразу после
+///    `tun:` (гарантия инварианта); flow-style `tun: {enable: true, ...}` —
+///    замена прямо в строке. dns.enable, sniffer.enable и прочие enable вне
+///    блока не задеваются.
+/// 2) Порты НЕ трогает: их вписывает generate_paid_config (замена/вставка
+///    после log-level) — иначе они применятся дважды.
+fn patch_yaml_lines(lines: &mut Vec<String>) {
+    // --- 1) TUN off ---
+    let first_level = |l: &str| {
+        !l.is_empty() && !l.starts_with(' ') && !l.starts_with('#') && l.contains(':')
+    };
+    // Flow-style `tun: {enable: true, ...}` — замена прямо в строке: блочный
+    // патч такой enable не увидит (он внутри одной строки).
+    if let Some(i) = lines.iter().position(|l| l.starts_with("tun:") && l.contains("{")) {
+        lines[i] = lines[i]
+            .replace("enable: true", "enable: false")
+            .replace("enable:true", "enable: false");
+    }
+    let (ti, ni) = {
+        let mut ti = None;
+        let mut ni = None;
+        for (i, l) in lines.iter().enumerate() {
+            if first_level(l) {
+                if l.starts_with("tun:") {
+                    ti = Some(i);
+                } else if ti.is_some() {
+                    ni = Some(i);
+                    break;
+                }
+            }
+        }
+        (ti, ni)
+    };
+    if let Some(t) = ti {
+        let end = ni.unwrap_or(lines.len());
+        // Инцидент 19.11.26: enable: true ГЛУБОКО в блоке (за списком
+        // exclude-package) с отступом — trim_end-матч его не находил, TUN
+        // поднимался и перехватывал систему целиком.
+        if let Some(i) = (t + 1..end).find(|&i| matches!(lines[i].trim(), "enable: true" | "enable:true")) {
+            let indent = lines[i].len() - lines[i].trim_start().len();
+            lines[i] = format!("{}enable: false", " ".repeat(indent));
+        } else if !lines[t].contains("{") && !(t + 1..end).any(|i| lines[i].trim() == "enable: false") {
+            // enable в блоке нет вообще — гарантированная вставка (инвариант
+            // proxy-only обязан быть видимым в тексте конфига).
+            lines.insert(t + 1, "  enable: false".to_string());
+        }
+    }
+}
+
 /// Патч yaml-канала юзера: вписать порты (mixed-port/external-controller) и
-/// принудительно выключить TUN (инвариант proxy-only, PRP v3). Строковый
-/// патч, валидированный на paid_test 18.11.26 (Шаг 1): YAML-библиотеки в
-/// зависимостях нет, а правки касаются только плоских скаляров.
+/// выключить TUN чистым патчером patch_yaml_lines (юнит-тесты patcher_tests;
+/// после инцидента 19.11.26 «валидация» старого патча была фикцией). YAML-
+/// библиотеки в зависимостях нет, а правки касаются только плоских скаляров.
 /// Источник — id канала из реестра (имя файла без пути): патч-защита от
 /// path traversal (mode со «/», «\», «..» не дойдёт до файловой системы),
 /// плюс канал обязан быть в реестре юзера — чужой файл не патчим.
@@ -518,32 +768,12 @@ fn generate_paid_config(src_file: &str) -> Result<PathBuf, String> {
 
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
 
-    // 1) TUN off внутри tun-блока (границы — ключи первого уровня; dns.enable
-    //    и прочие enable за границей блока не задеваются).
-    let first_level = |l: &String| {
-        !l.is_empty() && !l.starts_with(' ') && !l.starts_with('#') && l.contains(':')
-    };
-    let mut ti = None;
-    let mut ni = None;
-    for (i, l) in lines.iter().enumerate() {
-        if first_level(l) {
-            if l.starts_with("tun:") {
-                ti = Some(i);
-            } else if ti.is_some() && ni.is_none() {
-                ni = Some(i);
-                break;
-            }
-        }
-    }
-    if let (Some(t), Some(n)) = (ti, ni) {
-        for i in t + 1..n {
-            if lines[i].trim_end() == "enable: true" {
-                let indent = lines[i].len() - lines[i].trim_start().len();
-                lines[i] = format!("{}enable: false", " ".repeat(indent));
-                break;
-            }
-        }
-    }
+    // 1) TUN off: вынесен в чистый патчер patch_yaml_lines (trim-матч с любым
+    //    отступом, гарантированная вставка enable: false при отсутствии, flow-style):
+    //    старый trim_end-матч не снимал ведущий отступ и никогда не срабатывал —
+    //    TUN поднимался на ВСЕХ yaml-каналах, весь трафик системы уходил в наш
+    //    mihomo (TUN + auto-route + dns-hijack any:53), инцидент 19.11.26.
+    patch_yaml_lines(&mut lines);
 
     // 2) Порты: заменить существующие ключи, иначе вставить после log-level.
     let ports = [
@@ -593,6 +823,9 @@ pub fn channel_set(app: &AppHandle, mode: &str) -> Result<String, String> {
     match mode {
         "off" => {
             let was = stop_channel(Some(app));
+            // Вердикт перехвата пересчитать сразу: при живом канале TUN-хвост
+            // мог быть валидным до чистки (баг патчера до 19.11.26).
+            HIJACK_TS.store(0, Ordering::Relaxed);
             emit_log(app, "Канал выключен.".into());
             if was {
                 Ok("Канал выключен.".into())
@@ -609,6 +842,11 @@ pub fn channel_set(app: &AppHandle, mode: &str) -> Result<String, String> {
             GUARD_ON.store(false, Ordering::SeqCst);
             kill_koala(app);
             kill_mihomo_any();
+            let removed = cleanup_stale_fakeip();
+            if !removed.is_empty() {
+                emit_log(app, format!("Сняты чужие fake-ip маршруты (остатки перехватчика): {}", removed.join(", ")));
+                flush_dns();
+            }
             crate::reserve::generate_reserve_config()?;
             let config_path = validate_reserve_config()?;
             start_mihomo(app, &config_path)?;
@@ -628,6 +866,11 @@ pub fn channel_set(app: &AppHandle, mode: &str) -> Result<String, String> {
             GUARD_ON.store(false, Ordering::SeqCst);
             kill_koala(app);
             kill_mihomo_any();
+            let removed = cleanup_stale_fakeip();
+            if !removed.is_empty() {
+                emit_log(app, format!("Сняты чужие fake-ip маршруты (остатки перехватчика): {}", removed.join(", ")));
+                flush_dns();
+            }
             start_mihomo(app, &config_path)?;
             if let Ok(mut g) = CHANNEL.lock() {
                 g.mode = mode.to_string();
@@ -646,4 +889,169 @@ fn mark_active_channel(file_id: &str) {
     let mut reg = read_registry();
     reg["active"] = json!(file_id);
     let _ = write_registry(&reg);
+}
+
+/// «Починить систему» — действие под честный баннер перехвата: гасим сторожа
+/// Koala и ЧУЖИЕ mihomo-процессы (ядро перехватчика обязано умереть ДО снятия
+/// маршрутов, иначе успеет накласть их заново; наш ребёнок, если канал
+/// включён, не трогаем — починка не должна убивать канал юзера), снимаем
+/// маршруты-мины, сбрасываем DNS-кэш. Построчный отчёт — в лог фронта.
+pub fn channel_fix_system(app: &AppHandle) -> Result<Vec<String>, String> {
+    let mut log = Vec::new();
+    log.extend(stop_koala_watchdog());
+
+    let our_pid = CHANNEL.lock().ok().and_then(|g| g.child.as_ref().map(|c| c.id()));
+    let mut killed = Vec::new();
+    if our_pid.is_none() {
+        // Наш канал выключен: имя mihomo.exe в системе может носить только чужой.
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", MIHOMO_EXE])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", KOALA_PROCESS])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        killed.push(String::from("mihomo.exe и Koala Clash (по имени)"));
+    } else {
+        // Канал включён: чужие mihomo гасим по PID (wmic), наш не задеваем.
+        if let Ok(o) = Command::new("wmic")
+            .args(["process", "where", "name='mihomo.exe'", "get", "ProcessId"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if let Ok(pid) = line.trim().parse::<u32>() {
+                    if Some(pid) != our_pid {
+                        let _ = Command::new("taskkill")
+                            .args(["/F", "/PID", &pid.to_string()])
+                            .creation_flags(CREATE_NO_WINDOW)
+                            .output();
+                        killed.push(format!("mihomo PID {}", pid));
+                    }
+                }
+            }
+        }
+    }
+    if !killed.is_empty() {
+        log.push(format!("Погашены чужие процессы: {}.", killed.join(", ")));
+    }
+
+    let removed = cleanup_stale_fakeip();
+    if removed.is_empty() {
+        log.push(String::from("Маршрутов-мин 198.18.0.0/15 в таблице нет."));
+    } else {
+        log.push(format!("Сняты маршруты-мины перехватчика: {}.", removed.join(", ")));
+    }
+    flush_dns();
+    log.push(String::from("DNS-кэш Windows сброшен — fake-ip-ответы перехватчика вычищены."));
+
+    // Детект пересчитываем немедленно (троттлинг сброшен) — честный вердикт.
+    HIJACK_TS.store(0, Ordering::Relaxed);
+    let (detected, detail) = hijack_check();
+    if detected {
+        log.push(format!("ПРЕДУПРЕЖДЕНИЕ: признаки перехвата остались — {}.", detail));
+    } else {
+        log.push(String::from("Система чиста: следов fake-ip нет."));
+    }
+    for line in &log {
+        emit_log(app, line.clone());
+    }
+    Ok(log)
+}
+
+#[cfg(test)]
+mod fakeip_tests {
+    use super::parse_fakeip_routes;
+
+    /// Фрагмент живой route print -4 с минами инцидента 19.11.26: строки
+    /// «198.18.0.26  255.255.255.255  10.98.0.1  10.98.0.2  26» (хвосты
+    /// Koala/FlClash fake-ip через TAP-шлюз) + шум, который не должен парситься.
+    #[test]
+    fn fakeip_routes_parsed_from_table() {
+        let sample = "===========================================================================\n\
+Список интерфейсов\n\
+ 12...xx Realtek PCIe GbE Family Controller\n\
+===========================================================================\n\
+\nАктивные маршруты:\n\
+Сетевой адрес           Маска сети          Адрес шлюза       Интерфейс  Метрика\n\
+          0.0.0.0          0.0.0.0      192.168.1.1     192.168.1.10     25\n\
+     198.18.0.26  255.255.255.255         10.98.0.1        10.98.0.2     26\n\
+     198.18.0.98  255.255.255.255      127.0.0.1         127.0.0.1     31\n\
+        224.0.0.0        240.0.0.0   На канале\n";
+        let r = parse_fakeip_routes(sample);
+        assert_eq!(r.len(), 2, "мины 198.18.x должны найтись, шум остаться");
+        assert_eq!(r[0], ("198.18.0.26".to_string(), "255.255.255.255".to_string()));
+        assert_eq!(r[1], ("198.18.0.98".to_string(), "255.255.255.255".to_string()));
+    }
+
+    /// Чистая таблица без перехватчика: ноль мин (ложная тревога недопустима).
+    #[test]
+    fn clean_table_gives_no_mines() {
+        let sample = "          0.0.0.0          0.0.0.0      192.168.1.1     192.168.1.10     25\n\
+        127.0.0.0        255.0.0.0      127.0.0.1        127.0.0.1     31\n\
+      198.20.0.1  255.255.255.255      192.168.1.1     192.168.1.10     26\n";
+        assert!(parse_fakeip_routes(sample).is_empty(), "198.20.x вне /15 — не мина");
+    }
+}
+
+#[cfg(test)]
+mod patcher_tests {
+    use super::patch_yaml_lines;
+
+    fn patch(text: &str) -> Vec<String> {
+        let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+        patch_yaml_lines(&mut lines);
+        lines
+    }
+
+    /// Инцидент 19.11.26: enable: true ГЛУБОКО в tun-блоке (за списком
+    /// exclude-package) с отступом — старый trim_end-патчер НЕ выключал TUN,
+    /// весь трафик системы уходил в наш mihomo (TUN + auto-route + dns-hijack).
+    #[test]
+    fn deep_indented_tun_enable_true_is_disabled() {
+        let out = patch("tun:\n  exclude-package:\n    - a.b\n    - c.d\n  enable: true\n  auto-route: true\ndns:\n  enable: true\n");
+        let dns_at = out.iter().position(|l| l == "dns:").unwrap();
+        let tun_block = &out[..dns_at];
+        assert!(
+            tun_block.iter().any(|l| l.trim() == "enable: false"),
+            "tun enable обязан стать false"
+        );
+        assert!(
+            !tun_block.iter().any(|l| l.trim() == "enable: true"),
+            "в tun-блоке не должно остаться enable: true"
+        );
+        // dns.enable не тронут (контракт: правки только внутри tun-блока).
+        assert_eq!(out.last().map(|l| l.as_str()), Some("  enable: true"));
+        // auto-route остался на месте (не мешает при enable: false).
+        assert!(out.iter().any(|l| l.trim() == "auto-route: true"));
+    }
+
+    /// enable в tun-блоке отсутствует → патчер ДОЛЖЕН вставить enable: false
+    /// (инвариант proxy-only обязан быть видимым в конфиге).
+    #[test]
+    fn tun_without_enable_gets_explicit_false() {
+        let out = patch("tun:\n  stack: gvisor\nlog-level: info\n");
+        assert_eq!(out[1], "  enable: false");
+        assert!(out.iter().any(|l| l.trim() == "stack: gvisor"));
+    }
+
+    /// Flow-style `tun: {enable: true, ...}` — замена прямо в строке, без
+    /// вставки строк внутрь (вставка после flow-строки сломала бы YAML).
+    #[test]
+    fn flow_style_tun_enable_is_disabled_inplace() {
+        let out = patch("tun: {enable: true, stack: mixed}\nlog-level: info\n");
+        assert_eq!(out[0], "tun: {enable: false, stack: mixed}");
+        assert_eq!(out[1], "log-level: info");
+    }
+
+    /// Порты и dns.enable патчер НЕ трогает (порты вписывает
+    /// generate_paid_config — иначе дублировались бы).
+    #[test]
+    fn ports_and_dns_enable_untouched() {
+        let out = patch("mixed-port: 7890\nlog-level: info\ndns:\n  enable: true\n");
+        assert!(out.iter().any(|l| l == "mixed-port: 7890"));
+        assert_eq!(out[1], "log-level: info");
+        assert_eq!(out.last().map(|l| l.as_str()), Some("  enable: true"));
+    }
 }

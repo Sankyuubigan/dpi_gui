@@ -21,6 +21,7 @@ export default function ChannelTab({
   // переврать (мёртвый процесс ≠ зелёный бейдж, §2.2).
   const [channel, setChannel] = useState<any>(null);
   const [channelBusy, setChannelBusy] = useState(false);
+  const [fixBusy, setFixBusy] = useState(false);
   const [listBusy, setListBusy] = useState(false);
   // WG-креды (статус без приватного ключа).
   const [creds, setCreds] = useState<any>({ present: false });
@@ -88,6 +89,25 @@ export default function ChannelTab({
       logMsg(`Канал: ошибка переключения: ${e}`);
     } finally {
       setChannelBusy(false);
+      invoke("channel_status").then(setChannel).catch(() => {});
+    }
+  };
+
+  // «Починить систему» (красный баннер перехвата): гасим чужие перехватчики,
+  // снимаем их fake-ip маршруты (198.18.0.0/15), сбрасываем DNS-кэш Windows
+  // — отчёт построчно в лог (инцидент 19.11.26: весь трафик стоял в чужом
+  // fake-ip TUN, а софт обязан это видеть и уметь чинить).
+  const fixSystem = async () => {
+    if (fixBusy) return;
+    setFixBusy(true);
+    logMsg("Канал: чиню систему (чужой fake-ip-перехват)...");
+    try {
+      const report: string[] = await invoke("channel_fix_system");
+      for (const line of report) logMsg(`Канал: ${line}`);
+    } catch (e: any) {
+      logMsg(`Канал: ошибка починки: ${e}`);
+    } finally {
+      setFixBusy(false);
       invoke("channel_status").then(setChannel).catch(() => {});
     }
   };
@@ -317,6 +337,26 @@ export default function ChannelTab({
             </>
           )}
         </div>
+        {channel?.hijack && (
+          <div className="mt-3 border border-red-300 bg-red-50 rounded-lg p-3 flex items-center gap-3 flex-wrap">
+            <span className="w-2.5 h-2.5 rounded-full bg-red-600 inline-block" />
+            <span className="text-red-700 font-bold text-sm">
+              ВЕСЬ СИСТЕМНЫЙ ТРАФИК ПЕРЕХВАТЧЕН (чужой fake-ip/TUN — виноват не канал)
+            </span>
+            <span className="text-red-600 text-sm flex-1 min-w-[240px]">
+              {channel.hijack_detail || "следы 198.18.x в системе"} — программы и сайты напрямую работать не будут.
+            </span>
+            <button
+              onClick={fixSystem}
+              disabled={fixBusy}
+              title="Погасить чужие перехватчики, снять их fake-ip маршруты (198.18.0.0/15), сбросить DNS-кэш"
+              className="flex items-center gap-2 bg-red-600 hover:bg-red-700 disabled:bg-red-300 text-white px-4 py-2 rounded-md font-bold text-sm transition-colors"
+            >
+              {fixBusy ? <Loader2 size={14} className="animate-spin" /> : <RotateCcw size={14} />}
+              Починить систему
+            </button>
+          </div>
+        )}
       </div>
 
       {/* КАНАЛЫ ЮЗЕРА: единый список yaml-профилей и WG. Имя канала задаёт

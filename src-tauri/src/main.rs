@@ -97,8 +97,10 @@ fn check_status() -> bool {
 }
 
 /// Статус интернет-канала (proxy-only движок mihomo, PRP «18.11.26»).
+/// async: детект перехвата внутри (системный резолв до 3с раз в 10с) не
+/// должен блокировать UI-поток.
 #[tauri::command]
-fn channel_status() -> serde_json::Value {
+async fn channel_status() -> serde_json::Value {
     proxy_core::status()
 }
 
@@ -107,6 +109,13 @@ fn channel_status() -> serde_json::Value {
 #[tauri::command]
 fn channel_set(app: AppHandle, mode: String) -> Result<String, String> {
     proxy_core::channel_set(&app, &mode)
+}
+
+/// «Починить систему» (баннер перехвата): гасим сторожа Koala и чужие
+/// mihomo-процессы, снимаем их fake-ip маршруты, сбрасываем DNS-кэш.
+#[tauri::command]
+fn channel_fix_system(app: AppHandle) -> Result<Vec<String>, String> {
+    proxy_core::channel_fix_system(&app)
 }
 
 // ==== Вкладка «Канал» (PRP 18.11.26): личные каналы юзера + WG-креды ====
@@ -356,6 +365,7 @@ fn main() {
             check_status,
             channel_status,
             channel_set,
+            channel_fix_system,
             paid_profiles_list,
             paid_profile_add,
             paid_profile_delete,

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-channel-fix-system"
+description = "Enables the channel_fix_system command without any pre-configured scope."
+commands.allow = ["channel_fix_system"]
+
+[[permission]]
+identifier = "deny-channel-fix-system"
+description = "Denies the channel_fix_system command without any pre-configured scope."
+commands.deny = ["channel_fix_system"]

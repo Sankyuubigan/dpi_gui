@@ -80,6 +80,7 @@ fn main() {
                 // «__wg__»), не «paid»/«reserve» — хардкод-режимы убраны.
                 "channel_status",
                 "channel_set",
+                "channel_fix_system",
                 "paid_profiles_list",
                 "paid_profile_add",
                 "paid_profile_delete",
