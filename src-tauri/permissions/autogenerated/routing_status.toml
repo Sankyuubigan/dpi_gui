@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-routing-status"
+description = "Enables the routing_status command without any pre-configured scope."
+commands.allow = ["routing_status"]
+
+[[permission]]
+identifier = "deny-routing-status"
+description = "Denies the routing_status command without any pre-configured scope."
+commands.deny = ["routing_status"]

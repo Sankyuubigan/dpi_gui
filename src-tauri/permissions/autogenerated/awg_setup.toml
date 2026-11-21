@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-awg-setup"
+description = "Enables the awg_setup command without any pre-configured scope."
+commands.allow = ["awg_setup"]
+
+[[permission]]
+identifier = "deny-awg-setup"
+description = "Denies the awg_setup command without any pre-configured scope."
+commands.deny = ["awg_setup"]

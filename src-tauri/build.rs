@@ -81,12 +81,29 @@ fn main() {
                 "channel_status",
                 "channel_set",
                 "channel_fix_system",
+                // Этап A «Группы маршрутизации» (19.11.26): статус/смена
+                // режимов групп доменов + системный PAC-подхват браузеров.
+                "routing_status",
+                "routing_set_mode",
+                "pac_set",
                 "paid_profiles_list",
                 "paid_profile_add",
                 "paid_profile_delete",
                 "wg_creds_status",
                 "wg_creds_import",
                 "wg_creds_reset",
+                // Этап B «WARP-канал» (PRP 19.11.26): учётка Cloudflare —
+                // регистрация по гейтам спеца / импорт wgcf .conf / сброс + статус.
+                "warp_setup",
+                "warp_status",
+                // Бесплатные каналы (PRP 20.11.26): AWG-учётка (warpscout:
+                // register/rescan/reset) + статус AWG и Psiphon-сайдкара.
+                "awg_setup",
+                "awg_status",
+                "psiphon_status",
+                // Плашка «Тест каналов» (21.11.26): живой прогон по каналам.
+                "channel_test_one",
+                "channel_test_all",
             ])),
     )
     .expect("failed to run tauri-build");

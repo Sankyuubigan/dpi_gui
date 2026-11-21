@@ -1,0 +1,78 @@
+# Шаблон WARP-канала DPI GUI (v2 — MASQUE H2, метод спеца 20.11.26).
+# ПУБЛИЧНЫЙ файл: едет в бандле всем юзерам, СЕКРЕТОВ НЕ СОДЕРЖИТ —
+# плейсхолдеры __...__ подставляются из warp_account.json (регистрация в 1 клик).
+#
+# ИСТОРИЯ: v1 был WireGuard (UDP:2408) — мёртв вдвойне: бесплатный пул такси
+# НЕ релеит UDP (0/240 нод, sweep 20.11.26), а WG-протокол режет Дом.ру напрямую.
+# mihomo ≥1.19.20 умеет type: masque (Cloudflare CONNECT-IP), ≥1.19.24 —
+# network: h2 (MASQUE поверх HTTP/2 + TLS + TCP:443): UDP от нод не нужен
+# вообще. Смоук 20.11.26 (handoff 03:50): warp=on, loc=SG, colo=SIN,
+# aistudio/firefly HTTP 200. Ключи — ECDSA P-256 (контракт usque), Curve25519
+# от wgcf НЕ совместимы, поэтому импорт .conf убран (честная ошибка).
+# Нюансы (ломают подключение, не убирать):
+#  - НЕ добавлять tls: true — у masque TLS встроен (mihomo#3366);
+#  - sni: consumer-masque... — SNI CONNECT-запроса;
+#  - remote-dns-resolve + dns — userspace L3-стек masque сам домены не
+#    резолвит (для WG reserve это была квирка наоборот — тут наоборот же);
+#  - server = IP строго из ответа PATCH /reg/{id} (привязка к edge-кластеру,
+#    другой anycast может дать 0x131 access denied);
+#  - health-check такси — www.cloudflare.com/cdn-cgi/trace: Cloudflare-Worker
+#    ноды режут исходящие сокеты на свои же IP (Error 1101) — trace их
+#    отсекает (матрица 20.11.26: Workers FAIL, VPS PASS; youtube/204 FAIL
+#    даже на живых VPS).
+#  - ТАКСИ — только бесплатные VPS-пулы (igareck): у платных DC-флотов
+#    middlebox режет СТРОКУ SNI «consumer-masque» (20.11.26 вечер: masque и
+#    даже несуществующий masque2 — EOF в рукопожатии, а engage/api/speed/www
+#    с того же egress — TLS OK). Платный профиль такси для WARP не годится.
+#  Хвост rules дописывает generate_warp_config из компилятора групп
+#  (routing.rs, Этап A): селективно — geo-домены → WARP, остальное DIRECT.
+mixed-port: 7897
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+external-controller: 127.0.0.1:9097
+
+dns:
+  enable: true
+  enhanced-mode: redir-host
+  default-nameserver: [1.1.1.1, 8.8.8.8]
+  nameserver: [https://dns.google/dns-query, https://1.1.1.1/dns-query]
+
+proxy-providers:
+  igareck-vless:
+    type: file
+    path: "./providers/igareck_vless.yaml"
+    health-check: {enable: true, url: "https://www.cloudflare.com/cdn-cgi/trace", expected-status: 200, interval: 600, timeout: 4000, lazy: true}
+  igareck-ss:
+    type: file
+    path: "./providers/igareck_ss.yaml"
+    health-check: {enable: true, url: "https://www.cloudflare.com/cdn-cgi/trace", expected-status: 200, interval: 600, timeout: 4000, lazy: true}
+
+proxies:
+  - name: "WARP"
+    type: masque
+    server: __SERVER__
+    port: 443
+    private-key: "__PRIVATE_KEY__"
+    public-key: __PUBLIC_KEY__
+    ip: __IP__
+    ipv6: __IPV6__
+    mtu: 1280
+    udp: true
+    network: h2
+    sni: consumer-masque.cloudflareclient.com
+    dialer-proxy: "TR"
+    remote-dns-resolve: true
+    dns: [1.1.1.1, 8.8.8.8]
+
+proxy-groups:
+  - name: "TR"
+    type: fallback
+    url: "https://www.cloudflare.com/cdn-cgi/trace"
+    interval: 300
+    use: [igareck-vless, igareck-ss]
+
+rules:
+  - DOMAIN,www.cloudflare.com,WARP
+  - MATCH,WARP

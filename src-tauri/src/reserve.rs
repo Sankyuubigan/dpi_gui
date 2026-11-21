@@ -365,13 +365,13 @@ use std::path::PathBuf;
 /// Креды WireGuard-провайдера юзера (личные, хранить только в AppData).
 #[derive(Clone)]
 pub struct WgCreds {
-    private_key: String,
-    public_key: String,
-    server: String,
-    port: u16,
-    address: String,
-    keepalive: u16,
-    psk: Option<String>,
+    pub(crate) private_key: String,
+    pub(crate) public_key: String,
+    pub(crate) server: String,
+    pub(crate) port: u16,
+    pub(crate) address: String,
+    pub(crate) keepalive: u16,
+    pub(crate) psk: Option<String>,
 }
 
 fn creds_file() -> PathBuf {
@@ -380,6 +380,12 @@ fn creds_file() -> PathBuf {
 
 fn reserve_path() -> PathBuf {
     config::get_app_dir().join("proxy").join("reserve_profile.yaml")
+}
+
+/// Путь регенерированного конфига запасного канала (публичная обёртка для
+/// refresh_channel_exclude / routing_set_mode — Этап A, 19.11.26).
+pub fn reserve_profile_path() -> PathBuf {
+    reserve_path()
 }
 
 fn creds_to_json(c: &WgCreds, source: &str) -> Value {
@@ -415,7 +421,7 @@ fn save_creds(c: &WgCreds, source: &str) -> Result<(), String> {
         .map_err(|e| format!("не записать {}: {}", creds_file().display(), e))
 }
 
-fn load_creds() -> Option<WgCreds> {
+pub(crate) fn load_creds() -> Option<WgCreds> {
     std::fs::read_to_string(creds_file())
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
@@ -520,14 +526,14 @@ pub fn parse_wg_conf(text: &str) -> Result<WgCreds, String> {
 }
 
 /// Импорт WG .conf: парс → сохранение кредов в AppData → запись канала в
-/// реестр (имя задаёт юзер, канал один — file = «__wg__») → перегенерация
+/// реестр (имя — канон метода, канал один — file = «__wg__») → перегенерация
 /// reserve_profile.yaml из шаблона + кредов. Возвращает статус для UI.
-pub fn wg_creds_import(path: &str, name: &str, app: &AppHandle) -> Result<Value, String> {
+pub fn wg_creds_import(path: &str, app: &AppHandle) -> Result<Value, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("не прочитать {}: {}", path, e))?;
     let creds = parse_wg_conf(&text)?;
     save_creds(&creds, path)?;
-    crate::proxy_core::wg_channel_sync(app, name)?;
+    crate::proxy_core::wg_channel_sync(app)?;
     let out = generate_reserve_config()?;
     emit_log(app, format!(
         "WireGuard-креды импортированы ({}:{}), запасной конфиг собран: {}",
@@ -568,6 +574,32 @@ pub fn generate_reserve_config() -> Result<PathBuf, String> {
             let indent = lines[i].len() - lines[i].trim_start().len();
             lines.insert(i + 1, format!("{}preshared-key: \"{}\"", " ".repeat(indent), psk));
         }
+        out = lines.join("\n") + "\n";
+    }
+
+    // Правила маршрутизации от компилятора групп (Этап A, 19.11.26):
+    // selective → channel-домены → PROTON-WG + MATCH,DIRECT (остальное
+    // напрямую), fullport → MATCH,PROTON-WG (весь трафик через канал).
+    // Шаблонный хвост rules заменяется — применились режимы юзера из
+    // routing.json, а не зашитые в шаблоне. Домены нод сюда не нужны
+    // (mihomo-правила их не используют) — их добавит apply_channel_exclude
+    // в channel_set, когда конфиг уже сгенерирован.
+    {
+        let modes = crate::routing::load_modes()?;
+        let art = crate::routing::compile_from_fs(
+            &modes,
+            true,
+            Some("PROTON-WG"),
+            &[],
+            crate::proxy_core::PROXY_PORT,
+        )?;
+        let mut lines: Vec<String> = out.lines().map(|l| l.to_string()).collect();
+        let Some(ri) = lines.iter().position(|l| l.trim() == "rules:") else {
+            return Err(String::from("Шаблон запасного: не найдена секция rules"));
+        };
+        lines.truncate(ri);
+        lines.push(String::from("rules:"));
+        lines.extend(art.mihomo_rules);
         out = lines.join("\n") + "\n";
     }
 

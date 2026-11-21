@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-psiphon-status"
+description = "Enables the psiphon_status command without any pre-configured scope."
+commands.allow = ["psiphon_status"]
+
+[[permission]]
+identifier = "deny-psiphon-status"
+description = "Denies the psiphon_status command without any pre-configured scope."
+commands.deny = ["psiphon_status"]

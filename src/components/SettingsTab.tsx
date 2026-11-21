@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Edit3, Eye, FileText, ListFilter } from "lucide-react";
 import AboutSection from "./AboutSection";
+import RoutingCard from "./RoutingCard";
 
 /// Вкладка «Настройки»: секция «О программе» сверху, ниже — управление
 /// файлами списков (General / Exclude / DoH / hosts) и режимом наблюдения.
@@ -79,6 +80,18 @@ export default function SettingsTab() {
 
           <div className="flex items-center justify-between p-4 border rounded-lg bg-gray-50 hover:bg-gray-100 transition">
             <div>
+              <h3 className="font-bold text-gray-700">Geo List (дополнения)</h3>
+              <p className="text-xs text-gray-500">
+                Твои домены гео-группы (aistudio/Adobe и т.п. идут через канал).
+              </p>
+            </div>
+            <button onClick={() => openFile("geo_custom")} className="flex items-center gap-2 bg-blue-100 text-blue-700 px-4 py-2 rounded-md font-semibold hover:bg-blue-200">
+              <Edit3 size={18} />
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between p-4 border rounded-lg bg-gray-50 hover:bg-gray-100 transition">
+            <div>
               <h3 className="font-bold text-gray-700">DoH-серверы</h3>
               <p className="text-xs text-gray-500">Список сервисов подмены DNS для «Теста подмены DNS».</p>
             </div>
@@ -98,6 +111,9 @@ export default function SettingsTab() {
           </div>
         </div>
       </div>
+
+      {/* Маршрутизатор (Этап A 19.11.26): режимы групп + PAC-подхват. */}
+      <RoutingCard />
 
       <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
         <div className="flex items-center gap-2 mb-4">

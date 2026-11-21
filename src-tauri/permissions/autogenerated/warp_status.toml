@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-warp-status"
+description = "Enables the warp_status command without any pre-configured scope."
+commands.allow = ["warp_status"]
+
+[[permission]]
+identifier = "deny-warp-status"
+description = "Denies the warp_status command without any pre-configured scope."
+commands.deny = ["warp_status"]

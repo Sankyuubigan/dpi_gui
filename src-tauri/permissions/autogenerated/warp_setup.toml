@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-warp-setup"
+description = "Enables the warp_setup command without any pre-configured scope."
+commands.allow = ["warp_setup"]
+
+[[permission]]
+identifier = "deny-warp-setup"
+description = "Denies the warp_setup command without any pre-configured scope."
+commands.deny = ["warp_setup"]

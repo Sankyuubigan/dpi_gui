@@ -28,6 +28,7 @@ mod events;
 mod win_divert;
 mod domain_monitor;
 mod reanim;
+mod channel_test;
 mod fake_payloads;
 mod tls_sni;
 mod quic_sniff;
@@ -41,6 +42,18 @@ mod mass_analysis;
 mod probe_budget;
 mod proxy_core;
 mod reserve;
+mod routing;
+mod pac_server;
+// WARP-канал (Этап B, PRP 19.11.26): учётка/парсеры — warp.rs, оркестрация
+// регистрации/гарда — warp_ops.rs (файл ≤ 500 строк).
+mod warp;
+mod warp_ops;
+// Бесплатные каналы (PRP 20.11.26 «Три бесплатных канала»): AWG-учётка/
+// регистрация (warpscout) — awg.rs, генераторы конфигов AWG/pawg — awg_config.rs,
+// Psiphon-канал (sidecar aether.exe) — psiphon.rs.
+mod awg;
+mod awg_config;
+mod psiphon;
 
 use tauri::AppHandle;
 
@@ -55,6 +68,10 @@ fn init_app(app: AppHandle) -> Result<(), String> {
     // встроенных defaults — контракт владельца) + тихая миграция личных данных
     // прошлых версий в списки вкладки «Канал» (PRP 18.11.26).
     proxy_core::ensure_proxy_files(&app).map_err(|e| e.to_string())?;
+    // PAC-слушатель (Этап A 19.11.26): локальный 127.0.0.1:7896 отдаёт
+    // proxy.pac, скомпилированный routing.rs на каждый запрос. Живёт всю
+    // сессию; включение системного подхвата — команда pac_set (тумблер в UI).
+    pac_server::start(app.clone());
     // Автозабор кукисов (PRP 09.11.26): фоновой задачей — старт приложения
     // не ждёт чтения чужих кукис-баз; итог придёт событием cookies-updated.
     tauri::async_runtime::spawn(browser_cookies::auto_grab_on_startup(app.clone()));
@@ -111,6 +128,32 @@ fn channel_set(app: AppHandle, mode: String) -> Result<String, String> {
     proxy_core::channel_set(&app, &mode)
 }
 
+/// Статус маршрутизации (Этап A 19.11.26): режимы групп, счётчики списков,
+/// состояние PAC. Бизнес-логика в pac_server (routing.rs остаётся чистым).
+#[tauri::command]
+fn routing_status() -> Result<serde_json::Value, String> {
+    pac_server::routing_status_json()
+}
+
+/// Смена режимов групп маршрутизации (dpi/geo/route) с пересборкой артефактов:
+/// routing.json → channel-exclude → рестарт запасного (если живой).
+#[tauri::command]
+fn routing_set_mode(
+    app: AppHandle,
+    dpi_mode: String,
+    geo_mode: String,
+    route_mode: String,
+) -> Result<String, String> {
+    pac_server::routing_set_mode(&app, &dpi_mode, &geo_mode, &route_mode)
+}
+
+/// Системный PAC-подхват браузеров (Этап A): включить/выключить наш proxy.pac
+/// (AutoConfigURL в HKCU; чужой PAC не перезаписываем — честная ошибка).
+#[tauri::command]
+fn pac_set(enabled: bool) -> Result<String, String> {
+    pac_server::pac_set(enabled)
+}
+
 /// «Починить систему» (баннер перехвата): гасим сторожа Koala и чужие
 /// mihomo-процессы, снимаем их fake-ip маршруты, сбрасываем DNS-кэш.
 #[tauri::command]
@@ -127,8 +170,27 @@ fn paid_profiles_list() -> serde_json::Value {
 }
 
 #[tauri::command]
-fn paid_profile_add(app: AppHandle, path: String, name: String) -> Result<serde_json::Value, String> {
-    proxy_core::paid_profile_add(&path, &name, &app)
+fn paid_profile_add(app: AppHandle, path: String) -> Result<serde_json::Value, String> {
+    proxy_core::paid_profile_add(&path, &app)
+}
+
+/// Живой тест одного канала (21.11.26, плашка «Тест каналов»): реальные пробы
+/// (ютуб/медиа/гео/страна/скорость), активный — на боевом порту, остальные —
+/// тестовый стенд 7920/9120, гашение по PID.
+/// Асинхронные команды (21.11.26): синхронные вешали main thread — окно
+/// фризило на весь прогон. Тяжёлая работа вынесена в spawn_blocking.
+#[tauri::command]
+async fn channel_test_one(app: AppHandle, id: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::channel_test::test_channel(&app, &id))
+        .await
+        .map_err(|e| format!("поток теста прерван: {}", e))?
+}
+
+#[tauri::command]
+async fn channel_test_all(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::channel_test::channel_test_all(&app))
+        .await
+        .map_err(|e| format!("поток теста прерван: {}", e))?
 }
 
 #[tauri::command]
@@ -142,13 +204,56 @@ fn wg_creds_status() -> serde_json::Value {
 }
 
 #[tauri::command]
-fn wg_creds_import(app: AppHandle, path: String, name: String) -> Result<serde_json::Value, String> {
-    crate::reserve::wg_creds_import(&path, &name, &app)
+fn wg_creds_import(app: AppHandle, path: String) -> Result<serde_json::Value, String> {
+    crate::reserve::wg_creds_import(&path, &app)
 }
 
 #[tauri::command]
 fn wg_creds_reset(app: AppHandle) -> Result<String, String> {
     crate::reserve::wg_creds_reset(&app)
+}
+
+// ==== WARP-канал (Этап B, PRP 19.11.26): учётка Cloudflare ====
+// Учётка (ключи/token/reserved) живёт ТОЛЬКО в AppData; статус приватные поля
+// не отдаёт. Регистрация — долгая сеть (временный winws + HTTP) → async.
+
+#[tauri::command]
+async fn warp_setup(
+    app: AppHandle,
+    action: String,
+    path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::warp_ops::warp_setup(&app, &action, path.as_deref())
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
+}
+
+#[tauri::command]
+fn warp_status() -> serde_json::Value {
+    crate::warp::warp_status_json()
+}
+
+// ==== Бесплатные каналы (PRP 20.11.26): AWG / Proton-over-AWG / Psiphon ====
+// Регистрация AWG (warpscout, до 2 мин + резервный путь через aether) — долгая
+// сеть → async. Статусы приватные поля (private_key/token) не отдают.
+
+#[tauri::command]
+async fn awg_setup(app: AppHandle, action: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::awg::awg_setup(&app, action))
+        .await
+        .unwrap_or_else(|e| Err(format!("Ошибка потока: {}", e)))
+}
+
+#[tauri::command]
+fn awg_status() -> serde_json::Value {
+    crate::awg::awg_status_json()
+}
+
+#[tauri::command]
+fn psiphon_status() -> serde_json::Value {
+    crate::psiphon::psiphon_status_json()
 }
 
 // Оборачиваем долгие команды в асинхронные таски, чтобы не вешать UI-поток.
@@ -366,12 +471,23 @@ fn main() {
             channel_status,
             channel_set,
             channel_fix_system,
+            routing_status,
+            routing_set_mode,
+            pac_set,
             paid_profiles_list,
             paid_profile_add,
             paid_profile_delete,
             wg_creds_status,
             wg_creds_import,
             wg_creds_reset,
+            warp_setup,
+            warp_status,
+            awg_setup,
+            awg_status,
+            psiphon_status,
+            // Плашка «Тест каналов» (21.11.26): живой прогон по каналам.
+            channel_test_one,
+            channel_test_all,
             run_domain_analysis,
             cancel_operation,
             run_mass_analysis,

@@ -1,0 +1,12 @@
+# Гео-группа (Этап A 19.11.26): домены, которые банят RU-IP (гео-блок).
+# Через канал (WARP/платный/запасной) идут ТОЛЬКО эти домены + дополнения юзера
+# из lists/geo-custom.txt («Управление списками»); остальное — напрямую.
+# Держим список узким: меньше палева CF-диапазонов и проще диагностика.
+aistudio.google.com
+alkalimakersuite-pa.clients6.google.com
+gemini.google.com
+generativelanguage.googleapis.com
+firefly.adobe.com
+mixamo.com
+chatgpt.com
+openrouter.ai

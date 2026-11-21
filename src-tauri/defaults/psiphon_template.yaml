@@ -1,0 +1,53 @@
+# Шаблон Psiphon-канала DPI GUI (PRP 20.11.26 «Три бесплатных канала»).
+# ПУБЛИЧНЫЙ файл: едет в бандле всем юзерам, СЕКРЕТОВ НЕ СОДЕРЖИТ —
+# плейсхолдеры __...__ подставляются из warp_account.json (masque-учётка).
+# Проверенная цепочка 20.11.26 (temp/psiphon_chain): aether --psiphon-only
+# --upstream http://127.0.0.1:<listener> --bind 127.0.0.1:<socks> → loc=DE,
+# yt204 0.5с; звено «listener mihomo с proxy: WARP» проверено отдельно (7911→warp=on).
+# Нюансы (НЕ УБИРАТЬ):
+#  - ДВА aether в одной папке не живут (datastore лочится) → cwd aether =
+#    AppData/psiphon/ (своя папка данных, переживает обновления);
+#  - masque-outbound БЕЗ dialer-proxy (напрямую; taxi у этого канала нет —
+#    проверенная цепочка была напрямую через masque);
+#  - udp: false у PSIPHON-socks: UDP через psiphon-socks не заявляем (v1 TCP-only);
+#  - remote-dns-resolve внутри masque-outbound — НУЖЕН (userspace L3-стек masque
+#    сам домены не резолвит; это НЕ AWG-квирка, тут наоборот);
+#  - aether-регион DE — константа v1 (AETHER_PSIPHON_* env можно добавить позже).
+mixed-port: __LISTEN_PORT__
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+external-controller: 127.0.0.1:__API_PORT__
+
+dns:
+  enable: true
+  enhanced-mode: redir-host
+  default-nameserver: [1.1.1.1, 8.8.8.8]
+  nameserver: [https://dns.google/dns-query, https://1.1.1.1/dns-query]
+
+listeners:
+  - name: psiphon-up
+    type: mixed
+    port: __LISTENER_PORT__
+    proxy: WARP
+
+proxies:
+  - name: "WARP"
+    type: masque
+    server: __SERVER__
+    port: 443
+    private-key: "__PRIVATE_KEY__"
+    public-key: __PUBLIC_KEY__
+    ip: __IP__
+    ipv6: __IPV6__
+    mtu: 1280
+    udp: true
+    network: h2
+    sni: consumer-masque.cloudflareclient.com
+    remote-dns-resolve: true
+    dns: [1.1.1.1, 8.8.8.8]
+  __PSIPHON_OUT__
+
+rules:
+  - MATCH,DIRECT

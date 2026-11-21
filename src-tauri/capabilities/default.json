@@ -39,11 +39,21 @@
     "allow-channel-status",
     "allow-channel-set",
     "allow-channel-fix-system",
+    "allow-routing-status",
+    "allow-routing-set-mode",
+    "allow-pac-set",
     "allow-paid-profiles-list",
     "allow-paid-profile-add",
     "allow-paid-profile-delete",
     "allow-wg-creds-status",
     "allow-wg-creds-import",
-    "allow-wg-creds-reset"
+    "allow-wg-creds-reset",
+    "allow-warp-setup",
+    "allow-warp-status",
+    "allow-awg-setup",
+    "allow-awg-status",
+    "allow-psiphon-status",
+    "allow-channel-test-one",
+    "allow-channel-test-all"
   ]
 }

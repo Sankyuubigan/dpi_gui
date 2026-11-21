@@ -11,12 +11,14 @@ if not exist "%PROJ%\src-tauri\tauri.conf.json" (
   exit /b 1
 )
 
-set "TOOLKIT=%TAURI_BUILD_TOOLKIT%"
-if "%TOOLKIT%"=="" set "TOOLKIT=%~dp0..\cross-app-plugins\tauri-build-toolkit\cli.cjs"
+set "TOOLKIT=%BUILD_TOOLKIT%"
+if "%TOOLKIT%"=="" set "TOOLKIT=%~dp0..\cross-app-plugins\rust-build-toolkit\cli.cjs"
+REM Fallback #2: the project itself lives INSIDE cross-app-plugins (plugin-*, updater-core, ...).
+if not exist "%TOOLKIT%" set "TOOLKIT=%~dp0..\rust-build-toolkit\cli.cjs"
 if not exist "%TOOLKIT%" (
   echo [ERROR] Tauri build toolkit not found: "%TOOLKIT%"
-  echo Set env TAURI_BUILD_TOOLKIT to the toolkit cli.cjs, or place the
-  echo toolkit folder at: cross-app-plugins\tauri-build-toolkit
+  echo Set env BUILD_TOOLKIT to the toolkit cli.cjs, or place the
+  echo toolkit folder at: cross-app-plugins\rust-build-toolkit
   pause
   exit /b 1
 )

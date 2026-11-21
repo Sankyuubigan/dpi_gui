@@ -61,6 +61,7 @@ fn resolve_args_core(
     game_filter: bool,
     lists_dir: &str,
     bin_dir: &str,
+    dpi_bypass: bool,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let game_ports = if game_filter { "1024-65535" } else { "12" };
 
@@ -82,6 +83,12 @@ fn resolve_args_core(
     let default_exclude_arg = format!("--hostlist-exclude={}/defaults/default-exclude.txt", lists_dir);
     let default_bypass_general_arg = format!("--hostlist={}/defaults/list-general.txt", lists_dir);
     let default_bypass_google_arg = format!("--hostlist={}/defaults/list-google.txt", lists_dir);
+    // Артефакт маршрутизации (Этап A, 19.11.26): домены, которые winws НЕ
+    // должен дизсинкить — channel-домены групп + домены активных нод канала
+    // (фейк ClientHello ломает прокси-туннель изнутри). Файл существует
+    // всегда (config.rs создаёт пустым), содержимое обновляет
+    // proxy_core::apply_channel_exclude при переключении канала/режимов.
+    let channel_exclude_arg = format!("--hostlist-exclude={}/defaults/channel-exclude.txt", lists_dir);
 
     for arg in parsed_args {
         // Мы жестко вырезаем логику IPSet, чтобы не зависеть от лишних файлов
@@ -89,10 +96,23 @@ fn resolve_args_core(
             skipped_args.push(arg);
             continue;
         }
+        // Этап A (группы маршрутизации): dpi-группа НЕ на winws → её hostlist-
+        // аргументы (юзерские list-general/list-google) пропускаем: обход не
+        // должен дизсинкить домены, ушедшие в канал или оставленные без обхода.
+        // Дефолтные аппенды к ним уходят вместе с ними (внутри этой же ветки).
+        if !dpi_bypass
+            && arg.starts_with("--hostlist=")
+            && (arg.contains("list-general.txt") || arg.contains("list-google.txt"))
+        {
+            skipped_args.push(arg);
+            continue;
+        }
         final_args.push(arg.clone());
-        // После каждого --hostlist-exclude пользователя добавляем дефолтный список исключений
+        // После каждого --hostlist-exclude пользователя добавляем дефолтный список
+        // исключений и артефакт маршрутизации (winws всегда исключает channel-домены).
         if arg.starts_with("--hostlist-exclude=") && arg.contains("list-exclude.txt") {
             final_args.push(default_exclude_arg.clone());
+            final_args.push(channel_exclude_arg.clone());
         }
         // После каждого --hostlist пользователя добавляем дефолтные списки обхода
         if arg.starts_with("--hostlist=") {
@@ -118,7 +138,23 @@ fn resolve_args(app: &AppHandle, raw_args_template: &str, game_filter: bool, qui
     let lists_dir = app_dir.join("lists").to_string_lossy().replace("\\", "/");
     let bin_dir = get_bin_dir()?.to_string_lossy().replace("\\", "/");
 
-    let (final_args, skipped_args) = resolve_args_core(raw_args_template, game_filter, &lists_dir, &bin_dir)?;
+    // Этап A (группы маршрутизации): dpi-режим из routing.json. Ошибка чтения
+    // не блокирует старт обхода — честный лог, поведение прежнее (dpi на winws).
+    let dpi_bypass = match crate::routing::load_modes() {
+        Ok(m) => m.dpi_mode == crate::routing::DpiMode::Winws,
+        Err(e) => {
+            if !quiet {
+                let _ = app.emit(
+                    "log",
+                    format!("[ROUTING] routing.json не прочитан, dpi-группа остаётся на обходе: {}", e),
+                );
+            }
+            true
+        }
+    };
+
+    let (final_args, skipped_args) =
+        resolve_args_core(raw_args_template, game_filter, &lists_dir, &bin_dir, dpi_bypass)?;
 
     if !quiet {
         for arg in &skipped_args {
@@ -346,7 +382,8 @@ mod tests {
             .find(|p| p["name"] == name)
             .unwrap_or_else(|| panic!("профиль «{}» не найден в profiles_default.json", name));
         let args = p["args"].as_str().expect("args — строка");
-        resolve_args_core(args, game_filter, "C:/fake/lists", "C:/fake/bin").expect("resolve без ошибок")
+        resolve_args_core(args, game_filter, "C:/fake/lists", "C:/fake/bin", true)
+            .expect("resolve без ошибок")
     }
 
     /// Общий инвариант корпуса (PRP §5.4): после resolve_args_core у профиля
@@ -429,6 +466,39 @@ mod tests {
     }
 
     #[test]
+    fn dpi_off_channel_skips_general_and_google_appends_channel_exclude() {
+        // Этап A (группы маршрутизации, 19.11.26): dpi-группа НЕ на winws →
+        // юзерские hostlist-аргументы list-general/list-google вырезаются
+        // вместе со своими дефолт-аппендами, артефакт маршрутизации
+        // (channel-exclude) приписывается после каждого юзерского exclude.
+        let (final_args, skipped) = resolve_args_core(
+            "--hostlist={LISTS_DIR}/list-general.txt --hostlist={LISTS_DIR}/list-google.txt --hostlist-exclude={EXCLUDE_DIR}/list-exclude.txt --dpi-desync=fake,disorder2",
+            false,
+            "C:/fake/lists",
+            "C:/fake/bin",
+            false,
+        )
+        .expect("resolve без ошибок");
+        let joined = final_args.join("\u{1}");
+        assert!(
+            !joined.contains("list-general.txt"),
+            "dpi-список general вырезан при dpi≠winws: {}", joined
+        );
+        assert!(
+            !joined.contains("list-google.txt"),
+            "dpi-список google вырезан при dpi≠winws: {}", joined
+        );
+        assert!(
+            joined.contains("--hostlist-exclude=C:/fake/lists/defaults/channel-exclude.txt"),
+            "артефакт маршрутизации приписан после юзерского exclude: {}", joined
+        );
+        assert!(
+            skipped.iter().any(|a| a.contains("list-general.txt")),
+            "вырезанный аргумент попал в skipped (виден в логе): {:?}", skipped
+        );
+    }
+
+    #[test]
     fn alt13_and_fake_tls_auto_alt3_resolve_clean() {
         for name in ["1.10.4 - General (ALT13)", "1.10.4 - General (FAKE TLS AUTO ALT3)"] {
             let (final_args, skipped) = resolve(name, true);
@@ -445,8 +515,9 @@ mod tests {
         for p in &profiles {
             let name = p["name"].as_str().unwrap_or("?");
             let args = p["args"].as_str().expect("args строка");
-            let (final_args, _) = resolve_args_core(args, true, "C:/fake/lists", "C:/fake/bin")
-                .unwrap_or_else(|e| panic!("{}: resolve упал: {}", name, e));
+            let (final_args, _) =
+                resolve_args_core(args, true, "C:/fake/lists", "C:/fake/bin", true)
+                    .unwrap_or_else(|e| panic!("{}: resolve упал: {}", name, e));
             let joined = final_args.join("\u{1}");
             assert!(!joined.contains('{'), "{}: остались плейсхолдеры", name);
         }
@@ -464,7 +535,7 @@ mod tests {
                 let name = p["name"].as_str().unwrap_or("?");
                 let args = p["args"].as_str().expect("args строка");
                 let (final_args, _) =
-                    resolve_args_core(args, game_filter, "C:/fake/lists", "C:/fake/bin")
+                    resolve_args_core(args, game_filter, "C:/fake/lists", "C:/fake/bin", true)
                         .unwrap_or_else(|e| panic!("{} (gf={}): resolve упал: {}", name, game_filter, e));
                 for arg in &final_args {
                     if !arg.contains(".bin") {

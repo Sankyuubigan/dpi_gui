@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-routing-set-mode"
+description = "Enables the routing_set_mode command without any pre-configured scope."
+commands.allow = ["routing_set_mode"]
+
+[[permission]]
+identifier = "deny-routing-set-mode"
+description = "Denies the routing_set_mode command without any pre-configured scope."
+commands.deny = ["routing_set_mode"]

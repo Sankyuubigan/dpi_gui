@@ -168,9 +168,24 @@ pub fn ensure_directories_and_files() -> Result<(), std::io::Error> {
         ("list-google.txt", include_str!("../defaults/list-google.txt")),
         ("default-exclude.txt", include_str!("../defaults/default-exclude.txt")),
         ("doh-services.txt", include_str!("../defaults/doh-services.txt")),
+        ("geo-list.txt", include_str!("../defaults/geo-list.txt")),
     ];
     for (filename, content) in default_files {
         fs::write(defaults_dir.join(filename), content)?;
+    }
+
+    // channel-exclude.txt — ГЕНЕРИРУЕМЫЙ файл (routing.rs при переключении
+    // канала/режимов): создаём пустым, но НЕ перезаписываем при каждом
+    // запуске. winws требует существования файла hostlist при старте.
+    let chan_excl = defaults_dir.join("channel-exclude.txt");
+    if !chan_excl.exists() {
+        fs::write(&chan_excl, "# Генерируется routing.rs — НЕ РЕДАКТИРОВАТЬ.\n")?;
+    }
+
+    // geo-custom.txt — юзерские дополнения geo-группы («Управление списками»).
+    let geo_custom = lists_dir.join("geo-custom.txt");
+    if !geo_custom.exists() {
+        fs::write(&geo_custom, "# Домены гео-группы (дополнение к системному geo-list.txt)\n")?;
     }
 
     // Миграция со старых мест дефолтов (версии до папки defaults/):
@@ -293,6 +308,9 @@ pub fn open_file_in_editor(file_type: &str) -> Result<(), std::io::Error> {
     let path = match file_type {
         "list_general" => app_dir.join("lists").join("list-general.txt"),
         "list_exclude" => app_dir.join("lists").join("list-exclude.txt"),
+        // Гео-группа (Этап A 19.11.26): юзерские дополнения к системному
+        // geo-list.txt (движок: routing::geo_domains).
+        "geo_custom" => app_dir.join("lists").join("geo-custom.txt"),
         "profiles" => app_dir.join("profiles.json"),
         "doh_services" => defaults_dir().join("doh-services.txt"),
         "hosts" => crate::hosts::hosts_path(),

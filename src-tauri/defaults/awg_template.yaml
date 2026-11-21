@@ -1,0 +1,44 @@
+# Шаблон AWG-канала DPI GUI (PRP 20.11.26 «Три бесплатных канала»).
+# ПУБЛИЧНЫЙ файл: едет в бандле всем юзерам, СЕКРЕТОВ НЕ СОДЕРЖИТ —
+# плейсхолдеры __...__ подставляются из awg_account.json (регистрация warpscout,
+# 1 клик) и списком эндпоинтов (AppData скан или bundled шортлист).
+# Проверено живьём 20.11.26 (temp/proton_test/awg_hel.yaml, порт 7908):
+# youtube 204/0.2s, 10MB 15-18 МБ/с в вечерний пик, colo=HEL, loc=RU.
+# Нюансы (ломают канал, НЕ УБИРАТЬ):
+#  - i1 — ШАБЛОН-НОТАЦИЯ warpscout <b 0x..><r N>: mihomo v1.19.34 (amnezia
+#    device_v1) парсит i1 только как junk-генератор через ParseTagJunkGenerator;
+#    голый hex mihomo отвергает («IPC error -22: invalid i1: empty input»);
+#  - НЕ добавлять remote-dns-resolve/dns ВНУТРЬ wireguard-outbound: userspace
+#    L3-стек AWG домены сам не резолвит (проверено 20.11: dns resolve failed
+#    на все домены); warpscout-шаблон это поле несёт — генератор его не копирует;
+#  - DoH только top-level: голый udp 8.8.8.8:53 от Дом.ру травит ютуб-домены
+#    (мгновенные отказы, проверено 20.11);
+#  - allowed-ips 0.0.0.0/0 на пирах, keepalive 25 — как в проверенном конфиге.
+#  Хвост rules дописывает generate_awg_config из компилятора групп
+#  (routing.rs, Этап A): селективно — channel-домены → AWG WARP, остальное DIRECT.
+mixed-port: 7897
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+external-controller: 127.0.0.1:9097
+
+dns:
+  enable: true
+  enhanced-mode: redir-host
+  default-nameserver: [1.1.1.1, 8.8.8.8]
+  nameserver: [https://dns.google/dns-query, https://1.1.1.1/dns-query]
+
+proxies:
+__PROXIES_BLOCK__
+
+proxy-groups:
+  - name: "AWG WARP"
+    type: fallback
+    url: https://www.cloudflare.com/cdn-cgi/trace
+    interval: 300
+    proxies: __GROUP_MEMBERS__
+
+rules:
+  - DOMAIN,www.cloudflare.com,AWG WARP
+  - MATCH,AWG WARP
