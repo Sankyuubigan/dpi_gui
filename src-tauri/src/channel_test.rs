@@ -877,6 +877,20 @@ mod live {
         }
     }
 
+    /// Число процессов с данным именем (tasklist). Для дельта-проверок дерева:
+    /// боевая psiphon-сессия во время теста не должна давать ложный красный.
+    fn count_proc(image: &str) -> usize {
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("IMAGENAME eq {}", image)])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .expect("tasklist");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains(image))
+            .count()
+    }
+
     #[test]
     #[ignore]
     fn live_stand_psiphon_aether_from_runtime_and_tree_killed() {
@@ -885,9 +899,58 @@ mod live {
         // исполнялись из release/bin/pt/ и валили сборку релиза os error 32.
         // Проверяем оба фикса сразу: (1) aether стартует из AppData/runtime
         // (runtime_aether — бандл/папка сборки не лочится), (2) после гашения
-        // стенда дерево мёртво (Job Object kill-on-close). ВАЖНО: боевая
-        // psiphon-сессия во время теста даст ложный красный (tasklist видит
-        // и её psiphon-tunnel-core) — гаси канал перед запуском.
+        // стенда дерево мёртво (Job Object kill-on-close). Боевая psiphon-сессия
+        // не мешает: считаем ДЕЛЬТУ (до спавна/после гашения), а не абсолютный
+        // ноль — её psiphon-tunnel-core в проверку не попадает (автоматизация
+        // замера гоняет тест без присмотра, гасить ради неё канал нельзя).
+        let p = combat_config_path("__psiphon__")
+            .expect("путь psiphon-профиля")
+            .expect("psiphon-профиль есть");
+        let combat_text = std::fs::read_to_string(&p).expect("прочитать профиль");
+        let cfg = write_test_config("__psiphon__", &combat_text).expect("тест-конфиг");
+        let mut child = spawn_test_mihomo(&cfg).expect("тестовый mihomo");
+        wait_port(TEST_MIXED_PORT, &mut child, PORT_WAIT).expect("порт 7920");
+        let before = count_proc("psiphon-tunnel-core.exe");
+        let cwd = config::get_app_dir().join("psiphon_test");
+        let aether = crate::psiphon::spawn_aether(
+            &format!("http://127.0.0.1:{}", TEST_LISTENER_PORT),
+            TEST_AETHER_SOCKS_PORT,
+            &cwd,
+            &cwd.join("aether.log"),
+        )
+        .expect("aether из runtime-копии не поднялся");
+        crate::psiphon::wait_socks(TEST_AETHER_SOCKS_PORT, AETHER_WAIT)
+            .expect("socks 10828 не поднялся — aether из runtime-копии не нашёл своё pt/-окружение?");
+        assert!(process::runtime_dir().join("aether.exe").exists(), "runtime-копия aether не создана");
+        let warm = warmup_channel(TEST_MIXED_PORT);
+        eprintln!("[live] psiphon runtime: прогрев={}", warm.detail);
+        // Гасим стенд: TreeChild::drop = kill_tree → НАШИ дети умирают (дельта).
+        drop(aether);
+        let dl = Instant::now() + Duration::from_secs(5);
+        loop {
+            let now = count_proc("psiphon-tunnel-core.exe");
+            if now <= before {
+                break;
+            }
+            assert!(
+                Instant::now() < dl,
+                "сироты psiphon-tunnel-core пережили kill_tree (до спавна {}, осталось {})",
+                before, now
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        drop(child);
+    }
+
+    #[test]
+    #[ignore]
+    fn live_stand_psiphon_channel_probes_pass() {
+        // §9-замер psiphon (добавлен 23.11 после вопроса юзера «а че сифона
+        // нет в замере»): полный прогон проб через стенд — aether из runtime-
+        // копий, upstream = тестовый WARP-masque listener (та же цепочка, что
+        // у test_channel/боевого канала). ЖИВОСТЬ не ассертим: psiphon
+        // наследует живость masque (§9) — мёртвый masque честно даёт фейлы
+        // проб в [live], это данные вердикта, а не регрессия стенда.
         let p = combat_config_path("__psiphon__")
             .expect("путь psiphon-профиля")
             .expect("psiphon-профиль есть");
@@ -904,26 +967,23 @@ mod live {
         )
         .expect("aether из runtime-копии не поднялся");
         crate::psiphon::wait_socks(TEST_AETHER_SOCKS_PORT, AETHER_WAIT)
-            .expect("socks 10828 не поднялся — aether из runtime-копии не нашёл своё pt/-окружение?");
-        assert!(process::runtime_dir().join("aether.exe").exists(), "runtime-копия aether не создана");
-        let warm = warmup_channel(TEST_MIXED_PORT);
-        eprintln!("[live] psiphon runtime: прогрев={}", warm.detail);
-        // Гасим стенд: TreeChild::drop = kill_tree → сирот быть не должно.
-        drop(aether);
-        let dl = Instant::now() + Duration::from_secs(5);
-        loop {
-            let out = Command::new("tasklist")
-                .args(["/FI", "IMAGENAME eq psiphon-tunnel-core.exe"])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()
-                .expect("tasklist");
-            let s = String::from_utf8_lossy(&out.stdout);
-            if !s.contains("psiphon-tunnel-core.exe") {
-                break;
-            }
-            assert!(Instant::now() < dl, "сироты psiphon-tunnel-core пережили kill_tree");
-            std::thread::sleep(Duration::from_millis(300));
-        }
+            .expect("socks 10828 не поднялся");
+        let warmup = warmup_channel(TEST_MIXED_PORT);
+        let youtube = probe_youtube(TEST_MIXED_PORT);
+        let media = probe_media(TEST_MIXED_PORT);
+        let geo = probe_geo(TEST_MIXED_PORT);
+        let (country, _cp) = probe_country(TEST_MIXED_PORT);
+        let speed = probe_speed(TEST_MIXED_PORT);
+        eprintln!(
+            "[live] «__psiphon__»: прогрев={}; ютуб={}; медиа={}; гео={}; страна={:?}; скорость={}",
+            warmup.detail, youtube.detail, media.detail, geo.detail, country, speed.detail
+        );
+        assert!(
+            !warmup.detail.contains("закрылся после старта"),
+            "РЕГРЕССИЯ СКОУПА child: тестовый mihomo умер до проб ({})",
+            warmup.detail
+        );
+        drop(aether); // TreeChild::drop = kill_tree — сирот не остаётся
         drop(child);
     }
 }
