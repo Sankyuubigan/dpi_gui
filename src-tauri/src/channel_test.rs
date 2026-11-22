@@ -9,8 +9,12 @@
 //! - тест НЕ трогает активный канал: он тестируется на своём боевом порту
 //!   7897, остальные — тестовым mihomo на 7920 (REST 9120): 7898/9099 заняты
 //!   оракулом/экспериментами (комментарий у PAC_PORT в routing.rs);
-//! - тестовые процессы гасятся ПО PID (KillOnDrop) — kill по имени убил бы
-//!   и боевой mihomo;
+//! - тестовые процессы гасятся по PID (KillOnDrop у mihomo — kill по имени
+//!   убил бы и боевой движок) или деревом (TreeChild/Job Object у aether —
+//!   его дети psiphon-tunnel-core/lyrebird);
+//! - тестовые процессы исполняются из runtime-копий (process::runtime_file),
+//!   не из бандла/папки сборки: живой тест лочил release/bin/mihomo.exe и
+//!   валил сборку релиза os error 32 (инцидент 22.11.26);
 //! - каждая проба — реальный HTTP; эвристики запрещены (AGENTS.md §7),
 //!   ошибка показывается как есть, без «считаем что ок»;
 //! - тест = «работает СЕЙЧАС», не «стабильность 24/7» (§9 — суточный прогон);
@@ -39,7 +43,6 @@ const TEST_LISTENER_PORT: u16 = 7921;
 const TEST_AETHER_SOCKS_PORT: u16 = 10828;
 
 const MIHOMO_EXE: &str = "mihomo.exe";
-const AETHER_EXE: &str = "aether.exe";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const PORT_WAIT: Duration = Duration::from_secs(12);
@@ -229,11 +232,9 @@ fn prepend_echo_rules(yaml_text: &str) -> Result<String, String> {
 /// Тестовый mihomo: cwd/`-d` = proxy_dir (провайдеры резолвятся как в бою),
 /// stdout/stderr в лог-файл (там причина, если порт не поднялся).
 fn spawn_test_mihomo(cfg: &PathBuf) -> Result<KillOnDrop, String> {
-    let bin_dir = process::get_bin_dir()?;
-    let mihomo = bin_dir.join(MIHOMO_EXE);
-    if !mihomo.exists() {
-        return Err(format!("mihomo.exe не найден в {} — движок не собран в бандл", bin_dir.display()));
-    }
+    // Runtime-копия: тест не лочит exe в бандле/папке сборки — замер в
+    // 21:00 держал release/bin/mihomo.exe и валил сборку юзера (22.11.26).
+    let mihomo = process::runtime_file(MIHOMO_EXE)?;
     let work_dir = proxy_core::proxy_dir();
     let log = test_dir().join("mihomo_test.log");
     let out = std::fs::File::create(&log)
@@ -532,12 +533,17 @@ pub fn test_channel(app: &AppHandle, id: &str) -> Result<Value, String> {
         .unwrap_or(id)
         .to_string();
 
-    let active = reg["active"].as_str().unwrap_or("") == id;
+    // «Активный» = включён ПРЯМО СЕЙЧАС (живой CHANNEL.mode), а не «последний
+    // выбранный» из persisted-реестра: после рестарта приложения движок не
+    // поднят, реестр всё ещё помечал канал активным — тест шёл на боевой порт
+    // и ложно отдавал «МЁРТВ» (инцидент 22.11.26). Неактивный канал тестируется
+    // на стенде, как все остальные.
+    let active = proxy_core::channel_mode() == id;
     let port = if active { proxy_core::PROXY_PORT } else { TEST_MIXED_PORT };
     emit_log(app, format!("[Тест каналов] «{}»: старт{}...", name,
         if active { " (активный, боевой порт)" } else { " (тестовый стенд)" }));
 
-    let mut aether_child: Option<KillOnDrop> = None;
+    let mut aether_child: Option<crate::win_job::TreeChild> = None;
     // Тестовый mihomo должен жить ВСЮ test_channel (до конца функции). До
     // 21.11.26 `child` был локальной переменной if-блока ниже: блок кончался
     // раньше проб, KillOnDrop убивал процесс, и все пробы ловили os error
@@ -560,23 +566,14 @@ pub fn test_channel(app: &AppHandle, id: &str) -> Result<Value, String> {
         wait_port(port, &mut c, PORT_WAIT)?;
         // Psiphon-стенд: aether (upstream = тестовый WARP-listener mihomo).
         if id == "__psiphon__" {
-            let bin_dir = process::get_bin_dir()?;
-            let aether_path = bin_dir.join(AETHER_EXE);
-            if !aether_path.exists() {
-                return Err(format!(
-                    "aether.exe не найден в {} — sidecar Psiphon не собран в бандл",
-                    bin_dir.display()
-                ));
-            }
             let cwd = config::get_app_dir().join("psiphon_test");
             let aether_proc = crate::psiphon::spawn_aether(
-                &aether_path,
                 &format!("http://127.0.0.1:{}", TEST_LISTENER_PORT),
                 TEST_AETHER_SOCKS_PORT,
                 &cwd,
                 &cwd.join("aether.log"),
             )?;
-            aether_child = Some(KillOnDrop(aether_proc));
+            aether_child = Some(aether_proc);
             crate::psiphon::wait_socks(TEST_AETHER_SOCKS_PORT, AETHER_WAIT)
                 .map_err(|e| format!("psiphon-стенд не поднялся при тесте: {}", e))?;
         }
@@ -585,9 +582,17 @@ pub fn test_channel(app: &AppHandle, id: &str) -> Result<Value, String> {
         // успехе живёт до конца test_channel — пробы идут по живому порту.
         child = Some(c);
     } else if !proxy_core::port_alive(port) {
+        // Честный статус, не «МЁРТВ»: канал включён в приложении, но движок
+        // не отвечает — канал не тестировался вообще. Раньше этот ранний
+        // выход не логировался (в dpi_gui.log не было ни строчки) и вёлся
+        // в итог как мёртвый канал — юзер читал «платная не пашет».
+        emit_log(app, format!(
+            "[Тест каналов] «{}»: ⚪ НЕ ЗАПУЩЕН — канал включён, но боевой mihomo не отвечает (упал? выключили извне?)",
+            name
+        ));
         return Ok(json!({
-            "id": id, "name": name, "status": "dead", "active": true, "port": port,
-            "note": "боевой mihomo не запущен — канал выключен в приложении?",
+            "id": id, "name": name, "status": "not_running", "active": true, "port": port,
+            "note": "боевой mihomo не отвечает — выключи и включи канал заново, потом перетестируй",
             "elapsed": 0
         }));
     }
@@ -870,5 +875,55 @@ mod live {
             let s = run_stand(id).unwrap_or_else(|e| panic!("стенд {}: {}", id, e));
             assert_stand_alive(&s);
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn live_stand_psiphon_aether_from_runtime_and_tree_killed() {
+        // Инцидент 22.11.26: aether-дети (psiphon-tunnel-core) переживали
+        // гашение канала (kill() родителя на Windows не гасит дерево),
+        // исполнялись из release/bin/pt/ и валили сборку релиза os error 32.
+        // Проверяем оба фикса сразу: (1) aether стартует из AppData/runtime
+        // (runtime_aether — бандл/папка сборки не лочится), (2) после гашения
+        // стенда дерево мёртво (Job Object kill-on-close). ВАЖНО: боевая
+        // psiphon-сессия во время теста даст ложный красный (tasklist видит
+        // и её psiphon-tunnel-core) — гаси канал перед запуском.
+        let p = combat_config_path("__psiphon__")
+            .expect("путь psiphon-профиля")
+            .expect("psiphon-профиль есть");
+        let combat_text = std::fs::read_to_string(&p).expect("прочитать профиль");
+        let cfg = write_test_config("__psiphon__", &combat_text).expect("тест-конфиг");
+        let mut child = spawn_test_mihomo(&cfg).expect("тестовый mihomo");
+        wait_port(TEST_MIXED_PORT, &mut child, PORT_WAIT).expect("порт 7920");
+        let cwd = config::get_app_dir().join("psiphon_test");
+        let aether = crate::psiphon::spawn_aether(
+            &format!("http://127.0.0.1:{}", TEST_LISTENER_PORT),
+            TEST_AETHER_SOCKS_PORT,
+            &cwd,
+            &cwd.join("aether.log"),
+        )
+        .expect("aether из runtime-копии не поднялся");
+        crate::psiphon::wait_socks(TEST_AETHER_SOCKS_PORT, AETHER_WAIT)
+            .expect("socks 10828 не поднялся — aether из runtime-копии не нашёл своё pt/-окружение?");
+        assert!(process::runtime_dir().join("aether.exe").exists(), "runtime-копия aether не создана");
+        let warm = warmup_channel(TEST_MIXED_PORT);
+        eprintln!("[live] psiphon runtime: прогрев={}", warm.detail);
+        // Гасим стенд: TreeChild::drop = kill_tree → сирот быть не должно.
+        drop(aether);
+        let dl = Instant::now() + Duration::from_secs(5);
+        loop {
+            let out = Command::new("tasklist")
+                .args(["/FI", "IMAGENAME eq psiphon-tunnel-core.exe"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .expect("tasklist");
+            let s = String::from_utf8_lossy(&out.stdout);
+            if !s.contains("psiphon-tunnel-core.exe") {
+                break;
+            }
+            assert!(Instant::now() < dl, "сироты psiphon-tunnel-core пережили kill_tree");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        drop(child);
     }
 }

@@ -23,11 +23,13 @@
 - **Честность статуса обхода (не возвращай фолбэк-ложь):** `is_winws_running()` в `process.rs` отвечает «активен» ТОЛЬКО при живом процессе `winws.exe` (точное совпадение имени). Служба WinDivert может пережить смерть winws (падение/убитое приложение), но загруженный драйвер сам ничего не обходит — никогда не считай её признаком активности, иначе после перезапуска UI лжёт зелёным «ПРОЦЕСС АКТИВЕН» на мёртвом обходе (баг 25.10.26). Остаточную службу при старте выгружает `cleanup_stale_windivert()` из `init_app`.
 
 ## 4. Файловая система и Данные
-### 4.1 Бандл (`bin/`)
+### 4.1 Бандл (`bin/`) и runtime-копии (`AppData/Local/DPI_GUI/runtime/`)
 В установочную директорию (в `Program Files/DPI_GUI/bin/`) копируются **исполняемые** файлы:
-- `winws.exe`
-- `WinDivert64.sys` и `WinDivert.dll`
-- Фейки: `quic_*.bin`, `tls_*.bin`.
+- `winws.exe`, `WinDivert64.sys`, `WinDivert.dll`
+- Фейки: `quic_*.bin`, `tls_*.bin`
+- `aether.exe` + `cygwin1.dll` + `pt/` (psiphon-tunnel-core.exe, lyrebird.exe), `mihomo.exe`, `warpscout.exe`.
+
+**Runtime-копии (инцидент 22.11.26 — не откатывай):** бандл — только ИСТОЧНИК копий, не место работы. Все наши живые процессы (winws, mihomo, aether, warpscout, тест-стенд) исполняются из `AppData/Local/DPI_GUI/runtime/` (`process::runtime_file(rel)` копирует из бандла при отличии размера/mtime; fs::copy переносит mtime — сравнение дат работает; `runtime_winws()` кладёт winws.exe+WinDivert64.sys+WinDivert.dll рядом — DLL грузит драйвер из своей папки; `psiphon::runtime_aether()` — aether.exe+cygwin1.dll+pt/ рядом — aether ищет pt/ относительно своего exe). Любой процесс, исполняющий файлы из бандла/папки сборки, лочит их → обновление/пересборка падают os error 32 (три инцидента 22.11.26). Дерево aether гасится Job Object'ом (`win_job.rs` TreeChild, kill-on-close — kill() родителя на Windows оставлял сирот psiphon-tunnel-core из release/bin/pt/); сироты прошлых сессий выгружаются при старте (`psiphon::cleanup_stale_sidecar` в init_app). При обновлении runtime-копия перезаписывается сама при следующем спавне.
 
 ### 4.2 Пользовательские данные (`AppData/Local/DPI_GUI/`)
 Списки и настройки хранятся в защищённом каталоге профиля пользователя, чтобы они пережили обновление версии. Путь задаёт `config::get_app_dir()` через `dirs::data_local_dir()` — именно **Local**, не Roaming (реальная папка проверена 27.10.26; не меняй на Roaming):

@@ -13,7 +13,7 @@ use std::fs::OpenOptions;
 use std::net::TcpStream;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 use serde_json::{json, Value};
@@ -22,6 +22,7 @@ use tauri::{AppHandle, Emitter};
 use crate::config;
 use crate::process;
 use crate::proxy_core;
+use crate::win_job::TreeChild;
 
 const AETHER_EXE: &str = "aether.exe";
 /// Внутренний listener (→ WARP masque outbound): через него aether ходит в интернет.
@@ -41,7 +42,7 @@ pub const BOOT_API_PORT: u16 = 9110;
 pub const BOOT_LISTENER_PORT: u16 = 7911;
 pub const BOOT_SOCKS_PORT: u16 = 10819;
 
-static CHILD: Mutex<Option<Child>> = Mutex::new(None);
+static CHILD: Mutex<Option<TreeChild>> = Mutex::new(None);
 
 fn emit_log(app: &AppHandle, msg: String) {
     let _ = app.emit("log", msg);
@@ -153,25 +154,40 @@ pub fn validate_psiphon_config() -> Result<PathBuf, String> {
     let path = profile_path();
     let text = std::fs::read_to_string(&path)
         .map_err(|_| format!("Нет psiphon-профиля {} — сгенерируй конфиг канала", path.display()))?;
-    if !text.contains(&format!("mixed-port: {}", proxy_core::PROXY_PORT)) {
+    check_psiphon_text(&path.display().to_string(), &text)?;
+    Ok(path)
+}
+
+/// Все проверки — только по реальному YAML: полные строки-комментарии
+/// отрезаются перед contains, иначе contains("__") ловит доку шаблона
+/// («плейсхолдеры __...__ подставляются из warp_account.json») и каждый
+/// свежий профиль гарантированно проваливает — инцидент 22.11.26, второй
+/// случай того же класса после awg (awg_config.rs::check_awg_text).
+fn check_psiphon_text(display: &str, text: &str) -> Result<(), String> {
+    let code = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !code.contains(&format!("mixed-port: {}", proxy_core::PROXY_PORT)) {
         return Err(format!(
             "{}: ожидался mixed-port: {} — файл не тот?",
-            path.display(),
+            display,
             proxy_core::PROXY_PORT
         ));
     }
     for marker in ["type: masque", "type: socks5", "listeners:", "proxy: WARP"] {
-        if !text.contains(marker) {
-            return Err(format!("{}: нет маркера «{}» — конфиг не psiphon-профиля", path.display(), marker));
+        if !code.contains(marker) {
+            return Err(format!("{}: нет маркера «{}» — конфиг не psiphon-профиля", display, marker));
         }
-   }
-    if text.contains("__") {
+    }
+    if code.contains("__") {
         return Err(format!(
             "{}: остались плейсхолдеры — учётка подставилась не полностью",
-            path.display()
+            display
         ));
     }
-    Ok(path)
+    Ok(())
 }
 
 // ---------- Sidecar ----------
@@ -184,22 +200,24 @@ fn socks_alive(port: u16) -> bool {
     }
 }
 
+/// Runtime-копия aether и его окружения: cygwin1.dll рядом (cygwin-бинд),
+/// pt/ рядом (aether ищет psiphon-tunnel-core/lyrebird относительно своего
+/// exe — раскладка бандла воспроизводится в runtime-папке). Живой aether не
+/// лочит файлы бандла/папки сборки (инцидент 22.11.26, os error 32).
+pub(crate) fn runtime_aether() -> Result<PathBuf, String> {
+    for rel in [AETHER_EXE, "cygwin1.dll", "pt/psiphon-tunnel-core.exe", "pt/lyrebird.exe"] {
+        process::runtime_file(rel)?;
+    }
+    Ok(process::runtime_dir().join(AETHER_EXE))
+}
+
 /// Старт aether для боевого канала: спавн (cwd = своя папка данных) + ожидание
 /// готовности socks-порта (до 40с — datastore/транспорт Psiphon греются ~15с).
 pub fn start_sidecar(app: &AppHandle) -> Result<(), String> {
-    let bin_dir = process::get_bin_dir()?;
-    let aether = bin_dir.join(AETHER_EXE);
-    if !aether.exists() {
-        return Err(format!(
-            "aether.exe не найден в {} — sidecar Psiphon не собран в бандл",
-            bin_dir.display()
-        ));
-    }
     stop_sidecar(); // страховка от дубля
     let cwd = sidecar_dir();
     std::fs::create_dir_all(&cwd).map_err(|e| format!("не создать {}: {}", cwd.display(), e))?;
     let child = spawn_aether(
-        &aether,
         &format!("http://127.0.0.1:{}", LISTENER_PORT),
         SOCKS_PORT,
         &cwd,
@@ -234,15 +252,19 @@ pub fn start_sidecar(app: &AppHandle) -> Result<(), String> {
 }
 
 /// Спавн aether: лог в файл (append), CREATE_NO_WINDOW, cwd = папка данных.
-/// Не ждёт готовности — готовность проверяет wait_socks отдельно.
+/// Экземпляр — runtime-копия (не бандл, см. runtime_aether). Ребёнок в Job
+/// Object (win_job.rs): kill_tree гасит и его потомков — kill() родителя на
+/// Windows оставлял сирот psiphon-tunnel-core, исполнявшихся из release/bin/
+/// pt/ и валивших сборку релиза (инцидент 22.11.26). Не ждёт готовности —
+/// готовность проверяет wait_socks отдельно.
 pub(crate) fn spawn_aether(
-    aether_path: &Path,
     upstream: &str,
     bind: u16,
     cwd: &Path,
     log: &Path,
-) -> Result<Child, String> {
+) -> Result<TreeChild, String> {
     std::fs::create_dir_all(cwd).map_err(|e| format!("не создать {}: {}", cwd.display(), e))?;
+    let aether_path = runtime_aether()?;
     let open_log = || {
         OpenOptions::new()
             .create(true)
@@ -252,8 +274,8 @@ pub(crate) fn spawn_aether(
     };
     let out = open_log()?;
     let err = open_log()?;
-    Command::new(aether_path)
-        .arg("--psiphon-only")
+    let mut cmd = Command::new(&aether_path);
+    cmd.arg("--psiphon-only")
         .arg("--upstream")
         .arg(upstream)
         .arg("--bind")
@@ -263,9 +285,8 @@ pub(crate) fn spawn_aether(
         .current_dir(cwd)
         .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
-        .spawn()
-        .map_err(|e| format!("Ошибка запуска {}: {}", aether_path.display(), e))
+        .stderr(Stdio::from(err));
+    TreeChild::spawn(&mut cmd)
 }
 
 /// Ожидание живого socks-порта (poll 500мс).
@@ -282,14 +303,31 @@ pub(crate) fn wait_socks(port: u16, timeout: Duration) -> Result<(), String> {
     }
 }
 
-/// Гасит sidecar aether (ветки channel_set и stop_channel зовут при переключении
-/// каналов/выходе — висячий aether держал бы datastore и канал-порты).
+/// Гасит sidecar aether ВМЕСТЕ С ДЕТЬМИ (Job Object, см. win_job.rs): ветки
+/// channel_set и stop_channel зовут при переключении каналов/выходе — раньше
+/// kill() оставлял сирот psiphon-tunnel-core, лочивших release/bin/pt/ при
+/// сборке релиза (os error 32, инцидент 22.11.26).
 pub fn stop_sidecar() {
     if let Ok(mut g) = CHILD.lock() {
         if let Some(mut c) = g.take() {
-            let _ = c.kill();
-            let _ = c.wait();
+            c.kill_tree();
         }
+    }
+}
+
+/// Подметание сирот прошлых сессий при старте приложения (аналог
+/// cleanup_stale_windivert): aether/psiphon-tunnel-core/lyrebird, пережившие
+/// смерть старой сборки без Job Object, исполнялись из bin/pt/ и валили
+/// сборку релиза. На текущей сборке сирот не возникает (kill-on-close в
+/// win_job.rs), но у машин, обновившихся со старой версии, хвосты остаются —
+/// чистим при каждом старте. К моменту вызова боевой канал ещё не поднят,
+/// своих процессов вида не бывает.
+pub fn cleanup_stale_sidecar() {
+    for exe in ["aether.exe", "psiphon-tunnel-core.exe", "lyrebird.exe"] {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", exe])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
     }
 }
 
@@ -303,4 +341,55 @@ pub fn psiphon_status_json() -> Value {
         "running": running,
         "ready": running && socks_alive(SOCKS_PORT),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Собранный из РЕАЛЬНОГО шаблона профиль с фиктивными значениями
+    // (секретов в тестах быть не должно; ключи-заглушки валидной длины b64).
+    // Инцидент 22.11.26: contains("__") по сырому тексту ловил доку шаблона
+    // («плейсхолдеры __...__ подставляются из warp_account.json», строка 3) —
+    // Psiphon-канал нельзя было включить даже с полностью подставленной учёткой.
+    fn assemble_psiphon_like(server: &str) -> String {
+        include_str!("../defaults/psiphon_template.yaml")
+            .replace("__LISTEN_PORT__", &proxy_core::PROXY_PORT.to_string())
+            .replace("__API_PORT__", &proxy_core::API_PORT.to_string())
+            .replace("__LISTENER_PORT__", &LISTENER_PORT.to_string())
+            .replace("__SERVER__", server)
+            .replace("__PRIVATE_KEY__", "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq=")
+            .replace("__PUBLIC_KEY__", "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=")
+            .replace("__IP__", "172.16.0.2")
+            .replace("__IPV6__", "2606:4700:1800::1")
+            .replace(
+                "__PSIPHON_OUT__",
+                &format!(
+                    "- name: \"PSIPHON\"\n    type: socks5\n    server: 127.0.0.1\n    port: {}\n    udp: false",
+                    SOCKS_PORT
+                ),
+            )
+    }
+
+    #[test]
+    fn test_check_psiphon_text_template_comment_does_not_fail() {
+        let text = assemble_psiphon_like("203.0.113.7");
+        check_psiphon_text("тест", &text)
+            .expect("дока-комментарии шаблона не должны валить валидацию psiphon");
+    }
+
+    #[test]
+    fn test_check_psiphon_text_catches_real_placeholder() {
+        let text = assemble_psiphon_like("__SERVER__");
+        let err = check_psiphon_text("тест", &text).unwrap_err();
+        assert!(err.contains("плейсхолдеры"), "ловим только РЕАЛЬНЫЙ плейсхолдер в коде: {}", err);
+    }
+
+    #[test]
+    fn test_check_psiphon_text_missing_marker() {
+        // Вырезали masque-outbound → нет маркера «type: masque»
+        let text = assemble_psiphon_like("203.0.113.7").replace("type: masque", "type: foo");
+        let err = check_psiphon_text("тест", &text).unwrap_err();
+        assert!(err.contains("type: masque"), "{}", err);
+    }
 }

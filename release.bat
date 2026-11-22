@@ -51,6 +51,19 @@ echo [WARNING] release.bat will build, sign, publish a GitHub release, bump vers
 echo           regenerate latest.json and commit/push version files. Run only from a
 echo           clean target branch.
 
+REM Processes left over from the build output lock its files and made the
+REM release fail with os error 32 (incidents 22.11.26): dpi_gui.exe left by
+REM the toolkit autostart, mihomo/aether of a running channel, aether's
+REM children (psiphon-tunnel-core, lyrebird). Kill them before building.
+REM NOTE: winws.exe is NOT killed on purpose - the DPI bypass may be in use;
+REM if the build still fails with os error 32 on winws.exe / WinDivert*,
+REM stop the bypass manually and run the release again.
+taskkill /F /IM dpi_gui.exe >nul 2>&1
+taskkill /F /IM mihomo.exe >nul 2>&1
+taskkill /F /IM aether.exe >nul 2>&1
+taskkill /F /IM psiphon-tunnel-core.exe >nul 2>&1
+taskkill /F /IM lyrebird.exe >nul 2>&1
+
 node "%TOOLKIT%" release --project "%PROJ%"
 if errorlevel 1 (
   echo [ERROR] Release failed.

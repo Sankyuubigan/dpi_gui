@@ -215,7 +215,17 @@ pub fn validate_pawg_config() -> Result<PathBuf, String> {
 }
 
 fn check_awg_text(display: &str, text: &str, with_proton: bool) -> Result<(), String> {
-    if !text.contains(&format!("mixed-port: {}", proxy_core::PROXY_PORT)) {
+    // Все проверки — только по реальному YAML: полные строки-комментарии
+    // отрезаются перед contains. Шаблон сам несёт доку-комментарий «НЕ
+    // добавлять remote-dns-resolve…» и «плейсхолдеры __...__» — contains по
+    // сырому тексту ловил собственную доку шаблона и гарантированно валил
+    // каждый свежий профиль (инцидент 22.11.26: awg/pawg невозможно включить).
+    let code = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !code.contains(&format!("mixed-port: {}", proxy_core::PROXY_PORT)) {
         return Err(format!(
             "{}: ожидался mixed-port: {} — файл не тот?",
             display,
@@ -223,17 +233,17 @@ fn check_awg_text(display: &str, text: &str, with_proton: bool) -> Result<(), St
         ));
     }
     for marker in ["type: wireguard", "amnezia-wg-option:", "i1: <b 0x"] {
-        if !text.contains(marker) {
+        if !code.contains(marker) {
             return Err(format!("{}: нет маркера «{}» — конфиг не AWG-профиля", display, marker));
         }
     }
-    if text.contains("remote-dns-resolve") {
+    if code.contains("remote-dns-resolve") {
         return Err(format!(
             "{}: remote-dns-resolve внутри AWG-outbound ломает канал (dns resolve failed) — перегенерируй конфиг",
             display
         ));
     }
-    if text.contains("__") {
+    if code.contains("__") {
         return Err(format!(
             "{}: остались плейсхолдеры — учётка/эндпоинты подставились не полностью",
             display
@@ -241,7 +251,7 @@ fn check_awg_text(display: &str, text: &str, with_proton: bool) -> Result<(), St
     }
     if with_proton {
         for marker in ["dialer-proxy: \"AWG WARP\"", "name: PROTON", "mtu: 1280"] {
-            if !text.contains(marker) {
+            if !code.contains(marker) {
                 return Err(format!("{}: нет маркера «{}» — PROTON-outbound не на месте", display, marker));
             }
         }
@@ -348,5 +358,39 @@ mod tests {
         let block = build_proxies_block(&eps, &dummy_account(), None).unwrap();
         assert!(block.contains("name: \"AWG 6\""));
         assert!(!block.contains("name: \"AWG 7\""));
+    }
+
+    // Собранный из РЕАЛЬНОГО шаблона профиль (с докой-комментарием «НЕ
+    // добавлять remote-dns-resolve…» и «плейсхолдеры __...__» в шапке)
+    // обязан проходить валидацию. Инцидент 22.11.26: contains по сырому
+    // тексту ловил эти комментарии и awg/pawg нельзя было включить.
+    fn assemble_pawg_like(block_tail: &str) -> String {
+        let eps = vec![String::from("8.39.125.77:4500")];
+        let mut block = build_proxies_block(&eps, &dummy_account(), Some(&dummy_creds())).unwrap();
+        block.push_str(block_tail);
+        include_str!("../defaults/awg_template.yaml")
+            .replace("__PROXIES_BLOCK__", &block)
+            .replace("__GROUP_MEMBERS__", &group_members(1))
+    }
+
+    #[test]
+    fn test_check_awg_text_template_comments_do_not_fail() {
+        let text = assemble_pawg_like("");
+        check_awg_text("тест", &text, true)
+            .expect("дока-комментарии шаблона не должны валить валидацию awg/pawg");
+    }
+
+    #[test]
+    fn test_check_awg_text_catches_real_remote_dns_resolve() {
+        let text = assemble_pawg_like("\n    remote-dns-resolve: true");
+        let err = check_awg_text("тест", &text, true).unwrap_err();
+        assert!(err.contains("remote-dns-resolve"), "ловим только РЕАЛЬНЫЙ ключ, не комментарий: {}", err);
+    }
+
+    #[test]
+    fn test_check_awg_text_catches_placeholder_in_code() {
+        let text = assemble_pawg_like("\n    private-key: __PRIVATE_KEY__");
+        let err = check_awg_text("тест", &text, true).unwrap_err();
+        assert!(err.contains("плейсхолдеры"), "{}", err);
     }
 }

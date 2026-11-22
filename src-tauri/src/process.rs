@@ -51,6 +51,66 @@ pub fn get_bin_dir() -> Result<PathBuf, String> {
     find_bin_dir_from(exe_dir, BIN_SEARCH_MAX_UP)
 }
 
+/// Исполняемые копии sidecar'ов: AppData/runtime. Живые процессы (winws,
+/// mihomo, aether) НЕ должны исполнять файлы из бандла/папки сборки — любой
+/// запущенный канал/обход лочит exe, и обновление/пересборка падают os error
+/// 32 (инцидент 22.11.26, три случая: замер тест-стенда из release/bin во
+/// время сборки юзера, dpi_gui от автозапуска тулкита, сироты
+/// psiphon-tunnel-core). Бандл — только источник копий, не место работы.
+pub fn runtime_dir() -> PathBuf {
+    config::get_app_dir().join("runtime")
+}
+
+/// Путь исполняемого файла из runtime-копии бандла (копируется при отличии
+/// размера или даты источника — приехала новая версия). fs::copy (CopyFileEx)
+/// переносит mtime источника, поэтому сравнение дат работает и после копии.
+pub fn runtime_file(rel: &str) -> Result<PathBuf, String> {
+    let src = get_bin_dir()?.join(rel);
+    if !src.exists() {
+        return Err(format!(
+            "{} не найден в {} — бандл неполный",
+            rel,
+            src.display()
+        ));
+    }
+    let dst = runtime_dir().join(rel);
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!("не создать runtime-папку {}: {}", parent.display(), e)
+        })?;
+    }
+    let stale = match (std::fs::metadata(&src), std::fs::metadata(&dst)) {
+        (Ok(s), Ok(d)) => {
+            s.len() != d.len()
+                || match (s.modified(), d.modified()) {
+                    (Ok(a), Ok(b)) => a > b,
+                    _ => true,
+                }
+        }
+        _ => true,
+    };
+    if stale {
+        std::fs::copy(&src, &dst).map_err(|e| {
+            format!(
+                "не обновить runtime-копию {} → {}: {} (старый процесс ещё держит файл — выключи канал/обход и повтори)",
+                src.display(),
+                dst.display(),
+                e
+            )
+        })?;
+    }
+    Ok(dst)
+}
+
+/// Runtime-копия winws одним набором: DLL грузит драйвер из своей папки —
+/// winws.exe, WinDivert64.sys и WinDivert.dll обязаны лежать рядом.
+pub fn runtime_winws() -> Result<PathBuf, String> {
+    for rel in [WINWS_EXE, "WinDivert64.sys", "WinDivert.dll"] {
+        runtime_file(rel)?;
+    }
+    Ok(runtime_dir().join(WINWS_EXE))
+}
+
 /// Чистое ядро resolve_args без AppHandle: плейсхолдеры → пути, ipset-аргументы
 /// вырезаются, после каждого пользовательского hostlist-аргумента дописывается
 /// дефолтный список. Возвращает итоговые аргументы и список вырезанных
@@ -168,18 +228,21 @@ fn resolve_args(app: &AppHandle, raw_args_template: &str, game_filter: bool, qui
 
 /// Собственно запуск winws с готовым списком аргументов.
 fn spawn_winws(app: &AppHandle, final_args: Vec<String>, quiet: bool) -> Result<String, String> {
-    // bin/ с winws.exe — единственный источник пути: find_bin_dir_from
-    // гарантирует наличие winws.exe, отдельная exists-проверка не нужна.
-    let bin_dir = get_bin_dir()?;
-    let winws_path = bin_dir.join(WINWS_EXE);
-
-    // Убиваем старый процесс перед запуском нового
+    // Убиваем старый процесс ДО обновления runtime-копии: живой обход держит
+    // WinDivert64.sys — копия в его момент упала бы с os error 32.
     let _ = stop_winws();
     let _ = app.emit("log", "Старые процессы остановлены. Запускаем новый...".to_string());
 
+    // Исполняется из runtime-копии (AppData/runtime), а не из бандла: живой
+    // обход не лочит winws.exe/WinDivert* — сборка/обновление не падают
+    // os error 32 (инцидент 22.11.26). Фейки в args — абсолютные пути
+    // (контракт resolve_args_core, тест corpus_fake_bin_paths_are_absolute),
+    // cwd на них не влияет.
+    let winws_path = runtime_winws()?;
+
     let mut child = Command::new(&winws_path)
         .args(&final_args)
-        .current_dir(bin_dir)
+        .current_dir(runtime_dir())
         .creation_flags(CREATE_NO_WINDOW) // Не показывать консоль!
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

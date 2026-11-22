@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Globe, Plus, Trash2, FileUp, KeyRound, RotateCcw, Loader2, CheckCircle2, Cloud, Shield, Radio,
-  FlaskConical,
+  FlaskConical, Skull, Youtube,
 } from "lucide-react";
 
 // ==== «Тест каналов»: стейт на уровне МОДУЛЯ (21.11.26) ====
@@ -36,6 +36,43 @@ const bindTestListener = async () => {
     });
   });
 };
+
+// Иконки статуса канала из ПОСЛЕДНЕГО теста (просьба юзера 22.11.26):
+// мёртв — череп, жив — иконки того, что реально прошло (ютуб / иностранные
+// сайты-гео); теста не было или канал не тестировался (not_running) — иконок
+// нет. Стейт результатов — модульный testCache: иконки честно показывают
+// «на момент последнего теста», после рестарта приложения честно пусто.
+function TestStatusIcons({ r }: { r: any }) {
+  if (!r || r.running) return null;
+  if (r.status === "dead" || r.status === "error") {
+    return (
+      <span
+        title="последний тест: канал МЁРТВ — ни одна проба не прошла"
+        className="inline-flex items-center"
+      >
+        <Skull size={15} className="text-red-600" />
+      </span>
+    );
+  }
+  if ((r.status === "ok" || r.status === "partial") && (r.youtube?.ok || r.geo?.ok)) {
+    return (
+      <span className="inline-flex items-center gap-0.5">
+        {r.youtube?.ok && (
+          <span title="последний тест: ютуб работает" className="inline-flex items-center">
+            <Youtube size={15} className="text-red-500" />
+          </span>
+        )}
+        {r.geo?.ok && (
+          <span title="последний тест: иностранные сайты открываются (гео-обход)" className="inline-flex items-center">
+            <Globe size={15} className="text-emerald-600" />
+          </span>
+        )}
+      </span>
+    );
+  }
+  // not_running / нет пройденных проб ютуб-гео — без иконки
+  return null;
+}
 
 /// Вкладка «Канал» (PRP 18.11.26, редизайн по требованию юзера): селектор
 /// каналов строится ИЗ РЕЕСТРА юзера (никаких хардкод-режимов; 21.11.26 —
@@ -145,7 +182,13 @@ export default function ChannelTab({
       for (const r of results) map[r.id] = r;
       testCacheSet({ results: map });
       const okCount = results.filter((r) => r.status === "ok").length;
-      logMsg(`Канал: тест завершён — РАБОТАЕТ: ${okCount} из ${results.length}.`);
+      const notRunCount = results.filter((r) => r.status === "not_running").length;
+      const testedCount = results.length - notRunCount;
+      logMsg(
+        `Канал: тест завершён — РАБОТАЕТ: ${okCount} из ${testedCount}` +
+          (notRunCount ? ` (не запущено: ${notRunCount})` : "") +
+          ".",
+      );
     } catch (e: any) {
       logMsg(`Канал: ошибка теста: ${e}`);
     } finally {
@@ -437,7 +480,7 @@ export default function ChannelTab({
                         : "Нет WireGuard-кредов — импортируй .conf в списке ниже"
                         : isWarp
                           ? hasWarpAccount
-                            ? "WARP-канал Cloudflare (MASQUE, TCP:443): geo-домены через туннель, остальное напрямую (банки видят RU-IP)"
+                            ? "WARP-канал Cloudflare (MASQUE, TCP:443): geo-домены через туннель, остальное напрямую (банки видят RU-IP). СТАБИЛЬНОСТЬ НЕ ПОДТВЕРЖДЕНА (§9) — резерв, флапает по времени суток"
                             : "Нет WARP-учётки — нажми «Зарегистрировать» в карточке ниже"
                           : isAwg
                             ? hasAwgAccount
@@ -454,7 +497,7 @@ export default function ChannelTab({
                                 : `Переключить канал на «${p.name}» (yaml-профиль)`
                   }
                   className={
-                    "px-4 py-2 rounded-md font-bold text-sm transition-colors border " +
+                    "inline-flex items-center gap-1.5 px-4 py-2 rounded-md font-bold text-sm transition-colors border " +
                     ((channelBusy || locked)
                       ? "border-gray-200 text-gray-400 cursor-not-allowed"
                       : active
@@ -470,6 +513,7 @@ export default function ChannelTab({
                         : "border-gray-300 text-gray-600 hover:bg-gray-50")
                   }
                 >
+                  <TestStatusIcons r={testResults[p.file]} />
                   {p.name}
                 </button>
               );
@@ -692,7 +736,7 @@ export default function ChannelTab({
                       <CheckCircle2 size={12} /> ВКЛЮЧЁН
                     </span>
                   )}
-                  {(isAwg || isPawg || isPsiphon) && (
+                  {(isWarp || isAwg || isPawg || isPsiphon) && (
                     <span className="text-xs text-amber-600" title="Канал ещё не прошёл суточную проверку стабильности (правило §9) — не включай его в ночь, когда нужен доступ">
                       ⚠ стабильность не подтверждена
                     </span>
@@ -775,6 +819,37 @@ export default function ChannelTab({
             Протестировать все каналы
           </button>
         </div>
+        {Object.keys(testResults).length > 0 && !testRunning && (() => {
+          // Сводка прогона — дублирует строку лога «тест завершён — РАБОТАЕТ: N из M»,
+          // но видна прямо на плашке (юзер не должен лезть в dpi_gui.log).
+          const vals = Object.values(testResults) as any[];
+          const ok = vals.filter((r: any) => r.status === "ok").length;
+          const partial = vals.filter((r: any) => r.status === "partial").length;
+          const dead = vals.filter((r: any) => r.status === "dead" || r.status === "error").length;
+          const notRun = vals.filter((r: any) => r.status === "not_running").length;
+          const tested = vals.length - notRun;
+          return (
+            <p
+              className={
+                "mt-3 text-sm font-bold " +
+                (tested === 0
+                  ? "text-gray-500"
+                  : ok === tested
+                    ? "text-green-700"
+                    : ok > 0
+                      ? "text-amber-700"
+                      : "text-red-600")
+              }
+            >
+              Итог: РАБОТАЕТ {ok} из {tested}
+              {partial > 0 ? ` · ⚠ ЧАСТИЧНО ${partial}` : ""}
+              {dead > 0 ? ` · ❌ МЁРТВ ${dead}` : ""}
+              {notRun > 0 ? ` · ⚪ НЕ ЗАПУЩЕН ${notRun}` : ""}
+              {tested === 0 ? " — ни один канал не был запущен, тестировать нечего" : ""}
+              {ok === 0 && tested > 0 ? " — ни один запущенный канал не прошёл пробы" : ""}
+            </p>
+          );
+        })()}
         {Object.keys(testResults).length > 0 && (
           <ul className="mt-3 divide-y divide-gray-100">
             {(registry.profiles ?? []).map((p: any) => {
@@ -785,7 +860,9 @@ export default function ChannelTab({
                   ? ["✅ РАБОТАЕТ", "bg-green-100 text-green-700"]
                   : r.status === "partial"
                     ? ["⚠ ЧАСТИЧНО", "bg-yellow-100 text-yellow-700"]
-                    : ["❌ МЁРТВ", "bg-red-100 text-red-700"];
+                    : r.status === "not_running"
+                      ? ["⚪ НЕ ЗАПУЩЕН", "bg-gray-100 text-gray-600"]
+                      : ["❌ МЁРТВ", "bg-red-100 text-red-700"];
               return (
                 <li key={p.file} className="py-2 text-sm flex items-center gap-2 flex-wrap">
                   <span className={`px-2 py-0.5 rounded font-bold text-xs ${cls}`}>{mark}</span>
@@ -835,7 +912,13 @@ export default function ChannelTab({
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-2">
             <Cloud size={18} className="text-indigo-500" />
-            <h3 className="font-bold text-gray-800">WARP (Cloudflare, бесплатно)</h3>
+            <h3 className="font-bold text-gray-800">WARP (Cloudflare, бесплатно, резерв)</h3>
+            <span
+              className="text-xs text-amber-600"
+              title="Канал ещё не прошёл суточную проверку стабильности (правило §9); живые пробы показывают флап по времени суток (вечерний пик — мёртв). Резерв: не считай его решением"
+            >
+              ⚠ стабильность не подтверждена
+            </span>
           </div>
           <div className="flex items-center gap-2">
             {hasWarpAccount ? (
@@ -1021,7 +1104,9 @@ export default function ChannelTab({
             Что это: сеть Psiphon (обфусцированные туннели под видом HTTPS-трафика) как седьмой
             канал — медленный (~0.2 МБ/с), но живучий. Скорость не главное (§9): канал нужен как
             аварийный резерв, когда и платный, и бесплатные туннели лежат. Выход — DE (регион
-            Psiphon), селективно: только группа «geo». Работает поверх WARP masque.
+            Psiphon), селективно: только группа «geo». Работает ПОВЕРХ WARP masque (upstream):
+            masque лёг — Psiphon лёг вместе с ним (22.11: EOF-пробы ровно в окно мёртвого
+            masque), то есть независимым резервом он не является.
           </p>
         </div>
       </div>

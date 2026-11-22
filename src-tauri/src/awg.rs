@@ -237,14 +237,8 @@ fn run_warpscout(
 /// (внутри свои фолбэки: прямая → релея → WARP-туннель); при неудаче — путь (б)
 /// через aether-bootstrap. После успеха: перегенерация конфигов + синк реестра.
 pub fn awg_register(app: &AppHandle) -> Result<Value, String> {
-    let bin_dir = process::get_bin_dir()?;
-    let warpscout = bin_dir.join(WARPS_EXE);
-    if !warpscout.exists() {
-        return Err(format!(
-            "warpscout.exe не найден в {} — sidecar не собран в бандл",
-            bin_dir.display()
-        ));
-    }
+    // Runtime-копия: warpscout не лочит exe бандла/папки сборки (22.11.26).
+    let warpscout = process::runtime_file(WARPS_EXE)?;
     std::fs::create_dir_all(warp_dir())
         .map_err(|e| format!("не создать {}: {}", warp_dir().display(), e))?;
 
@@ -298,14 +292,6 @@ fn register_via_aether(app: &AppHandle, warpscout: &Path) -> Result<(), String> 
             "Резервная регистрация AWG через aether требует WARP masque-учётку — сначала зарегистрируй WARP-канал (1 клик), потом повтори AWG",
         ));
     }
-    let bin_dir = process::get_bin_dir()?;
-    let aether = bin_dir.join("aether.exe");
-    if !aether.exists() {
-        return Err(format!(
-            "aether.exe не найден в {} — sidecar Psiphon не собран в бандл",
-            bin_dir.display()
-        ));
-    }
     // Bootstrap-порты должны быть свободны (честная ошибка, не молча).
     for p in [
         crate::psiphon::BOOT_LISTEN_PORT,
@@ -322,7 +308,7 @@ fn register_via_aether(app: &AppHandle, warpscout: &Path) -> Result<(), String> 
     }
 
     let mut mihomo_child: Option<Child> = None;
-    let mut aether_child: Option<Child> = None;
+    let mut aether_child: Option<crate::win_job::TreeChild> = None;
     let result = (|| {
         // 1) bootstrap-конфиг mihomo (masque-учётка + listener→WARP, MATCH,DIRECT)
         let yaml = match crate::psiphon::generate_bootstrap_config() {
@@ -333,7 +319,7 @@ fn register_via_aether(app: &AppHandle, warpscout: &Path) -> Result<(), String> 
         if let Err(e) = std::fs::write(&cfg, &yaml) {
             return Err(format!("не записать {}: {}", cfg.display(), e));
         }
-        let m = match Command::new(bin_dir.join(proxy_core::MIHOMO_EXE))
+        let m = match Command::new(process::runtime_file(proxy_core::MIHOMO_EXE)?)
             .arg("-f")
             .arg(&cfg)
             .creation_flags(CREATE_NO_WINDOW)
@@ -362,7 +348,6 @@ fn register_via_aether(app: &AppHandle, warpscout: &Path) -> Result<(), String> 
         // 3) aether: socks 10819, upstream listener 7911, cwd = своя папка (datastore!)
         let cwd = config::get_app_dir().join("psiphon_bootstrap");
         let a = match crate::psiphon::spawn_aether(
-            &aether,
             &format!("http://127.0.0.1:{}", crate::psiphon::BOOT_LISTENER_PORT),
             crate::psiphon::BOOT_SOCKS_PORT,
             &cwd,
@@ -402,10 +387,9 @@ fn register_via_aether(app: &AppHandle, warpscout: &Path) -> Result<(), String> 
         )
     })();
 
-    // Cleanup ВСЕГДА: aether (отпускает socks) → mihomo.
+    // Cleanup ВСЕГДА: aether деревом (Job Object — дети тоже) → mihomo.
     if let Some(mut c) = aether_child.take() {
-        let _ = c.kill();
-        let _ = c.wait();
+        c.kill_tree();
     }
     if let Some(mut c) = mihomo_child.take() {
         let _ = c.kill();
@@ -419,14 +403,8 @@ fn register_via_aether(app: &AppHandle, warpscout: &Path) -> Result<(), String> 
 /// junk-поля (i1/remote-dns-resolve и пр.) НЕ копируются — конфиг строится из
 /// нашего шаблона.
 pub fn awg_rescan(app: &AppHandle) -> Result<Value, String> {
-    let bin_dir = process::get_bin_dir()?;
-    let warpscout = bin_dir.join(WARPS_EXE);
-    if !warpscout.exists() {
-        return Err(format!(
-            "warpscout.exe не найден в {} — sidecar не собран в бандл",
-            bin_dir.display()
-        ));
-    }
+    // Runtime-копия: warpscout не лочит exe бандла/папки сборки (22.11.26).
+    let warpscout = process::runtime_file(WARPS_EXE)?;
     std::fs::create_dir_all(warp_dir())
         .map_err(|e| format!("не создать {}: {}", warp_dir().display(), e))?;
     let out = warp_dir().join("awg_scan_conf.yaml");

@@ -54,6 +54,8 @@ mod warp_ops;
 mod awg;
 mod awg_config;
 mod psiphon;
+// Job Object Windows (22.11.26): дерево процессов sidecar'ов гасится атомарно.
+mod win_job;
 
 use tauri::AppHandle;
 
@@ -63,6 +65,10 @@ fn init_app(app: AppHandle) -> Result<(), String> {
     // службу WinDivert) ДО первого check_status из фронтенда, чтобы индикатор
     // не показывал «ПРОЦЕСС АКТИВЕН» на мёртвом обходе.
     process::cleanup_stale_windivert(&app);
+    // Сироты aether/psiphon прошлых сессий (сборки до Job Object kill-on-
+    // close) держали файлы bin/pt/ и валили сборку релиза os error 32 —
+    // чистим при старте, как WinDivert (инцидент 22.11.26).
+    psiphon::cleanup_stale_sidecar();
     config::ensure_directories_and_files().map_err(|e| e.to_string())?;
     // Файлы прокси-движка: шаблон запасного + пул нод (жёсткая перезапись из
     // встроенных defaults — контракт владельца) + тихая миграция личных данных

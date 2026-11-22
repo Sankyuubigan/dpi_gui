@@ -565,6 +565,18 @@ pub fn status() -> serde_json::Value {
     })
 }
 
+/// Живой режим канала (in-memory CHANNEL.mode): "off" или id канала, который
+/// включён ПРЯМО СЕЙЧАС. Не путать с реестром `active` — тот переживает
+/// рестарт (последний выбранный канал), а движок после рестарта не поднят
+/// (инцидент 22.11.26: тест каналов решал «активный» по реестру и ложно
+/// отдавал «МЁРТВ» для не поднятого боевого порта).
+pub fn channel_mode() -> String {
+    CHANNEL
+        .lock()
+        .map(|g| g.mode.clone())
+        .unwrap_or_else(|_| String::from("off"))
+}
+
 fn emit_log(app: &AppHandle, msg: String) {
     let _ = app.emit("log", format!("[Канал] {}", msg));
 }
@@ -815,14 +827,10 @@ pub fn shutdown_for_exit() {
 
 /// Старт mihomo с конфигом и ожидание живого порта. Ребёнок кладётся в CHANNEL.
 fn start_mihomo(app: &AppHandle, config_path: &PathBuf) -> Result<(), String> {
-    let bin_dir = process::get_bin_dir()?;
-    let mihomo_path = bin_dir.join(MIHOMO_EXE);
-    if !mihomo_path.exists() {
-        return Err(format!(
-            "mihomo.exe не найден в {} — движок прокси не собран в бандл",
-            bin_dir.display()
-        ));
-    }
+    // Runtime-копия (AppData/runtime): боевой mihomo не лочит exe в бандле/
+    // папке сборки — запущенный канал не мешает ни пересборке, ни обновлению
+    // (инцидент 22.11.26: три случая os error 32 из-за процессов из release/bin).
+    let mihomo_path = process::runtime_file(MIHOMO_EXE)?;
     let work_dir = proxy_dir();
     if !work_dir.exists() {
         std::fs::create_dir_all(&work_dir).map_err(|e| format!("не создать {}: {}", work_dir.display(), e))?;
