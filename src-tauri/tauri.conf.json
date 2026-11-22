@@ -1,6 +1,6 @@
 {
   "productName": "DPI_GUI",
-  "version": "26.11.8",
+  "version": "26.11.9",
   "identifier": "com.dpigui.app",
   "build": {
     "beforeDevCommand": "npm run dev",
