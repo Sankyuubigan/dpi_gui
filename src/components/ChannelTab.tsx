@@ -994,15 +994,20 @@ export default function ChannelTab({
             </span>
           </div>
           <div className="flex items-center gap-2">
-            <button
-              onClick={() => awgAction("register")}
-              disabled={awgBusy}
-              title="Программа сама создаст анонимную AWG-учётку (warpscout) и запишет ключи локально; при блокировке регистрации поднимет временный обход"
-              className="flex items-center gap-2 bg-violet-600 hover:bg-violet-700 disabled:bg-gray-300 text-white px-4 py-2 rounded-md font-bold text-sm transition-colors"
-            >
-              {awgBusy ? <Loader2 size={14} className="animate-spin" /> : <Shield size={14} />}
-              Зарегистрировать
-            </button>
+            {/* «Зарегистрировать» скрыта при готовой учётке (паттерн WARP-карточки):
+                повторная регистрация перезаписала бы ключи/шортлист. Легальный путь
+                перерегистрации — «Сбросить учётку» → кнопка возвращается. */}
+            {!hasAwgAccount && (
+              <button
+                onClick={() => awgAction("register")}
+                disabled={awgBusy}
+                title="Программа сама создаст анонимную AWG-учётку (warpscout) и запишет ключи локально; при блокировке регистрации поднимет временный обход"
+                className="flex items-center gap-2 bg-violet-600 hover:bg-violet-700 disabled:bg-gray-300 text-white px-4 py-2 rounded-md font-bold text-sm transition-colors"
+              >
+                {awgBusy ? <Loader2 size={14} className="animate-spin" /> : <Shield size={14} />}
+                Зарегистрировать
+              </button>
+            )}
             {hasAwgAccount && (
               <>
                 <button
