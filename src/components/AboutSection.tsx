@@ -1,14 +1,29 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
-import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open } from "@tauri-apps/plugin-shell";
 import {
   getReleaseHistory,
-  installRelease,
+  updateStore,
   type ReleaseInfo,
 } from "@my-tauri-plugins/plugin-about-updates";
+
+// Хост-хуки стора обновлений (SSOT стейта — в плагине): остановка обхода перед
+// скачиванием/установкой (winws.exe и WinDivert держат файлы в bin/ заблокированными —
+// иначе установщик падает с os error 32) и перезапуск после установки.
+updateStore.setHooks({
+  onBeforeInstall: async () => {
+    try {
+      await invoke("stop_bypass");
+    } catch {
+      // Остановка не удалась — не блокируем попытку установки/отката.
+    }
+  },
+  onInstalled: () => {
+    void relaunch();
+  },
+});
 import {
   Info,
   RefreshCw,
@@ -20,31 +35,22 @@ import {
   RotateCcw,
 } from "lucide-react";
 
-type Status =
-  | "idle"
-  | "checking"
-  | "up-to-date"
-  | "available"
-  | "downloading"
-  | "error";
-
 const REPO_URL = "https://github.com/Sankyuubigan/dpi_gui";
 
 /// Секция «О программе» (версия, репозиторий, обновления, откат).
-/// Раньше была отдельной вкладкой, теперь блок вверху вкладки «Настройки».
+/// Блок вверху вкладки «Настройки»; вкладки размонтируются при переключении,
+/// поэтому весь стейт обновления/отката (проверка, прогресс, откат) живёт в
+/// модульном updateStore (src/updateStore.ts) и переживает unmount —
+/// этот компонент только рендерит его и зовёт действия.
 export default function AboutSection() {
+  const st = useSyncExternalStore(updateStore.subscribe, updateStore.getState);
   const [version, setVersion] = useState<string>("");
-  const [status, setStatus] = useState<Status>("idle");
-  const [update, setUpdate] = useState<Update | null>(null);
-  const [progress, setProgress] = useState(0);
-  const [isDownloading, setIsDownloading] = useState(false);
-  const [errorMsg, setErrorMsg] = useState("");
 
+  // История релизов — перефетчируемый список без фоновой операции,
+  // её потеря при unmount нечему ломать, поэтому она остаётся локальной.
   const [history, setHistory] = useState<ReleaseInfo[] | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [selected, setSelected] = useState("");
-  const [rollbackBusy, setRollbackBusy] = useState(false);
-  const [rollbackMsg, setRollbackMsg] = useState("");
 
   useEffect(() => {
     getVersion()
@@ -58,11 +64,10 @@ export default function AboutSection() {
       return;
     }
     setHistoryLoading(true);
-    setRollbackMsg("");
     try {
       setHistory(await getReleaseHistory());
     } catch (e: any) {
-      setRollbackMsg(e?.message || String(e));
+      updateStore.setRollbackMsg(e?.message || String(e));
     } finally {
       setHistoryLoading(false);
     }
@@ -71,70 +76,7 @@ export default function AboutSection() {
   const doRollback = async () => {
     const target = history?.find((r) => r.version === selected);
     if (!target) return;
-    setRollbackBusy(true);
-    setRollbackMsg(`Откат на ${target.version}: скачивание установщика...`);
-    try {
-      // Гасим обход до скачивания/установки: winws.exe и драйвер WinDivert
-      // держат файлы в bin/ заблокированными (иначе установщик падает с os error 32).
-      try {
-        await invoke("stop_bypass");
-      } catch (_) {
-        // Остановка не удалась — не блокируем попытку отката.
-      }
-      await installRelease(target.downloadUrl, target.version);
-      setRollbackMsg(`Откат на ${target.version} запущен, приложение будет перезапущено.`);
-    } catch (e: any) {
-      setRollbackMsg(e?.message || String(e));
-      setRollbackBusy(false);
-    }
-  };
-
-  const checkForUpdates = async () => {
-    setStatus("checking");
-    setErrorMsg("");
-    try {
-      const found = await check();
-      if (found) {
-        setUpdate(found);
-        setStatus("available");
-      } else {
-        setStatus("up-to-date");
-      }
-    } catch (e: any) {
-      setErrorMsg(e?.message || String(e));
-      setStatus("error");
-    }
-  };
-
-  const doUpdate = async () => {
-    if (!update) return;
-    setStatus("downloading");
-    setIsDownloading(true);
-    setProgress(0);
-    try {
-      // Останавливаем обход перед установкой: иначе winws.exe / WinDivert
-      // держат файлы в bin/ заблокированными и установщик не сможет их перезаписать.
-      try {
-        await invoke("stop_bypass");
-      } catch (_) {
-        // Даже если остановить не удалось — продолжаем попытку обновления.
-      }
-      let downloaded = 0;
-      let total = 0;
-      await update.downloadAndInstall((event) => {
-        if (event.event === "Started") {
-          total = event.data.contentLength ?? 0;
-        } else if (event.event === "Progress") {
-          downloaded += event.data.chunkLength;
-          if (total > 0) setProgress(Math.round((downloaded / total) * 100));
-        }
-      });
-      await relaunch();
-    } catch (e: any) {
-      setErrorMsg(e?.message || String(e));
-      setStatus("error");
-      setIsDownloading(false);
-    }
+    await updateStore.startRollback(target);
   };
 
   return (
@@ -172,43 +114,42 @@ export default function AboutSection() {
         <h2 className="text-lg font-bold text-gray-800 mb-4">Обновления</h2>
 
         <button
-          onClick={checkForUpdates}
-          disabled={status === "checking" || status === "downloading"}
+          onClick={() => updateStore.checkForUpdates()}
+          disabled={st.status === "checking" || st.status === "downloading"}
           className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-md font-semibold hover:bg-blue-700 disabled:opacity-50"
         >
-          <RefreshCw size={18} className={status === "checking" ? "animate-spin" : ""} />
+          <RefreshCw size={18} className={st.status === "checking" ? "animate-spin" : ""} />
           Проверить обновления
         </button>
 
         <div className="mt-4">
-          {status === "checking" && (
+          {st.status === "checking" && (
             <p className="text-gray-600 text-sm">Проверка наличия обновлений...</p>
           )}
 
-          {status === "up-to-date" && (
+          {st.status === "up-to-date" && (
             <div className="flex items-center gap-2 text-green-600">
               <CheckCircle2 size={18} />
               <span className="text-sm">У вас установлена актуальная версия.</span>
             </div>
           )}
 
-          {status === "available" && update && (
+          {st.status === "available" && st.update && (
             <div className="p-4 border border-blue-200 rounded-lg bg-blue-50">
               <p className="text-blue-800 font-semibold">
-                Доступна новая версия: {update.version}
+                Доступна новая версия: {st.update.version}
               </p>
-              {update.date && (
+              {st.update.date && (
                 <p className="text-xs text-blue-600 mt-1">
-                  Опубликовано: {new Date(update.date).toLocaleString()}
+                  Опубликовано: {new Date(st.update.date).toLocaleString()}
                 </p>
               )}
-              {update.body && (
-                <p className="text-sm text-gray-700 mt-2 whitespace-pre-wrap">{update.body}</p>
+              {st.update.body && (
+                <p className="text-sm text-gray-700 mt-2 whitespace-pre-wrap">{st.update.body}</p>
               )}
               <button
-                onClick={doUpdate}
-                className="mt-3 flex items-center gap-2 bg-green-600 text-white px-4 py-2 rounded-md font-semibold hover:bg-green-700 disabled:opacity-50"
-                disabled={isDownloading}
+                onClick={() => updateStore.startUpdate()}
+                className="mt-3 flex items-center gap-2 bg-green-600 text-white px-4 py-2 rounded-md font-semibold hover:bg-green-700"
               >
                 <Download size={18} />
                 Обновиться
@@ -216,25 +157,25 @@ export default function AboutSection() {
             </div>
           )}
 
-          {status === "downloading" && (
+          {st.status === "downloading" && (
             <div className="p-4 border rounded-lg bg-gray-50">
               <p className="text-sm text-gray-700 mb-2">Загрузка и установка обновления...</p>
               <div className="w-full bg-gray-200 rounded-full h-2.5">
                 <div
                   className="bg-blue-600 h-2.5 rounded-full transition-all"
-                  style={{ width: `${progress}%` }}
+                  style={{ width: `${st.progress}%` }}
                 ></div>
               </div>
-              <p className="text-xs text-gray-500 mt-1 text-right">{progress}%</p>
+              <p className="text-xs text-gray-500 mt-1 text-right">{st.progress}%</p>
             </div>
           )}
 
-          {status === "error" && (
+          {st.status === "error" && (
             <div className="flex items-start gap-2 text-red-600">
               <AlertTriangle size={18} className="mt-0.5" />
               <div>
                 <p className="text-sm font-semibold">Не удалось проверить обновления.</p>
-                <p className="text-xs text-red-500 break-all">{errorMsg}</p>
+                <p className="text-xs text-red-500 break-all">{st.errorMsg}</p>
                 <p className="text-xs text-gray-500 mt-1">
                   Проверьте подключение к интернету или откройте релиз вручную на GitHub.
                 </p>
@@ -252,7 +193,7 @@ export default function AboutSection() {
           </h2>
           <button
             onClick={toggleHistory}
-            disabled={historyLoading || rollbackBusy}
+            disabled={historyLoading || st.rollbackBusy}
             className="flex items-center gap-2 bg-gray-100 text-gray-700 px-4 py-2 rounded-md font-semibold hover:bg-gray-200 disabled:opacity-50"
           >
             <RefreshCw size={16} className={historyLoading ? "animate-spin" : ""} />
@@ -266,7 +207,7 @@ export default function AboutSection() {
               <select
                 value={selected}
                 onChange={(e) => setSelected(e.target.value)}
-                disabled={rollbackBusy}
+                disabled={st.rollbackBusy}
                 className="w-full border-gray-300 rounded-md shadow-sm p-2 border focus:border-blue-500 focus:ring-blue-500"
               >
                 <option value="" disabled>
@@ -284,7 +225,7 @@ export default function AboutSection() {
               </select>
               <button
                 onClick={doRollback}
-                disabled={!selected || rollbackBusy}
+                disabled={!selected || st.rollbackBusy}
                 className="flex items-center justify-center gap-2 bg-amber-600 text-white px-4 py-2 rounded-md font-semibold hover:bg-amber-700 disabled:opacity-50 whitespace-nowrap"
               >
                 <RotateCcw size={16} />
@@ -298,8 +239,8 @@ export default function AboutSection() {
               </p>
             )}
 
-            {rollbackMsg && (
-              <p className="text-sm text-gray-600 mt-3 break-all">{rollbackMsg}</p>
+            {st.rollbackMsg && (
+              <p className="text-sm text-gray-600 mt-3 break-all">{st.rollbackMsg}</p>
             )}
           </>
         )}
