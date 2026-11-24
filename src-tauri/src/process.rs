@@ -105,7 +105,12 @@ pub fn runtime_file(rel: &str) -> Result<PathBuf, String> {
 /// Runtime-копия winws одним набором: DLL грузит драйвер из своей папки —
 /// winws.exe, WinDivert64.sys и WinDivert.dll обязаны лежать рядом.
 pub fn runtime_winws() -> Result<PathBuf, String> {
-    for rel in [WINWS_EXE, "WinDivert64.sys", "WinDivert.dll"] {
+    // cygwin1.dll — winws.exe собран под cygwin (PE-импорт cygwin1.dll,
+    // 80 функций: cygwin_detach_dll, cygwin_internal…). Без неё winws падает
+    // с 0xC0000135 (STATUS_DLL_NOT_FOUND) на свежей машине, где Psiphon/AWG
+    // ни разу не запускались (cygwin1.dll клал только runtime_aether).
+    // Инцидент 24.11.26 (машина zongo): «система не обнаружила cygwin1.dll».
+    for rel in [WINWS_EXE, "cygwin1.dll", "WinDivert64.sys", "WinDivert.dll"] {
         runtime_file(rel)?;
     }
     Ok(runtime_dir().join(WINWS_EXE))
@@ -248,6 +253,20 @@ fn spawn_winws(app: &AppHandle, final_args: Vec<String>, quiet: bool) -> Result<
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Ошибка запуска: {}", e))?;
+
+    // Проверка живучести (core §2.2 — честность): winws мог мгновенно умереть
+    // (0xC0000135 STATUS_DLL_NOT_FOUND, блок антивируса, кривой профиль).
+    // Раньше рапортовали «PID X» на мёртвом процессе — юзер видел зелёный
+    // статус на дохлом обходе. Ждём 200мс и проверяем try_wait.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    if let Ok(Some(status)) = child.try_wait() {
+        return Err(format!(
+            "winws запустился из {} но мгновенно упал (код {:?}). \
+Возможные причины: cygwin1.dll не найдена (антивирус?), кривой профиль, или WinDivert заблокирован.",
+            winws_path.display(),
+            status.code()
+        ));
+    }
 
     let pid = child.id();
     let _ = app.emit("log", format!("Процесс запущен успешно. PID: {}", pid));

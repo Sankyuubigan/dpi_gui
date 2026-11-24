@@ -287,7 +287,10 @@ pub fn awg_register(app: &AppHandle) -> Result<Value, String> {
             Err(e) => emit_log(app, format!("[PAWG] Конфиг не сгенерился: {}", e)),
         }
     }
-    proxy_core::special_channels_sync(app);
+    // Единый reconciler (баг №1): синкает ВСЕ встроенные каналы по факту.
+    // Раньше здесь был только special_channels_sync (AWG/pawg/Psiphon), без
+    // WG/WARP — следующий хендлер (например wg_creds_import) мог забыть ресинк.
+    proxy_core::reconcile_builtin_channels(app);
     emit_log(app, String::from("[AWG] Каналы «WARP AWG (YouTube)»/«Proton поверх WARP» в селекторе (стабильность не подтверждена — §9)."));
     Ok(awg_status_json())
 }
@@ -489,7 +492,7 @@ pub fn awg_reset(app: &AppHandle) -> Result<Value, String> {
     let _ = std::fs::remove_file(scanned_endpoints_file());
     let _ = std::fs::remove_file(proxy_core::proxy_dir().join("awg_profile.yaml"));
     let _ = std::fs::remove_file(proxy_core::proxy_dir().join("pawg_profile.yaml"));
-    proxy_core::special_channels_sync(app);
+    proxy_core::reconcile_builtin_channels(app);
     emit_log(app, String::from("[AWG] Учётка и конфиги сброшены."));
     Ok(awg_status_json())
 }

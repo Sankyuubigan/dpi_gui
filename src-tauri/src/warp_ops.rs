@@ -173,10 +173,14 @@ struct TempWinws {
 impl TempWinws {
     fn start(app: &AppHandle) -> Result<TempWinws, String> {
         let args = temp_winws_args()?;
-        let bin_dir = crate::process::get_bin_dir()?;
-        let child = std::process::Command::new(bin_dir.join("winws.exe"))
+        // Runtime-копия (не bin\ напрямую): живой temp winws лочит
+        // winws.exe/WinDivert64.sys/cygwin1.dll в бандле → reld-release падает
+        // os error 32 (инцидент 22.11.26). runtime_winws() копирует весь набор
+        // (вкл. cygwin1.dll) в AppData/runtime и возвращает путь.
+        let winws_path = crate::process::runtime_winws()?;
+        let child = std::process::Command::new(&winws_path)
             .args(&args)
-            .current_dir(&bin_dir)
+            .current_dir(crate::process::runtime_dir())
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -319,7 +323,8 @@ fn register_warp(app: &AppHandle) -> Result<serde_json::Value, String> {
     }
     let acct = crate::warp::parse_patch_response(&text, &priv_b64, &token)?;
     crate::warp::save_account(&acct)?;
-    crate::proxy_core::warp_channel_sync(app)?;
+    // Единый reconciler (баг №1): синкает ВСЕ встроенные каналы по факту.
+    crate::proxy_core::reconcile_builtin_channels(app);
     let out = crate::warp::generate_warp_config()?;
     let id_short: String = acct.device_id.chars().take(8).collect();
     emit_log(
@@ -364,7 +369,9 @@ pub fn warp_setup(
             crate::warp::remove_account()?;
             // Профиль без учётки бессмысленен: удалить (отсутствие — не ошибка).
             let _ = std::fs::remove_file(crate::warp::warp_profile_path());
-            crate::proxy_core::warp_channel_remove(app)?;
+            // Единый reconciler: уберёт WARP из реестра + удалит осиротевший
+            // Psiphon-конфиг (Psiphon ходит через WARP).
+            crate::proxy_core::reconcile_builtin_channels(app);
             emit_log(app, "[WARP] учётка и профиль удалены.".into());
             Ok(crate::warp::warp_status_json())
         }

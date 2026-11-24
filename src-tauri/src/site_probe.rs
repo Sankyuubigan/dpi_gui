@@ -416,7 +416,7 @@ const UNVERIFIED_MIN_VISIBLE: usize = 200;
 /// текста — десятки байт, у контентной страницы — сотни и больше (запас
 /// до порога ≥4x). Регистронезависимость тегов обеспечена входным
 /// lowercase'ом (`http_via_ip` режет детекторы по одному lowercase-телу).
-fn visible_text_len(page: &str) -> usize {
+pub fn visible_text_len(page: &str) -> usize {
     let low = page.to_lowercase();
     let mut visible = 0usize;
     let mut in_tag = false;

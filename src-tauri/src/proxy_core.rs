@@ -392,6 +392,106 @@ pub fn special_channels_sync(app: &AppHandle) {
     }
 }
 
+/// Единый идемпотентный reconciler встроенных каналов (баги №1+№5, ревью спеца
+/// 24.11.26). Читает ФАКТИЧЕСКОЕ состояние на диске и приводит реестр + конфиги
+/// в соответствие. Заменяет разрозненные `special_channels_sync` + `wg_channel_sync`
+/// + `warp_channel_sync` в точках мутаций — чтобы следующий хендлер не забыл
+/// ресинк (корень бага №1: `wg_creds_import` не ресинкал pawg).
+///
+/// Инварианты:
+/// - pawg ⇔ `has_awg && load_creds().is_some()`; при генерации конфига ошибка
+///   логируется, битый pawg НЕ добавляется в реестр.
+/// - Psiphon — всегда в реестре (как сейчас), но `psiphon_profile.yaml`
+///   генерится только при `has_warp_account()`.
+/// - WG ⇔ `has_wg_creds()`, WARP ⇔ `has_warp_account()`, AWG ⇔ `has_account()`.
+/// - При удалении активного канала → `active` = первый оставшийся.
+/// - Ошибки не роняют (как `special_channels_sync` — `let _ = write_registry`).
+pub fn reconcile_builtin_channels(app: &AppHandle) {
+    let has_warp = crate::warp::has_warp_account();
+    let has_awg = crate::awg::has_account();
+    let has_wg = crate::reserve::has_wg_creds();
+    let pawg_possible = has_awg && crate::reserve::load_creds().is_some();
+
+    // pawg: конфиг генерим ТОЛЬКО если возможен; иначе удаляем осиротевший.
+    if pawg_possible {
+        if let Err(e) = crate::awg_config::generate_pawg_config() {
+            emit_log(app, format!("[PAWG] генерация pawg_profile.yaml не удалась: {}", e));
+            // Не добавляем pawg в реестр с битым конфигом — honest fail.
+        }
+    } else {
+        let orphan = proxy_dir().join("pawg_profile.yaml");
+        if orphan.exists() {
+            let _ = std::fs::remove_file(&orphan);
+            emit_log(app, "PAWG: pawg_profile.yaml удалён (нет AWG-учётки или WG-кредов).".into());
+        }
+    }
+
+    // AWG: конфиг генерим если есть учётка.
+    if has_awg {
+        if let Err(e) = crate::awg_config::generate_awg_config() {
+            emit_log(app, format!("[AWG] генерация awg_profile.yaml не удалась: {}", e));
+        }
+    }
+
+    // Psiphon: конфиг генерим если есть WARP-учётка (Psiphon ходит через WARP).
+    if has_warp {
+        if let Err(e) = crate::psiphon::generate_psiphon_config() {
+            emit_log(app, format!("[PSIPHON] генерация psiphon_profile.yaml не удалась: {}", e));
+        }
+    }
+
+    // Реестр: единый find-or-push/retain для всех 5 встроенных каналов.
+    // Порядок: WG, WARP, AWG, pawg, Psiphon — как в UI.
+    let rows: [(&str, &str, &str, bool); 5] = [
+        (WG_CHANNEL_ID, "WireGuard через паблик Xray/V2Ray", "wg", has_wg),
+        (WARP_CHANNEL_ID, "WARP (Cloudflare)", "warp", has_warp),
+        (AWG_CHANNEL_ID, "WARP AWG", "awg", has_awg),
+        (PAWG_CHANNEL_ID, "AWG Proton WARP", "pawg", pawg_possible),
+        (PSIPHON_CHANNEL_ID, "Psiphon", "psiphon", true), // всегда в реестре
+    ];
+    let mut reg = read_registry();
+    let active = reg["active"].as_str().unwrap_or("").to_string();
+    let mut removed_active = false;
+    if let Some(profiles) = reg["profiles"].as_array_mut() {
+        for (id, name, ctype, want) in rows {
+            let present = profiles.iter().any(|p| p["file"].as_str() == Some(id));
+            if want {
+                if let Some(entry) = profiles.iter_mut().find(|p| p["file"].as_str() == Some(id)) {
+                    entry["name"] = json!(name);
+                } else {
+                    profiles.push(json!({
+                        "name": name,
+                        "file": id,
+                        "type": ctype,
+                        "added": chrono_now_str(),
+                        "added_ts": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                        "size": 0,
+                    }));
+                    emit_log(app, format!("Канал «{}» добавлен в селектор (стабильность не подтверждена — §9).", name));
+                }
+            } else if present {
+                if active == id { removed_active = true; }
+                profiles.retain(|p| p["file"].as_str() != Some(id));
+                emit_log(app, format!("Канал «{}» убран из селектора (данных не хватает).", name));
+            }
+        }
+    }
+    // Если удалили активный канал → active = первый оставшийся (паттерн
+    // wg_channel_remove; special_channels_sync этого не делал — латентный баг).
+    if removed_active {
+        let first = reg["profiles"].as_array()
+            .and_then(|a| a.first())
+            .and_then(|p| p["file"].as_str())
+            .unwrap_or("")
+            .to_string();
+        reg["active"] = json!(first);
+    }
+    let _ = write_registry(&reg);
+}
+
 /// Удаление WARP-записи из реестра (при сбросе учётки). Активный «__warp__»?
 /// → первый оставшийся канал, иначе пусто (как wg_channel_remove).
 pub fn warp_channel_remove(app: &AppHandle) -> Result<Value, String> {
@@ -479,41 +579,24 @@ pub fn ensure_proxy_files(app: &AppHandle) -> Result<(), String> {
     // Миграция WG-кредов + перегенерация reserve_profile.yaml из текущего шаблона.
     crate::reserve::migrate_existing_creds(app);
     if crate::reserve::has_wg_creds() {
-        // Канон имени WG-канала при каждом запуске (21.11.26): старые
-        // юзерские имена («Запасной (WG)», stem файла) заменяются каноном.
-        let _ = crate::proxy_core::wg_channel_sync(app);
         crate::reserve::generate_reserve_config()?;
     }
     // WARP (Этап B): регенерация warp_profile.yaml из ТЕКУЩЕГО шаблона + учётки —
     // обновления шаблона доезжают до юзера без его действий. Без учётки файла
-    // быть не должно (сброс удаляет его сам). Ошибка не роняет запуск
-    // приложения — честный лог; исправится при следующей регистрации/включении.
+    // быть не должно (сброс удаляет его сам).
     if crate::warp::has_warp_account() {
         if let Err(e) = crate::warp::generate_warp_config() {
             emit_log(app, format!("[WARP] регенерация warp_profile.yaml не удалась: {}", e));
         }
     }
-    // Специальные каналы (PRP 20.11.26): реестр (AWG/pawg/psiphon ⇔ данные)
-    // + регенерация конфигов из ТЕКУЩИХ шаблонов (обновления едут релизами).
-    // Ошибки не роняют запуск — честный лог, исправится при следующем включении.
-    special_channels_sync(app);
+    // Единый reconciler (баги №1+№5, ревью спеца 24.11.26): приводит реестр
+    // каналов + генерит pawg/awg/psiphon конфиги по фактическому состоянию на
+    // диске. Заменяет разрозненные wg_channel_sync + special_channels_sync +
+    // per-channel generators (которые мог забыть следующий хендлер — корень
+    // бага №1). Ошибки не роняют запуск — честный лог.
+    reconcile_builtin_channels(app);
     // Канонические имена платных (21.11.26: имя = метод, юзерские не выживают).
     paid_names_canonicalize(app);
-    if crate::awg::has_account() {
-        if let Err(e) = crate::awg_config::generate_awg_config() {
-            emit_log(app, format!("[AWG] регенерация awg_profile.yaml не удалась: {}", e));
-        }
-        if crate::reserve::load_creds().is_some() {
-            if let Err(e) = crate::awg_config::generate_pawg_config() {
-                emit_log(app, format!("[PAWG] регенерация pawg_profile.yaml не удалась: {}", e));
-            }
-        }
-    }
-    if crate::warp::has_warp_account() {
-        if let Err(e) = crate::psiphon::generate_psiphon_config() {
-            emit_log(app, format!("[PSIPHON] регенерация psiphon_profile.yaml не удалась: {}", e));
-        }
-    }
     Ok(())
 }
 

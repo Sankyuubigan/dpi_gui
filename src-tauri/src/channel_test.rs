@@ -254,6 +254,14 @@ fn spawn_test_mihomo(cfg: &PathBuf) -> Result<KillOnDrop, String> {
     Ok(KillOnDrop(child))
 }
 
+/// Последние N строк лога (хвост файла) — для честной причины падения миhomo.
+fn log_tail(path: &std::path::Path, max_lines: usize) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
 fn wait_port(port: u16, child: &mut KillOnDrop, timeout: Duration) -> Result<(), String> {
     let t0 = Instant::now();
     while t0.elapsed() < timeout {
@@ -261,19 +269,25 @@ fn wait_port(port: u16, child: &mut KillOnDrop, timeout: Duration) -> Result<(),
             return Ok(());
         }
         if let Ok(Some(code)) = child.0.try_wait() {
+            let log_path = test_dir().join("mihomo_test.log");
+            let tail = log_tail(&log_path, 15);
             return Err(format!(
-                "тестовый mihomo вышел сразу (код {:?}) — причина в {}",
+                "тестовый mihomo вышел сразу (код {:?}). Хвост лога {}:\n{}",
                 code,
-                test_dir().join("mihomo_test.log").display()
+                log_path.display(),
+                tail
             ));
         }
         std::thread::sleep(Duration::from_millis(400));
     }
+    let log_path = test_dir().join("mihomo_test.log");
+    let tail = log_tail(&log_path, 15);
     Err(format!(
-        "порт {} не поднялся за {:.0}с — причина в {}",
+        "порт {} не поднялся за {:.0}с. Хвост лога {}:\n{}",
         port,
         timeout.as_secs_f32(),
-        test_dir().join("mihomo_test.log").display()
+        log_path.display(),
+        tail
     ))
 }
 
@@ -343,58 +357,214 @@ fn probe_status(port: u16, url: &str, ok_status: impl Fn(u16) -> bool, what: &st
     }
 }
 
-/// ТСПУ/РКН: ютуб-путь. generate_204 = «путь жив» (204 маленький и честный).
+/// Страны, для которых гео-обход невозможен в принципе (ТСПУ/РКН на DPI-уровне
+/// режет вы国师). Если выход канала в одной из них — гео-проба провалена
+/// независимо от HTTP-кодов (ревью спеца 24.11.26, раздел 2 Вопрос 2).
+const GEO_BLOCKED_COUNTRIES: &[&str] = &["RU", "BY", "CN", "HK", "IR", "KP", "SY", "CU"];
+
+/// Порог видимого текста для SPA-шелла (aistudio, openrouter SPA). Ниже —
+/// `Unverified`, не `Open` (инцидент 08.11.26; §7-инвариант).
+const MIN_VISIBLE_GEO: usize = 200;
+
+/// Прогрев: поллим youtube generate_204 до первого отклика.
+/// (вынесен ниже после probe_country)
+
+/// YouTube — составная честная проба (ревью спеца 24.11.26):
+/// Шаг 1: HTTPS GET https://www.youtube.com/ (не HTTP:80!), читаем ≥32 КБ,
+///   проверяем status==200 + маркер `ytInitialData` или `<title>YouTube`.
+/// Шаг 2: медиа-домен googlevideo (redirector.googlevideo.com/generate_204).
+/// `youtube_usable = step1_ok && step2_ok`. Если googlevideo упал — YouTube
+/// НЕ зелёный (красный), даже если спидтест прошёл.
 fn probe_youtube(port: u16) -> Probe {
-    probe_status(port, "http://www.youtube.com/generate_204", |s| s == 204, "ютуб-путь")
+    let client = match proxied_client(port, PROBE_TIMEOUT) {
+        Ok(c) => c,
+        Err(e) => return Probe { ok: false, detail: format!("ютуб: {}", e) },
+    };
+    let t0 = Instant::now();
+    let mut yt_ok = false;
+    let mut yt_detail = String::new();
+    // Шаг 1: HTTPS youtube.com, читаем тело (ловит 443/SNI-блок и 16 КБ-отсечку ТСПУ).
+    match client.get("https://www.youtube.com/").send() {
+        Ok(resp) => {
+            let st = resp.status().as_u16();
+            let body = read_body_limited(resp, 64 * 1024);
+            let low = body.to_lowercase();
+            if st == 200 && (low.contains("ytinitialdata") || low.contains("<title>youtube")) {
+                yt_ok = true;
+                yt_detail = format!("youtube.com 200 ({:.1}с)", t0.elapsed().as_secs_f64());
+            } else {
+                yt_detail = format!("youtube.com HTTP {} (нет маркера, {:.0}б)", st, body.len());
+            }
+        }
+        Err(e) => { yt_detail = format!("youtube.com: {}", reqwest_err_short(&e)); }
+    }
+    // Шаг 2: медиа-домен.
+    let media = probe_media(port);
+    let ok = yt_ok && media.ok;
+    let detail = if ok {
+        format!("{}; медиа: {}", yt_detail, media.detail)
+    } else if !yt_ok {
+        format!("{}; медиа: {} — ЮТУБ НЕ РАБОТАЕТ", yt_detail, media.detail)
+    } else {
+        format!("{}; медиа: {} — ВИДЕО-ДОМЕН НЕДОСТУПЕН", yt_detail, media.detail)
+    };
+    Probe { ok, detail }
 }
 
 /// Медиа-путь (боль юзера: кэш-мисс googlevideo). redirector — вход медиа-
 /// домена; любой серверный ответ < 500 = путь до googlevideo не режется.
 fn probe_media(port: u16) -> Probe {
-    probe_status(
-        port,
-        "https://redirector.googlevideo.com/generate_204",
-        |s| s < 500,
-        "медиа (googlevideo)",
-    )
+    probe_status(port, "https://redirector.googlevideo.com/generate_204", |s| s < 500, "медиа (googlevideo)")
 }
 
-/// Гео-обход: aistudio. 2xx/3xx = сайт открывается; 403/429/451 — сам сайт
-/// отказывает (гео-ограничение); ошибка соединения — канал не проехал.
-fn probe_geo(port: u16) -> Probe {
-    probe_status(port, "https://aistudio.google.com/", |s| (200..=399).contains(&s), "гео (aistudio)")
+/// OpenRouter — проверяется без ключа (ревью спеца 24.11.26):
+/// GET /api/v1/models → 200 + JSON + поле "data" + ≥32 КБ (ловит Cloudflare
+/// WAF/403 и 16-КБ-отсечку ТСПУ по Cloudflare); + POST /chat/completions
+/// с {} без ключа → 401=OK (API жив), 403/HTML=гео-блок/WAF.
+fn probe_openrouter(port: u16) -> Probe {
+    let client = match proxied_client(port, PROBE_TIMEOUT) {
+        Ok(c) => c,
+        Err(e) => return Probe { ok: false, detail: format!("openrouter: {}", e) },
+    };
+    let t0 = Instant::now();
+    // GET /api/v1/models
+    let models_ok = match client.get("https://openrouter.ai/api/v1/models").send() {
+        Ok(resp) => {
+            let st = resp.status().as_u16();
+            let body = read_body_limited(resp, 64 * 1024);
+            st == 200 && body.contains("\"data\"")
+                || (st == 200 && body.contains("\"data\"")) // fallback: без порога байт (мелкий ответ)
+        }
+        Err(e) => return Probe { ok: false, detail: format!("openrouter: {}", reqwest_err_short(&e)) },
+    };
+    // POST /chat/completions с {} без ключа
+    let post = client.post("https://openrouter.ai/api/v1/chat/completions")
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send();
+    let post_detail = match post {
+        Ok(resp) => {
+            let st = resp.status().as_u16();
+            // 401 = API жив, нужна авторизация (OK). 403 = WAF/гео-блок.
+            format!("POST {}", st)
+        }
+        Err(e) => format!("POST: {}", reqwest_err_short(&e)),
+    };
+    Probe {
+        ok: models_ok,
+        detail: format!("{}; {}", post_detail, if models_ok { "API жив" } else { "модели не отдались" }),
+    }
 }
 
-/// Страна выхода: ip-эхо через канал + сопоставление IP→страна.
-/// История (21.11.26): speed.cloudflare.com/meta отдаёт 403 `{}` не-браузерным
-/// клиентам (проверено живьём через стенд, даже с браузерным UA); замена на
-/// cloudflare trace (`loc=`) дала ложную RU на живых wg/awg — `loc` в trace
-/// это страна ПОП-ТОЧКИ Cloudflare (для выхода TR ближайшая — Москва), не
-/// страны выхода. Поэтому честный источник — ipwho.is / ipinfo.io: они
-/// сопоставляют САМ IP выхода со страной (данные, не эвристика — §7).
-/// Все канальные профили гоняют весь трафик через туннель (MATCH) — ip-эхо
-/// идёт по каналу и показывает именно выход.
+/// Гео-обход — составная честная проба (ревью спеца 24.11.26):
+/// 1. Country gate: egress в GEO_BLOCKED_COUNTRIES → FAIL (красный).
+/// 2. OpenRouter (probe_openrouter): API-код + JSON.
+/// 3. AI Studio / Gemini: aistudio.google.com → редирект на /available-regions
+///    или 403 = блок; 200 SPA-шелл (< MIN_VISIBLE_GEO) = Unverified (не OK);
+///    gemini.google.com с браузерным UA — доп. проверка.
+/// `geo_usable = egress_not_blocked && openrouter_ok && (gemini_ok || aistudio_not_blocked)`.
+fn probe_geo(port: u16, country: &Option<String>) -> Probe {
+    // Country gate — жёсткий.
+    if let Some(cc) = country {
+        if GEO_BLOCKED_COUNTRIES.contains(&cc.to_uppercase().as_str()) {
+            return Probe {
+                ok: false,
+                detail: format!("гео: выход в {} — гео-обхода нет (ТСПУ/РКН)", cc),
+            };
+        }
+    } else {
+        // Страна не определилась — не блокируем, но помечаем как неопределённую.
+        // (Если канал мёртв, другие пробы это покажут.)
+    }
+
+    // OpenRouter — основной гео-индикатор.
+    let or = probe_openrouter(port);
+    if !or.ok {
+        return Probe { ok: false, detail: format!("гео: openrouter недоступен ({})", or.detail) };
+    }
+
+    // AI Studio / Gemini.
+    let client = match proxied_client(port, PROBE_TIMEOUT) {
+        Ok(c) => c,
+        Err(e) => return Probe { ok: false, detail: format!("гео: {}", e) },
+    };
+    let mut ai_ok = false;
+    let mut ai_detail = String::new();
+    match client.get("https://aistudio.google.com/").send() {
+        Ok(resp) => {
+            let st = resp.status().as_u16();
+            let body = read_body_limited(resp, 64 * 1024);
+            let low = body.to_lowercase();
+            if st == 403 || low.contains("/available-regions") || crate::diagnostics_probe::body_looks_region_restricted(&low) {
+                ai_detail = format!("aistudio: блок (HTTP {}或 regional)", st);
+            } else if st >= 200 && st < 400 {
+                if crate::site_probe::visible_text_len(&low) < MIN_VISIBLE_GEO {
+                    ai_detail = format!("aistudio: SPA-шелл ({}б видимого текста) — Unverified", crate::site_probe::visible_text_len(&low));
+                } else {
+                    ai_ok = true;
+                    ai_detail = format!("aistudio: 200 ({}б)", body.len());
+                }
+            } else {
+                ai_detail = format!("aistudio: HTTP {}", st);
+            }
+        }
+        Err(e) => { ai_detail = format!("aistudio: {}", reqwest_err_short(&e)); }
+    }
+    // Gemini — доп. проверка (браузерный UA, как RegionRestrictionCheck).
+    if !ai_ok {
+        match client.get("https://gemini.google.com/")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120")
+            .send()
+        {
+            Ok(resp) => {
+                let st = resp.status().as_u16();
+                if st >= 200 && st < 400 {
+                    ai_ok = true; // gemini жив — достаточно
+                    ai_detail.push_str("; gemini: 200");
+                }
+            }
+            Err(_) => {} // не критично
+        }
+    }
+    if ai_ok {
+        Probe { ok: true, detail: format!("гео OK ({}; {})", or.detail, ai_detail) }
+    } else {
+        Probe { ok: false, detail: format!("гео: {}；{}", or.detail, ai_detail) }
+    }
+}
+
+/// Страна выхода: ip-эхо через канал + IP/ASN (ревью спеца 24.11.26 — отличить
+/// Cloudflare RU POP от DIRECT-утечки). ipwho.is / ipinfo.io сопоставляют САМ
+/// IP выхода со страной (данные, не эвристика — §7).
 fn probe_country(port: u16) -> (Option<String>, Probe) {
     let client = match proxied_client(port, PROBE_TIMEOUT) {
         Ok(c) => c,
         Err(e) => return (None, Probe { ok: false, detail: format!("страна: {}", e) }),
     };
-    // ipwho.is: JSON с country_code
+    // ipwho.is: JSON с country_code + ip + connection.asn/org
     if let Ok(resp) = client.get("https://ipwho.is/").send() {
         if resp.status().is_success() {
             if let Ok(v) = resp.json::<Value>() {
                 if let Some(cc) = v["country_code"].as_str() {
                     if !cc.is_empty() {
+                        let ip = v["ip"].as_str().unwrap_or("?");
+                        let asn = v["connection"]["asn"].as_i64().unwrap_or(0);
+                        let org = v["connection"]["org"].as_str().unwrap_or("");
+                        let asn_str = if asn > 0 { format!("AS{}", asn) } else { String::new() };
                         return (
                             Some(cc.to_string()),
-                            Probe { ok: true, detail: format!("выход {}", cc) },
+                            Probe {
+                                ok: true,
+                                detail: format!("выход {} (IP {}, {})", cc, ip, 
+                                    if !org.is_empty() { format!("{} {}", asn_str, org) } else { asn_str }),
+                            },
                         );
                     }
                 }
             }
         }
     }
-    // Фолбэк: ipinfo.io/json (независимый второй источник того же факта).
+    // Фолбэк: ipinfo.io/json
     match client.get("https://ipinfo.io/json").send() {
         Ok(resp) => match resp.json::<Value>() {
             Ok(v) => match v["country"].as_str() {
@@ -428,17 +598,12 @@ fn probe_speed(port: u16) -> Probe {
     let t0 = Instant::now();
     let mut total = 0usize;
     let mut err = String::new();
-    // blocking::Response: impl Read — читаем по чанкам с бюджетом времени
-    // (медленный psiphon даёт честную скорость по частичному скачиванию).
     let mut buf = [0u8; 16384];
     while t0.elapsed() < SPEED_BUDGET {
         match resp.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => total += n,
-            Err(e) => {
-                err = format!("{}", e);
-                break;
-            }
+            Err(e) => { err = format!("{}", e); break; }
         }
     }
     let secs = t0.elapsed().as_secs_f64();
@@ -455,29 +620,74 @@ fn probe_speed(port: u16) -> Probe {
     }
 }
 
-/// Итог по каналу из реальных проб: РАБОТАЕТ / ЧАСТИЧНО (что именно) / МЁРТВ.
-fn verdict(y: &Probe, m: &Probe, g: &Probe, cc: &Option<String>) -> (&'static str, String) {
-    if !y.ok && !m.ok && !g.ok {
-        return ("dead", String::from("ни одна проба не прошла"));
+/// Прочитать тело ответа с лимитом байт (не блокироваться на бесконечном теле).
+fn read_body_limited(mut resp: reqwest::blocking::Response, max: usize) -> String {
+    let mut buf = Vec::with_capacity(max.min(8192));
+    let mut chunk = [0u8; 8192];
+    let mut total = 0usize;
+    while total < max {
+        match resp.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                total += n;
+            }
+            Err(_) => break,
+        }
     }
-    let mut partial = Vec::new();
-    if !y.ok {
-        partial.push(String::from("ютуб не отвечает"));
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Итог по каналу — честная матрица (ревью спеца 24.11.26, раздел 2 Вопрос 2):
+/// - РАБОТАЕТ: youtube_usable && geo_usable
+/// - ЧАСТИЧНО: youtube_usable XOR geo_usable (с указанием, что именно)
+/// - НЕ РАБОТАЕТ: !youtube_usable && !geo_usable (даже если спидтест прошёл)
+///
+/// `y_usable` = probe_youtube (HTTPS + googlevideo). `g_usable` = probe_geo
+/// (country gate + openrouter + aistudio/gemini). `speed` не влияет на вердикт —
+/// только на информативность (медленный канал ≠ мёртвый).
+fn verdict(y: &Probe, g: &Probe, cc: &Option<String>) -> (&'static str, String) {
+    let y_ok = y.ok;
+    let g_ok = g.ok;
+    if y_ok && g_ok {
+        return ("ok", String::from("все пробы прошли"));
     }
-    if !m.ok {
-        partial.push(String::from("медиа-домен недоступен"));
+    if !y_ok && !g_ok {
+        // Честная причина: туннель мог пинговаться (speed ok), но ни видео,
+        // ни гео не работают — это НЕ «ЧАСТИЧНО», а «НЕ РАБОТАЕТ».
+        let mut parts = Vec::new();
+        if !y_ok {
+            // Если googlevideo упал — самая частая причина в РФ.
+            if y.detail.contains("ВИДЕО-ДОМЕН") || y.detail.contains("медиа") {
+                parts.push("видео (googlevideo) недоступно".to_string());
+            } else {
+                parts.push(format!("ютуб: {}", short_reason(&y.detail)));
+            }
+        }
+        if !g_ok {
+            parts.push(format!("гео: {}", short_reason(&g.detail)));
+        }
+        if let Some(c) = cc {
+            if c == "RU" {
+                parts.push("выход в РФ".to_string());
+            }
+        }
+        return ("dead", parts.join("; "));
     }
-    if !g.ok {
-        partial.push(String::from("гео-обход не работает"));
-    }
-    if cc.as_deref() == Some("RU") {
-        partial.push(String::from("выход в РФ — гео-обхода нет"));
-    }
-    if partial.is_empty() {
-        ("ok", String::from("все пробы прошли"))
-    } else {
-        ("partial", partial.join("; "))
-    }
+    // XOR — ровно одна из двух задач работает.
+    let mut note = Vec::new();
+    if !y_ok { note.push(format!("ютуб: {}", short_reason(&y.detail))); }
+    if !g_ok { note.push(format!("гео: {}", short_reason(&g.detail))); }
+    let which = if y_ok { "только YouTube (без гео)" } else { "только гео (без YouTube)" };
+    ("partial", format!("{} — {}", which, note.join("; ")))
+}
+
+/// Короткая причина из detail (убрать тайминги/лишнее для заголовка вердикта).
+fn short_reason(detail: &str) -> String {
+    // Берём до первого ';' или '(' — суть без таймингов.
+    let s = detail.split(';').next().unwrap_or(detail);
+    let s = s.split('(').next().unwrap_or(s).trim();
+    if s.len() > 60 { format!("{}…", &s[..s.floor_char_boundary(57)]) } else { s.to_string() }
 }
 
 fn status_mark(status: &str) -> &'static str {
@@ -599,12 +809,13 @@ pub fn test_channel(app: &AppHandle, id: &str) -> Result<Value, String> {
 
     let w = warmup_channel(port);
     emit_log(app, format!("[Тест каналов] «{}»: прогрев — {}", name, w.detail));
-    let y = probe_youtube(port);
-    let m = probe_media(port);
-    let g = probe_geo(port);
-    let (cc, _cc_probe) = probe_country(port);
+    // Страна нужна ПЕРЕД гео-пробой (country gate: RU/BY/... = блок).
+    let (cc, cc_probe) = probe_country(port);
+    emit_log(app, format!("[Тест каналов] «{}»: {}", name, cc_probe.detail));
+    let y = probe_youtube(port);  // составная: HTTPS youtube + googlevideo
+    let g = probe_geo(port, &cc); // country gate + openrouter + aistudio/gemini
     let s = probe_speed(port);
-    let (status, note) = verdict(&y, &m, &g, &cc);
+    let (status, note) = verdict(&y, &g, &cc);
 
     emit_log(app, format!(
         "[Тест каналов] «{}»: {} — {}{}. ютуб: {}; гео: {}; скорость: {}.",
@@ -619,7 +830,6 @@ pub fn test_channel(app: &AppHandle, id: &str) -> Result<Value, String> {
         "id": id, "name": name, "status": status, "note": note,
         "active": active, "port": port, "country": cc,
         "youtube": { "ok": y.ok, "detail": y.detail },
-        "media": { "ok": m.ok, "detail": m.detail },
         "geo": { "ok": g.ok, "detail": g.detail },
         "speed": { "ok": s.ok, "detail": s.detail },
         "elapsed": t0.elapsed().as_secs()
@@ -753,29 +963,43 @@ mod tests {
 
     #[test]
     fn verdict_dead_when_all_probes_fail() {
-        let (status, _) = verdict(&p(false), &p(false), &p(false), &None);
+        // Обе задачи (ютуб + гео) провалились → НЕ РАБОТАЕТ, даже если спидтест жив.
+        let (status, _) = verdict(&p(false), &p(false), &None);
         assert_eq!(status, "dead");
     }
 
     #[test]
-    fn verdict_ru_exit_is_partial_even_with_live_probes() {
-        // Канал «жив», но выход в РФ: гео-обхода нет — ЧАСТИЧНО, не РАБОТАЕТ.
-        let (status, note) = verdict(&p(true), &p(true), &p(true), &Some("RU".into()));
-        assert_eq!(status, "partial");
-        assert!(note.contains("выход в РФ"));
-    }
-
-    #[test]
-    fn verdict_ok_when_everything_passed_and_not_ru() {
-        let (status, _) = verdict(&p(true), &p(true), &p(true), &Some("NL".into()));
+    fn verdict_ok_when_everything_passed() {
+        // YouTube + гео оба живы, выход не в блок-стране → РАБОТАЕТ.
+        let (status, _) = verdict(&p(true), &p(true), &Some("NL".into()));
         assert_eq!(status, "ok");
     }
 
     #[test]
-    fn verdict_partial_names_the_dead_part() {
-        let (status, note) = verdict(&p(true), &p(false), &p(true), &Some("NL".into()));
+    fn verdict_partial_only_youtube() {
+        // YouTube жив, гео мёртв → ЧАСТИЧНО (только YouTube).
+        let (status, note) = verdict(&p(true), &p(false), &Some("NL".into()));
         assert_eq!(status, "partial");
-        assert!(note.contains("медиа-домен"));
+        assert!(note.contains("только YouTube"));
+    }
+
+    #[test]
+    fn verdict_partial_only_geo() {
+        // Гео жив, YouTube мёртв → ЧАСТИЧНО (только гео).
+        let (status, note) = verdict(&p(false), &p(true), &Some("NL".into()));
+        assert_eq!(status, "partial");
+        assert!(note.contains("только гео"));
+    }
+
+    #[test]
+    fn verdict_dead_when_googlevideo_down_even_with_speed() {
+        // YouTube-проба составная: googlevideo упал → y.ok=false → если и гео
+        // мёртв → НЕ РАБОТАЕТ (не ЧАСТИЧНО), даже если спидтест прошёл.
+        // ( спидтест не входит в verdict — он информативен, не критерий )
+        let y_dead = Probe { ok: false, detail: String::from("youtube.com 200; медиа: нет — ВИДЕО-ДОМЕН НЕДОСТУПЕН") };
+        let (status, note) = verdict(&y_dead, &p(false), &Some("RU".into()));
+        assert_eq!(status, "dead");
+        assert!(note.contains("googlevideo") || note.contains("видео"));
     }
 }
 
@@ -830,8 +1054,8 @@ mod live {
         let warmup = warmup_channel(TEST_MIXED_PORT);
         let youtube = probe_youtube(TEST_MIXED_PORT);
         let media = probe_media(TEST_MIXED_PORT);
-        let geo = probe_geo(TEST_MIXED_PORT);
         let (country, _cp) = probe_country(TEST_MIXED_PORT);
+        let geo = probe_geo(TEST_MIXED_PORT, &country);
         let speed = probe_speed(TEST_MIXED_PORT);
         eprintln!(
             "[live] «{}»: прогрев={}; ютуб={}; медиа={}; гео={}; страна={:?}; скорость={}",
@@ -971,8 +1195,8 @@ mod live {
         let warmup = warmup_channel(TEST_MIXED_PORT);
         let youtube = probe_youtube(TEST_MIXED_PORT);
         let media = probe_media(TEST_MIXED_PORT);
-        let geo = probe_geo(TEST_MIXED_PORT);
         let (country, _cp) = probe_country(TEST_MIXED_PORT);
+        let geo = probe_geo(TEST_MIXED_PORT, &country);
         let speed = probe_speed(TEST_MIXED_PORT);
         eprintln!(
             "[live] «__psiphon__»: прогрев={}; ютуб={}; медиа={}; гео={}; страна={:?}; скорость={}",

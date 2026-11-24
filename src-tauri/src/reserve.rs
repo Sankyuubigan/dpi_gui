@@ -533,7 +533,11 @@ pub fn wg_creds_import(path: &str, app: &AppHandle) -> Result<Value, String> {
         .map_err(|e| format!("не прочитать {}: {}", path, e))?;
     let creds = parse_wg_conf(&text)?;
     save_creds(&creds, path)?;
-    crate::proxy_core::wg_channel_sync(app)?;
+    // Единый reconciler (баг №1, ревью спеца 24.11.26): синкает ВСЕ встроенные
+    // каналы (WG + pawg + AWG + Psiphon) по фактическому состоянию на диске.
+    // Раньше здесь был только wg_channel_sync → pawg не появлялся, если AWG
+    // уже зарегистрирован (корень бага №1).
+    crate::proxy_core::reconcile_builtin_channels(app);
     let out = generate_reserve_config()?;
     emit_log(app, format!(
         "WireGuard-креды импортированы ({}:{}), запасной конфиг собран: {}",
@@ -547,7 +551,9 @@ pub fn wg_creds_import(path: &str, app: &AppHandle) -> Result<Value, String> {
 pub fn wg_creds_reset(app: &AppHandle) -> Result<String, String> {
     let _ = std::fs::remove_file(creds_file());
     let _ = std::fs::remove_file(crate::proxy_core::proxy_dir().join("reserve_profile.yaml"));
-    crate::proxy_core::wg_channel_remove(app)?;
+    // Единый reconciler: уберёт WG из реестра + удалит осиротевший pawg
+    // (pawg_possible = false без кредов) + корректно обработает active.
+    crate::proxy_core::reconcile_builtin_channels(app);
     emit_log(app, "WireGuard-креды сброшены — для WG-канала нужен повторный импорт.".into());
     Ok(String::from("Креды сброшены."))
 }

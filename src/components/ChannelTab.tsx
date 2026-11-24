@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, confirm as tauriConfirm } from "@tauri-apps/plugin-dialog";
 import {
   Globe, Plus, Trash2, FileUp, KeyRound, RotateCcw, Loader2, CheckCircle2, Cloud, Shield, Radio,
   FlaskConical, Skull, Youtube,
@@ -135,7 +135,15 @@ export default function ChannelTab({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const refreshRegistry = () => {
+// Fail-closed confirm (core §1.9/§2.2): нативный window.confirm в Tauri v2
+// webview маршрутизируется через dialog-плагин; если ACL упадёт — возвращаем
+// false (отмена), НЕ удаляем данные юзера без подтверждения.
+async function safeConfirm(msg: string): Promise<boolean> {
+  try { return await tauriConfirm(msg); }
+  catch { logMsg(`Диалог подтверждения недоступен: ${msg}`); return false; }
+}
+
+function refreshRegistry() {
     invoke("paid_profiles_list")
       .then(setRegistry)
       .catch((e: any) => logMsg(`Канал: список каналов недоступен: ${e}`));
@@ -284,8 +292,10 @@ export default function ChannelTab({
     try {
       const s: any = await invoke("wg_creds_import", { path: String(path) });
       setCreds(s);
-      refreshRegistry(); // wg_channel_sync изменил реестр — перечитать
-      logMsg(`Канал: креды импортированы (${s.endpoint}).`);
+      refreshRegistry(); // reconcile_builtin_channels изменил реестр — перечитать
+      // Честный список (баг №1): импорт ресинкает ВСЕ встроенные каналы.
+      // Если AWG уже зарегистрирован → pawg тоже появился.
+      logMsg(`Канал: креды импортированы (${s.endpoint}). Если AWG-учётка зарегистрирована — добавлен и канал «AWG Proton WARP (гео)».`);
     } catch (e: any) {
       logMsg(`Канал: не импортировать .conf: ${e}`);
     } finally {
@@ -316,7 +326,7 @@ export default function ChannelTab({
       logMsg("WARP: сначала выключи WARP-канал — сброс учётки при активном туннеле запрещён.");
       return;
     }
-    if (!confirm("Сбросить WARP-учётку? Туннель перестанет работать, пока не зарегистрируешься заново.")) return;
+    if (!await safeConfirm("Сбросить WARP-учётку? Туннель перестанет работать, пока не зарегистрируешься заново.")) return;
     setWarpBusy(true);
     try {
       const s: any = await invoke("warp_setup", { action: "reset" });
@@ -338,7 +348,7 @@ export default function ChannelTab({
         logMsg("AWG: сначала выключи канал — сброс учётки при активном туннеле запрещён.");
         return;
       }
-      if (!confirm("Сбросить AWG-учётку? Каналы «WARP AWG (YouTube)» и «AWG Proton WARP» перестанут работать до новой регистрации.")) return;
+      if (!await safeConfirm("Сбросить AWG-учётку? Каналы «WARP AWG (YouTube)» и «AWG Proton WARP» перестанут работать до новой регистрации.")) return;
     }
     setAwgBusy(true);
     logMsg(
@@ -352,7 +362,15 @@ export default function ChannelTab({
       const s: any = await invoke("awg_setup", { action });
       setAwg(s);
       refreshRegistry();
-      if (action === "register") logMsg("AWG: учётка готова. Каналы «WARP AWG (YouTube)» и «AWG Proton WARP (гео)» — в селекторе.");
+      if (action === "register") {
+        // Честное сообщение (баг №1): pawg нужны WG-креды. Если их нет —
+        // «AWG Proton WARP» не появится, и обещать его — ложь.
+        if (s.pawg_available) {
+          logMsg("AWG: учётка готова. Каналы «WARP AWG (YouTube)» и «AWG Proton WARP (гео)» — в селекторе.");
+        } else {
+          logMsg("AWG: учётка готова. Канал «WARP AWG (YouTube)» — в селекторе. Чтобы появился «AWG Proton WARP (гео)» — импортируй WireGuard .conf (нужны WG-креды Proton).");
+        }
+      }
       if (action === "rescan") logMsg(`AWG: эндпоинтов: ${s.endpoints_count} (источник: ${s.endpoints_source === "scan" ? "свежий скан" : "встроенный шортлист"}).`);
       if (action === "reset") logMsg("AWG: учётка сброшена.");
     } catch (e: any) {
@@ -372,7 +390,7 @@ export default function ChannelTab({
       return;
     }
     if (p.type === "wg" || p.file === "__wg__") {
-      if (!confirm(`Сбросить WireGuard-креды и убрать «${p.name}» из каналов? Включить WG снова можно будет только после импорта .conf.`)) return;
+      if (!await safeConfirm(`Сбросить WireGuard-креды и убрать «${p.name}» из каналов? Включить WG снова можно будет только после импорта .conf.`)) return;
       setListBusy(true);
       try {
         await invoke("wg_creds_reset");
@@ -396,7 +414,7 @@ export default function ChannelTab({
       // Psiphon — постоянный канал реестра (не данные юзера): удалять нечего.
       return;
     }
-    if (!confirm(`Удалить канал «${p.name}» из списка? Файл профиля будет удалён с диска.`)) return;
+    if (!await safeConfirm(`Удалить канал «${p.name}» из списка? Файл профиля будет удалён с диска.`)) return;
     setListBusy(true);
     try {
       const reg: any = await invoke("paid_profile_delete", { fileId: p.file });
